@@ -1,0 +1,48 @@
+/* Mswrite 主题:浅色(GitHub 风) */
+
+body {
+    background: #ffffff;
+    color: #24292e;
+    font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+}
+
+.vditor {
+    --border-color: #d1d5da;
+    --second-color: rgba(88, 96, 105, 0.36);
+    --panel-background-color: #ffffff;
+    --toolbar-background-color: #f6f8fa;
+    --toolbar-icon-color: #586069;
+    --textarea-background-color: #ffffff;
+    --textarea-text-color: #24292e;
+    --heading-border-color: #eaecef;
+    --blockquote-color: #6a737d;
+    --ir-heading-color: #660e7a;
+    --ir-title-color: #4f4f4f;
+    --ir-bi-color: #4f4f4f;
+    --ir-link-color: #4285f4;
+    --ir-bracket-color: rgba(88, 96, 105, 0.36);
+    --ir-paren-color: rgba(88, 96, 105, 0.36);
+    --code-background: #f6f8fa;
+    --blockquote-background: transparent;
+    --ms-code-lineno: #c0c4c8;
+}
+
+/* 正文字号与代码字体 */
+.vditor-reset {
+    font-size: var(--ms-font-size, 16px);
+    line-height: 1.75;
+}
+.vditor-reset code, .vditor-reset pre {
+    font-family: "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", monospace;
+}
+.vditor-reset pre {
+    background: var(--code-background) !important;
+}
+
+::selection { background: rgba(66, 133, 244, 0.25); }
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #c8ccd0; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #adb1b5; }
+::-webkit-scrollbar-track { background: transparent; }

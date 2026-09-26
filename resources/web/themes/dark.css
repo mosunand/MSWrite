@@ -1,0 +1,55 @@
+/* Mswrite 主题:夜间(Dark) */
+
+body {
+    background: #1e1e1e;
+    color: #d4d4d4;
+    font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+}
+
+.vditor {
+    --border-color: #3c3c3c;
+    --second-color: rgba(158, 158, 158, 0.36);
+    --panel-background-color: #252526;
+    --panel-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+    --toolbar-background-color: #252526;
+    --toolbar-icon-color: #c5c5c5;
+    --textarea-background-color: #1e1e1e;
+    --textarea-text-color: #d4d4d4;
+    --heading-border-color: #37373d;
+    --blockquote-color: #9d9d9d;
+    --ir-heading-color: #c586c0;
+    --ir-title-color: #d4d4d4;
+    --ir-bi-color: #d4d4d4;
+    --ir-link-color: #569cd6;
+    --ir-bracket-color: rgba(158, 158, 158, 0.45);
+    --ir-paren-color: rgba(158, 158, 158, 0.45);
+    --code-background: #252526;
+    --ms-code-lineno: #5a5a5a;
+}
+
+.vditor-reset {
+    color: #d4d4d4;
+    font-size: var(--ms-font-size, 16px);
+    line-height: 1.75;
+}
+.vditor-reset h1, .vditor-reset h2, .vditor-reset h3,
+.vditor-reset h4, .vditor-reset h5, .vditor-reset h6 { color: #e8e8e8; }
+.vditor-reset a { color: #569cd6; }
+.vditor-reset blockquote { color: #9d9d9d; border-color: #3c3c3c; }
+.vditor-reset code, .vditor-reset pre {
+    font-family: "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", monospace;
+    background: var(--code-background) !important;
+    color: #d4d4d4;
+}
+.vditor-reset table tr { background: transparent; }
+.vditor-reset table td, .vditor-reset table th { border-color: #3c3c3c; }
+.vditor-reset table th { background: #252526; }
+.vditor-reset hr { border-color: #3c3c3c; }
+.vditor-reset img { background: #ffffff; } /* 白底图不刺眼 */
+
+::selection { background: rgba(86, 156, 214, 0.35); }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #4a4a4a; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #5a5a5a; }
+::-webkit-scrollbar-track { background: transparent; }

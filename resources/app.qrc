@@ -1,0 +1,10 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <qresource prefix="/">
+        <file alias="welcome.md">welcome.md</file>
+        <file alias="logo.ico">../logo.ico</file>
+        <file alias="tab-close.png">../purple.png</file>
+        <file alias="tab-close-hover.png">../red.png</file>
+        <file alias="pdf/Reader.qml">pdf/Reader.qml</file>
+    </qresource>
+</RCC>

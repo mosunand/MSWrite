@@ -1,0 +1,46 @@
+/* Mswrite 主题:纸白(护眼暖色,微信风格) */
+
+body {
+    background: #f7f4ed;
+    color: #3f3f3f;
+    font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+}
+
+.vditor {
+    --border-color: #dcd7c9;
+    --second-color: rgba(122, 112, 92, 0.36);
+    --panel-background-color: #fffdf7;
+    --toolbar-background-color: #f2eee2;
+    --toolbar-icon-color: #7a705c;
+    --textarea-background-color: #f7f4ed;
+    --textarea-text-color: #3f3f3f;
+    --heading-border-color: #e8e3d5;
+    --blockquote-color: #7a705c;
+    --ir-heading-color: #8b5e3c;
+    --ir-title-color: #504a3f;
+    --ir-bi-color: #504a3f;
+    --ir-link-color: #b8860b;
+    --ir-bracket-color: rgba(122, 112, 92, 0.36);
+    --ir-paren-color: rgba(122, 112, 92, 0.36);
+    --code-background: #efe9d8;
+    --ms-code-lineno: #c5bda8;
+}
+
+.vditor-reset {
+    font-size: var(--ms-font-size, 16px);
+    line-height: 1.75;
+}
+.vditor-reset h1, .vditor-reset h2, .vditor-reset h3,
+.vditor-reset h4, .vditor-reset h5, .vditor-reset h6 { color: #504a3f; }
+.vditor-reset a { color: #b8860b; }
+.vditor-reset code, .vditor-reset pre {
+    font-family: "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", monospace;
+}
+.vditor-reset pre { background: var(--code-background) !important; }
+
+::selection { background: rgba(184, 134, 11, 0.22); }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #d0c9b4; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #bfb79f; }
+::-webkit-scrollbar-track { background: transparent; }

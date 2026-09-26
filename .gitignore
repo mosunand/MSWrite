@@ -1,0 +1,41 @@
+# CMake 构建目录
+build*/
+cmake-build-*/
+
+# 打包产物
+dist/
+installer/_stage/
+
+# 运行期生成(在 exe 同级)
+MSWriteData/
+webview-data/
+export-tmp/
+mswrite.log
+
+# Qt / IDE
+*.user
+*.user.*
+.qtc_clangd/
+CMakeLists.txt.user*
+.vs/
+.idea/
+.vscode/
+
+# 编译中间产物
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.a
+moc_*
+ui_*
+qrc_*
+*._autogen/
+
+# 例外:vendored 依赖是源码的一部分
+!third_party/webview2/WebView2Loader.dll
+
+# 系统
+.DS_Store
+Thumbs.db

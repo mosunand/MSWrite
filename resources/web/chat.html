@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'">
+  <title>AI 对话</title>
+  <link rel="stylesheet" href="vditor/dist/js/katex/katex.min.css">
+  <link id="codeTheme" rel="stylesheet" href="vditor/dist/js/highlight.js/styles/github-dark.min.css">
+  <link rel="stylesheet" href="chat.css">
+  <script defer src="vditor/dist/js/lute/lute.min.js"></script>
+  <script defer src="vditor/dist/js/katex/katex.min.js"></script>
+  <script defer src="vditor/dist/js/highlight.js/highlight.min.js"></script>
+  <script defer src="latex-preference.js?v=135"></script>
+  <script defer src="chat.js?v=2"></script>
+</head>
+<body>
+  <nav aria-label="对话操作"><button data-action="copyAll">复制全部</button><button data-action="export">导出对话</button></nav>
+  <main id="messages" aria-label="对话记录"></main>
+  <button id="latest" hidden>↓ 回到最新</button>
+  <div id="context" role="menu" hidden></div>
+  <div id="toast" role="status" hidden></div>
+</body>
+</html>
