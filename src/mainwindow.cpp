@@ -26,6 +26,7 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QHash>
 #include <QGuiApplication>
 #include <QImage>
 #include <QJsonArray>
@@ -70,7 +71,7 @@ QString pageUrl()
 {
     // ?v= 与 bridge.js 版本同步递增:editor.html 本体也绕过缓存
     QString url = QStringLiteral("https://") + QLatin1String(kVirtualHost)
-                + QStringLiteral("/editor.html?v=136");
+                + QStringLiteral("/editor.html?v=137");
     // 开发态才把排障开关传给页面(按键记录器等),生产环境不启用
     if (qEnvironmentVariableIsSet("MSWRITE_DEV"))
         url += QStringLiteral("&dev=1");
@@ -100,6 +101,12 @@ QString readAll(const QString &path)
 
 QString katexExportCss(const QString &webDir)
 {
+    // KaTeX 字体随工程分发,永不变更:内联结果按 webDir 缓存,
+    // 避免每次导出都重读全部字体文件并 base64(数百 KB IO+编码)
+    static QHash<QString, QString> cache;
+    const auto hit = cache.find(webDir);
+    if (hit != cache.end())
+        return *hit;
     const QDir katexDir(webDir + QStringLiteral("/vditor/dist/js/katex"));
     QString css = readAll(katexDir.filePath(QStringLiteral("katex.min.css")));
     static const QRegularExpression urls(QStringLiteral(R"(url\(([^)]+)\))"));
@@ -123,7 +130,9 @@ QString katexExportCss(const QString &webDir)
                 + QString::fromLatin1(font.readAll().toBase64()) + QLatin1Char(')');
         offset = match.capturedEnd();
     }
-    return result + css.mid(offset);
+    result += css.mid(offset);
+    cache.insert(webDir, result);
+    return result;
 }
 
 // MIME(或裸扩展名)-> 落盘扩展名:截图/拖入的 jpg、webp 不再一律存成 .png
@@ -155,6 +164,7 @@ MainWindow::MainWindow(QWidget *parent, const QString &initialPath)
             ? QStringLiteral("dark") : QStringLiteral("light"));
     m_fontSize = qBound(12, QSettings().value(QStringLiteral("fontSize"), 16).toInt(), 28);
     m_lineNumbers = QSettings().value(QStringLiteral("codeLineNumbers"), false).toBool();
+    m_autoSave = QSettings().value(QStringLiteral("autoSave"), true).toBool();
     m_aiStore = AiProviderStore::load(); // AI 助手的供应商(面板懒创建)
 
     // ---------- 标签栏 + 编辑区栈 ----------
@@ -371,9 +381,11 @@ int MainWindow::addTab(const QString &path, const QString &content,
     t.host = new WebViewHost(this);
     t.autoSave = new QTimer(t.host);
     t.autoSave->setSingleShot(true);
+    // 打开既有文档:标题从内容直接算(页面编辑中再由 firstLine 消息维护)
+    t.titleHint = FileService::titleFromMarkdown(content);
     connect(t.autoSave, &QTimer::timeout, this, [this,host=t.host] {
         auto *tab=tabForHost(host);
-        if(tab && tab->dirty && QSettings().value(QStringLiteral("autoSave"),true).toBool())
+        if(tab && tab->dirty && m_autoSave)
             requestContent(*tab);
     });
     t.host->showStartupPreview(content, m_theme, m_fontSize);
@@ -458,6 +470,23 @@ MainWindow::Tab *MainWindow::currentTab()
 {
     const int i = currentTabIndex();
     return (i >= 0 && i < m_tabs.size()) ? &m_tabs[i] : nullptr;
+}
+
+// 未命名文档落盘路径:标题(已清洗)直接作名,冲突加 -2/-3 序号;
+// 没有可用标题(空文档/纯代码围栏开头)回退时间戳+短 UUID,保持唯一
+QString MainWindow::uniqueUntitledPath(const QString &title) const
+{
+    const QString dir = m_files->defaultSaveDir();
+    QString name = FileService::sanitizeFileName(title);
+    if (name.isEmpty())
+        name = QStringLiteral("未命名-%1-%2")
+                   .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")),
+                        QUuid::createUuid().toString(QUuid::Id128).left(8));
+    QString path = dir + QLatin1Char('/') + name + QStringLiteral(".md");
+    for (int i = 2; QFileInfo::exists(path); ++i)
+        path = dir + QLatin1Char('/') + name + QLatin1Char('-')
+             + QString::number(i) + QStringLiteral(".md");
+    return path;
 }
 
 MainWindow::Tab *MainWindow::tabForHost(WebViewHost *host)
@@ -565,7 +594,7 @@ void MainWindow::closeTab(int index)
     if (index < 0 || index >= m_tabs.size())
         return;
     WebViewHost *host=m_tabs[index].host;
-    if(host && !m_flushingSaves && m_tabs[index].dirty && QSettings().value(QStringLiteral("autoSave"),true).toBool()) {
+    if(host && !m_flushingSaves && m_tabs[index].dirty && m_autoSave) {
         flushSaves({host});
         index=indexOfHost(host);
         if(index<0)return;
@@ -789,11 +818,10 @@ void MainWindow::updateSaveIndicator(bool dirty)
     if (!m_saveLabel)
         return;
     const Tab *tab=currentTab();
-    const bool autoSave=QSettings().value(QStringLiteral("autoSave"),true).toBool();
     const QString text = tab && tab->pdf ? tr("PDF 只读")
         : tab && !tab->saveError.isEmpty() ? tr("保存失败 · 点击重试")
         : tab && tab->awaitingContent ? tr("正在保存…")
-        : dirty ? (autoSave ? tr("等待自动保存…") : tr("未保存 · 自动保存已关闭"))
+        : dirty ? (m_autoSave ? tr("等待自动保存…") : tr("未保存 · 自动保存已关闭"))
         : tab && tab->path.isEmpty() ? tr("新文档") : tr("✓ 已保存");
     m_saveLabel->setText(text);
     m_saveLabel->setToolTip(tab && !tab->saveError.isEmpty() ? tab->saveError
@@ -875,8 +903,11 @@ bool MainWindow::saveFileAs()
     }
     QString suggested = t->path;
     if (suggested.isEmpty()) {
-        // 新建文档:默认落在用户设置的保存目录(首次为 exe/MSWriteData)
-        suggested = m_files->defaultSaveDir() + QStringLiteral("/未命名.md");
+        // 新建文档:默认名取文档开头正文(titleHint,页面编辑中上报维护);
+        // 没有可用标题回退"未命名"。保存目录默认 exe/MSWriteData
+        suggested = m_files->defaultSaveDir() + QLatin1Char('/')
+                  + (t->titleHint.isEmpty() ? tr("未命名") : t->titleHint)
+                  + QStringLiteral(".md");
     }
     QString path = QFileDialog::getSaveFileName(this, tr("另存为"), suggested,
                                                 FileService::markdownFilters()
@@ -1133,6 +1164,7 @@ void MainWindow::buildMenus()
     settings->addSeparator();
     QAction *autoSaveAct = settings->addAction(tr("自动保存(&A)(停笔 2 秒)"), this, [this](bool on) {
         QSettings().setValue(QStringLiteral("autoSave"), on);
+        m_autoSave = on;   // 高频路径读成员,不再每次开注册表
         for(Tab &tab:m_tabs)if(tab.autoSave) {
             if(on && tab.dirty)tab.autoSave->start(2000);
             else if(!on)tab.autoSave->stop();
@@ -1603,7 +1635,7 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
         tab->rev = obj.value(QStringLiteral("rev")).toInt();
         tab->saveError.clear();
         markDirty(index, true);
-        if(QSettings().value(QStringLiteral("autoSave"),true).toBool())
+        if(m_autoSave)
             tab->autoSave->start(2000);
         return;
     }
@@ -1642,8 +1674,10 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
                 return;
             }
             {
-                const QString path = newFile ? m_files->defaultSaveDir()+QStringLiteral("/未命名-%1-%2.md")
-                    .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")),QUuid::createUuid().toString(QUuid::Id128).left(8)) : tab->path;
+                // 未命名文档:默认文件名取文档开头正文(剥 Markdown 标记,
+                // 由页面 firstLine 消息维护的 titleHint 同源);无标题回退时间戳
+                const QString path = newFile ? uniqueUntitledPath(
+                    FileService::titleFromMarkdown(md)) : tab->path;
                 // 行尾保真:编辑器统一输出 \n,原文件是 CRLF 就还原成 CRLF,
                 // 否则 Windows 老文档一保存整篇 diff
                 md.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
@@ -1667,7 +1701,7 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
                         markDirty(index, true);
                         if (tab->closeAfterSave || m_flushingSaves)
                             requestContent(*tab);   // 存完最新内容再关
-                        else if(QSettings().value(QStringLiteral("autoSave"),true).toBool())
+                        else if(m_autoSave)
                             tab->autoSave->start(1500);
                     } else {
                         markDirty(index, false);
@@ -1806,6 +1840,13 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
     if (t == QLatin1String("doclang")) {
         // 本文档默认代码语言(列表底部快捷入口回传)
         applyDocLang(*tab, obj.value(QStringLiteral("lang")).toString());
+        return;
+    }
+    if (t == QLatin1String("firstLine")) {
+        // 页面上报的文档开头正文(未命名文档的默认文件名候选);
+        // 清洗与打开文件路径同源(FileService::titleFromMarkdown)
+        tab->titleHint = FileService::titleFromMarkdown(
+            obj.value(QStringLiteral("text")).toString());
         return;
     }
 }
@@ -2163,20 +2204,29 @@ void MainWindow::onSearchDocResult(int blockIndex)
 QString MainWindow::composeExportHtml(const QString &bodyHtml, const Tab &tab)
 {
     const QString webDir = resourcesWebDir();
+    // 主题相关的四个 CSS 按 (webDir, 主题) 缓存:导出不应每次都做 4 次盘读
+    static QHash<QString, QStringList> baseCssCache;
+    const QString cssKey = webDir + QLatin1Char('\n') + m_theme;
     QStringList css;
-    css << readAll(webDir + QStringLiteral("/vditor/dist/index.css"));
-    const QString contentTheme = m_theme == QLatin1String("dark")
-                                     ? QStringLiteral("dark")
-                                     : (m_theme == QLatin1String("paper")
-                                            ? QStringLiteral("wechat")
-                                            : QStringLiteral("light"));
-    css << readAll(webDir + QStringLiteral("/vditor/dist/css/content-theme/")
-                  + contentTheme + QStringLiteral(".css"));
-    css << readAll(webDir + QStringLiteral("/vditor/dist/js/highlight.js/styles/")
-                  + (m_theme == QLatin1String("dark") ? QStringLiteral("dark")
-                                                       : QStringLiteral("github"))
-                  + QStringLiteral(".min.css"));
-    css << readAll(webDir + QStringLiteral("/themes/") + m_theme + QStringLiteral(".css"));
+    const auto cached = baseCssCache.find(cssKey);
+    if (cached != baseCssCache.end()) {
+        css = *cached;
+    } else {
+        const QString contentTheme = m_theme == QLatin1String("dark")
+                                         ? QStringLiteral("dark")
+                                         : (m_theme == QLatin1String("paper")
+                                                ? QStringLiteral("wechat")
+                                                : QStringLiteral("light"));
+        css << readAll(webDir + QStringLiteral("/vditor/dist/index.css"))
+            << readAll(webDir + QStringLiteral("/vditor/dist/css/content-theme/")
+                       + contentTheme + QStringLiteral(".css"))
+            << readAll(webDir + QStringLiteral("/vditor/dist/js/highlight.js/styles/")
+                       + (m_theme == QLatin1String("dark") ? QStringLiteral("dark")
+                                                           : QStringLiteral("github"))
+                       + QStringLiteral(".min.css"))
+            << readAll(webDir + QStringLiteral("/themes/") + m_theme + QStringLiteral(".css"));
+        baseCssCache.insert(cssKey, css);
+    }
     css << katexExportCss(webDir);
 
     // Vditor 的颜色变量定义在 .vditor 选择器上,导出页没有该类,
@@ -2279,8 +2329,11 @@ void MainWindow::finishExport(const QString &bodyHtml, Tab *tab)
     // 用"回传 html 的那个标签",而不是 currentTab():请求与回传之间
     // 用户可能已切标签,否则导出文件名与图片映射会张冠李戴
     const Tab &docTab = *tab;
-    const QString base = docTab.path.isEmpty() ? tr("未命名")
-                                               : QFileInfo(docTab.path).completeBaseName();
+    // 未命名文档:导出默认名同样取文档开头正文(titleHint)
+    const QString base = docTab.path.isEmpty()
+                             ? (docTab.titleHint.isEmpty() ? tr("未命名")
+                                                           : docTab.titleHint)
+                             : QFileInfo(docTab.path).completeBaseName();
     QString filter;
     if (kind == kExportPdf)
         filter = tr("PDF 文档 (*.pdf)");
@@ -2732,7 +2785,7 @@ void MainWindow::readAiDocument(const QJsonObject &request,std::function<void(Ai
 void MainWindow::closeEvent(QCloseEvent *event)
 {
     if(m_flushingSaves) {event->ignore();return;}
-    if(QSettings().value(QStringLiteral("autoSave"),true).toBool()) {
+    if(m_autoSave) {
         QVector<WebViewHost *> hosts;
         for(const Tab &tab:m_tabs)if(tab.host && (tab.dirty || tab.awaitingContent))hosts.append(tab.host);
         if(!hosts.isEmpty())flushSaves(hosts);

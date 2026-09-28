@@ -11,6 +11,7 @@ add_executable(chat-regression
     chat-regression.cpp
     ../src/ai/ChatView.cpp ../src/ai/ChatView.h
     ../src/ai/AiMathPainter.cpp ../src/ai/AiMathPainter.h
+    ../src/fileservice.cpp ../src/fileservice.h
 )
 target_include_directories(chat-regression PRIVATE ../src)
 target_link_libraries(chat-regression PRIVATE Qt6::Widgets)

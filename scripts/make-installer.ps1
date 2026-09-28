@@ -33,3 +33,18 @@ $setup = Get-ChildItem (Join-Path $root "dist") -Filter "*-setup.exe" |
          Sort-Object LastWriteTime -Descending | Select-Object -First 1
 Write-Output ""
 Write-Output ("安装包完成:{0}({1:N1} MB)" -f $setup.FullName, ($setup.Length / 1MB))
+
+# 4) 发布目录只保留安装包:清掉打包中转(便携目录 + 暂存)。
+# dist\Mswrite 只是打包脚本的组装车间(package.ps1 填充 → robocopy 剔除运行期
+# 产物),编译成功后不再需要。MSWriteData 若有用户文档先搬到 dist 保留。
+$portable = Join-Path $root "dist\Mswrite"
+$userDocs = Join-Path $portable "MSWriteData"
+if ((Test-Path $userDocs) -and (Get-ChildItem $userDocs -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0) {
+    $keep = Join-Path $root "dist\MSWriteData-backup"
+    if (Test-Path $keep) { Remove-Item $keep -Recurse -Force }
+    Move-Item $userDocs $keep
+    Write-Output "便携目录里发现用户文档,已保留到:$keep"
+}
+if (Test-Path $portable) { Remove-Item $portable -Recurse -Force }
+if (Test-Path $stage)    { Remove-Item $stage -Recurse -Force }
+Write-Output "已清理打包中转目录(dist 今后只保留安装包)"

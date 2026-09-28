@@ -24,6 +24,13 @@ public:
     static bool writeFile(const QString &path, const QString &content,
                           Encoding enc = Encoding::Utf8);
 
+    // 未命名文档的默认文件名:取文档开头首个非空行(跳过代码围栏与块级
+    // 公式整体),剥掉 Markdown 标记(# / ** / $ / > / 列表等)。返回已清理
+    // 的安全文件名;文档为空或没有可用行时返回空串(调用方回退默认名)。
+    static QString titleFromMarkdown(const QString &markdown);
+    // Windows 文件名清理:去非法字符/折叠空白/截断/去尾部点。幂等。
+    static QString sanitizeFileName(QString name);
+
     static QStringList markdownFilters();
 
     // 最近文件(最多 10 条,读取时过滤已不存在的)

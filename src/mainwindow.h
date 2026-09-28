@@ -89,6 +89,7 @@ private:
         QString stats;                 // 最近统计文本(切标签时恢复)
         QString docHost;               // 本标签文档目录的虚拟主机名(doc{n}.local)
         QString docDir;                // 本标签文档所在目录(与 docHost 配对,用于落盘还原)
+        QString titleHint;             // 文档开头正文的清洗标题(未命名文档的默认文件名候选)
     };
 
     void buildMenus();
@@ -116,6 +117,8 @@ private:
     void markDirty(int index, bool dirty);
     void updateTitle();
     void syncStatusFromTab();
+    // 未命名文档落盘:标题冲突时加序号;无可用标题回退时间戳名
+    QString uniqueUntitledPath(const QString &title) const;
 
     void applyTheme(const QString &theme, bool persist = true);
     void broadcastTheme() const;
@@ -196,5 +199,8 @@ private:
     bool m_pdfActive = false;
     bool m_outlineBeforePdf = true;
     bool m_runtimeWarned = false;   // 已提示过 WebView2 运行时异常
+    // 自动保存开关缓存:changed/content/markDirty 等高频路径不再每次开注册表,
+    // 写入方(菜单动作)负责同步本成员
+    bool m_autoSave = true;
     QStringList m_closedFiles;      // 已关闭文件栈(Ctrl+Shift+T 重开)
 };

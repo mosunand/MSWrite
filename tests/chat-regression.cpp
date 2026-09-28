@@ -2,6 +2,7 @@
 // saved settings, network requests, or the running editor.
 #include "ai/AiMathPainter.h"
 #include "ai/ChatView.h"
+#include "fileservice.h"
 
 #include <QApplication>
 #include <QImage>
@@ -142,6 +143,50 @@ int main(int argc, char **argv)
             fixture.message->kind = kind;
             fixture.render(QStringLiteral("Test message"), true, false);
         }
+    });
+
+    struct TitleCase { const char *name; QString markdown; QString expected; };
+    const QList<TitleCase> titleCases = {
+        { "bold first line", QStringLiteral("**AI生成多媒体内容安全与可信溯源**"),
+          QStringLiteral("AI生成多媒体内容安全与可信溯源") },
+        { "atx heading", QStringLiteral("# 项目周报\n\n正文段落"), QStringLiteral("项目周报") },
+        { "deep heading", QStringLiteral("#### 四级标题\n正文"), QStringLiteral("四级标题") },
+        { "quote and bullet", QStringLiteral("> - 带引用的列表\n\n正文"), QStringLiteral("带引用的列表") },
+        { "ordered task", QStringLiteral("1. [x] 已完成任务"), QStringLiteral("已完成任务") },
+        { "inline code prefix", QStringLiteral("`代码开头`的文档"), QStringLiteral("代码开头的文档") },
+        { "inline math prefix", QStringLiteral("$E=mc^2$ 的推导"), QStringLiteral("E=mc^2 的推导") },
+        { "display math skipped", QStringLiteral("$$\n\\frac{1}{2}\n$$\n\n公式后面的标题"),
+          QStringLiteral("公式后面的标题") },
+        { "code fence skipped", QStringLiteral("```python\nprint('hi')\n```\n\n围栏后面的标题"),
+          QStringLiteral("围栏后面的标题") },
+        { "link text kept", QStringLiteral("[链接文字](https://example.com) 开头"),
+          QStringLiteral("链接文字 开头") },
+        { "image alt kept", QStringLiteral("![封面图](./assets/cover.png)\n\n封面说明"),
+          QStringLiteral("封面图") },
+        { "font tag stripped", QStringLiteral("<font color=\"#e74c3c\">红色开头的文档</font>"),
+          QStringLiteral("红色开头的文档") },
+        { "underline emphasis", QStringLiteral("__粗体下划线__开头"), QStringLiteral("粗体下划线开头") },
+        { "illegal filename chars", QStringLiteral("报告: 2026/09/28 (第一版)"),
+          QStringLiteral("报告 20260928 (第一版)") },
+        { "blank lines skipped", QStringLiteral("\n\n**第二行才有效**"), QStringLiteral("第二行才有效") },
+        { "empty document", QString(), QString() },
+    };
+    for (const auto &c : titleCases) {
+        test(c.name, [&] {
+            const QString got = FileService::titleFromMarkdown(c.markdown);
+            check(got == c.expected, QStringLiteral("expected \"%1\" got \"%2\"")
+                                         .arg(c.expected, got));
+        });
+    }
+    test("sanitize keeps unique-name safety", [&] {
+        check(FileService::sanitizeFileName(QStringLiteral("a/b\\c:d*e?f\"g<h>i|j"))
+                  == QStringLiteral("abcdefghij"), QStringLiteral("illegal characters removed"));
+        const QString collapsed = FileService::sanitizeFileName(
+            QStringLiteral("  多  个 空白\t制表  "));
+        check(collapsed == QStringLiteral("多 个 空白 制表"),
+              QStringLiteral("whitespace collapsed: got \"%1\"").arg(collapsed));
+        check(FileService::sanitizeFileName(QStringLiteral("尾部点..."))
+                  == QStringLiteral("尾部点"), QStringLiteral("trailing dots removed"));
     });
 
     const QStringList formulas = {

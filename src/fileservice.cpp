@@ -11,6 +11,7 @@
 #include <QDateTime>
 
 #include <algorithm>
+#include <QRegularExpression>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -175,6 +176,106 @@ QStringList FileService::markdownFilters()
              QStringLiteral("Markdown 文档 (*.md *.markdown *.mdown *.txt)"),
              QStringLiteral("PDF 文档 (*.pdf)"),
              QStringLiteral("所有文件 (*.*)") };
+}
+
+// ---------------------------------------------------------------------------
+// 默认文件名:文档开头正文 → 安全文件名
+// ---------------------------------------------------------------------------
+
+QString FileService::sanitizeFileName(QString name)
+{
+    // \x00 不能进 PCRE 模式串(C 字符串截断):NUL 单独删,控制字符从 \x01 起。
+    // 先折叠空白(\s 含 tab/LF/CR,如 "空白\t制表" → "空白 制表"),再删残余控制符
+    static const QRegularExpression blanks(QStringLiteral("\\s+"));
+    static const QRegularExpression illegal(
+        QStringLiteral("[\\\\/:*?\"<>|\\x01-\\x1f]"));
+    name.remove(QChar(0));
+    name.replace(blanks, QStringLiteral(" "));
+    name.remove(illegal);
+    name = name.trimmed();
+    if (name.size() > 60)
+        name = name.left(60).trimmed();
+    while (name.endsWith(QLatin1Char('.')))
+        name.chop(1);
+    return name;
+}
+
+QString FileService::titleFromMarkdown(const QString &markdown)
+{
+    if (markdown.isEmpty())
+        return {};
+    // 只看开头:标题候选不会埋在 64KB 之后;超大文档不必全文扫描
+    const QStringList lines = markdown.left(64 * 1024).split(QLatin1Char('\n'));
+
+    // 行首块级标记:可重复组合(# 标题、> 引用、- 列表、1. 有序、[x] 任务)
+    static const QRegularExpression lead(QStringLiteral(
+        "^(?:#{1,6}\\s+|>\\s?|[-*+]\\s+|\\d{1,9}[.)]\\s+|\\[[ xX]\\]\\s+)+"));
+    // 行内标记(顺序重要:先链接后 HTML,先定界符后通配)
+    static const QRegularExpression image(
+        QStringLiteral("!\\[([^\\]]*)\\]\\([^)]*\\)"));
+    static const QRegularExpression link(
+        QStringLiteral("\\[([^\\]]*)\\]\\([^)]*\\)"));
+    static const QRegularExpression htmlTag(QStringLiteral("<[^>]*>"));
+    static const QRegularExpression boldUnder(QStringLiteral("__([^_]+)__"));
+    static const QRegularExpression italUnder(QStringLiteral("_([^_\\s]+)_"));
+    static const QRegularExpression displayMath(QStringLiteral("\\$\\$([^$]+)\\$\\$"));
+    static const QRegularExpression inlineMath(QStringLiteral("\\$([^$]+)\\$"));
+
+    bool inFence = false;
+    QChar fenceChar;
+    int fenceLength = 0;
+    bool inMathBlock = false;
+    static const QRegularExpression fenceOpen(QStringLiteral("^(`{3,}|~{3,})"));
+
+    for (const QString &raw : lines) {
+        const QString line = raw.trimmed();
+        if (inFence) {
+            // 闭合:行首同类字符长度不小于开围栏,且之后无其他内容
+            int len = 0;
+            while (len < line.size() && line.at(len) == fenceChar)
+                ++len;
+            if (len >= fenceLength && line.mid(len).trimmed().isEmpty())
+                inFence = false;
+            continue;
+        }
+        if (inMathBlock) {
+            if (line == QLatin1String("$$"))
+                inMathBlock = false;
+            continue;
+        }
+        const auto fence = fenceOpen.match(line);
+        if (fence.hasMatch()) {
+            inFence = true;
+            fenceChar = line.at(0);
+            fenceLength = fence.captured(1).size();
+            continue;
+        }
+        if (line == QLatin1String("$$")) {
+            inMathBlock = true;
+            continue;
+        }
+        if (line.isEmpty())
+            continue;
+
+        QString t = line;
+        t.remove(lead);
+        t.replace(image, QStringLiteral("\\1"));
+        t.replace(link, QStringLiteral("\\1"));
+        t.remove(htmlTag);
+        t.replace(displayMath, QStringLiteral("\\1"));
+        t.replace(inlineMath, QStringLiteral("\\1"));
+        t.replace(boldUnder, QStringLiteral("\\1"));
+        t.replace(italUnder, QStringLiteral("\\1"));
+        t.remove(QLatin1Char('*'));
+        t.remove(QLatin1Char('~'));
+        t.remove(QLatin1Char('`'));
+        t.remove(QChar(0x200b));
+        const QString name = sanitizeFileName(t);
+        if (!name.isEmpty())
+            return name;
+        // 整行剥完为空(纯标记行/空公式):继续找下一行
+    }
+    return {};
 }
 
 void FileService::pushRecentFile(const QString &path)

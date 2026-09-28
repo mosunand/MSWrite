@@ -4,7 +4,7 @@
  */
 (function () {
     'use strict';
-    var MSW_BRIDGE_VERSION = 136;
+    var MSW_BRIDGE_VERSION = 137;
     window.msbridgeVer = MSW_BRIDGE_VERSION;
     window.mswValue = function () { return vd ? vd.getValue() : ''; }; // 启动校验(C++ 读日志) // 缓存排查:每次改动必须递增
 
@@ -92,6 +92,38 @@
             || document.querySelector('.vditor-wysiwyg pre.vditor-reset')
             || document.querySelector('.vditor-wysiwyg')
             || document.querySelector('.vditor-sv textarea');
+    }
+
+    // ------------------------------------------------------------------
+    // 文档开头正文(未命名文档的默认文件名候选):首个非空行【原文】,
+    // 跳过代码围栏与块级公式整体。剥 Markdown 标记由 C++ 侧统一做。
+    // ------------------------------------------------------------------
+    function firstLineRaw() {
+        if (!lastValue) return '';
+        var lines = lastValue.split('\n');
+        var fenceCh = null, fenceLen = 0, inMath = false;
+        for (var i = 0; i < lines.length; i++) {
+            var t = lines[i].trim();
+            if (fenceCh) {
+                var n = 0;
+                while (n < t.length && t.charAt(n) === fenceCh) n++;
+                if (n >= fenceLen && !t.slice(n).trim()) fenceCh = null;
+                continue;
+            }
+            if (inMath) { if (t === '$$') inMath = false; continue; }
+            var fm = /^(`{3,}|~{3,})/.exec(t);
+            if (fm) { fenceCh = t.charAt(0); fenceLen = fm[1].length; continue; }
+            if (t === '$$') { inMath = true; continue; }
+            if (t) return t.slice(0, 200);
+        }
+        return '';
+    }
+    var lastFirstLine = null;
+    function pushFirstLine() {
+        var t = firstLineRaw();
+        if (t === lastFirstLine) return;   // 没变就不发
+        lastFirstLine = t;
+        post({ t: 'firstLine', text: t });
     }
 
     // Empty math loaded by Lute contains wbr caret bookmarks. Vditor restores
@@ -464,6 +496,7 @@
         statsTimer = setTimeout(function () {
             pushStats();
             pushOutline();
+            pushFirstLine();   // 默认文件名候选(有变化才发)
             renderColorTags();
             decorateAllCodeBlocks();
             updateMathPop();   // 气泡内容跟随公式源码
@@ -3604,6 +3637,7 @@
                 decorateAllCodeBlocks();
                 pushStats();
                 pushOutline();
+                pushFirstLine();       // 初始内容(含 msInitialState 路径)的文件名候选
                 if (!vdReady) {
                     vdReady = true;
                     var q = initQueue.splice(0);
@@ -3719,6 +3753,7 @@
             setTimeout(function () {
                 pushStats();
                 pushOutline();
+                pushFirstLine();   // 程序设值也更新默认文件名候选
                 if (docHost) rewriteAllImgs(document);
                 renderColorTags();   // 正文里的 <font> 标签渲染成真颜色
                 decorateAllCodeBlocks();   // setValue 重渲染后重挂行号

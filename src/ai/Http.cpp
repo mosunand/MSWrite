@@ -6,6 +6,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QThreadStorage>
 #include <QTimer>
 
 #include <atomic>
@@ -13,6 +14,17 @@
 namespace {
 
 std::atomic<bool> g_abort{false};
+
+// 每线程一个 QNetworkAccessManager:同一网关的连续请求(流式/重试/回退)
+// 复用连接与 TLS 会话,而不是每个请求都重新握手。QThreadStorage 在线程
+// 结束时于本线程内销毁,满足 QObject 的线程亲和要求。
+QNetworkAccessManager *sharedNam()
+{
+    static QThreadStorage<QNetworkAccessManager *> pool;
+    if (!pool.hasLocalData())
+        pool.setLocalData(new QNetworkAccessManager);
+    return pool.localData();
+}
 
 } // namespace
 
@@ -59,8 +71,8 @@ HttpResult get(const QUrl &url,
                int timeoutMs,
                int maxBytes)
 {
-    QNetworkAccessManager nam;
-    QNetworkReply *reply = nam.get(makeRequest(url, headers));
+    QNetworkAccessManager *nam = sharedNam();
+    QNetworkReply *reply = nam->get(makeRequest(url, headers));
 
     HttpResult r;
     QEventLoop loop;
@@ -132,7 +144,6 @@ HttpResult postJson(const QUrl &url,
                     const QList<QPair<QByteArray, QByteArray>> &headers,
                     int timeoutMs)
 {
-    QNetworkAccessManager nam;
     auto hdrs = headers;
     bool hasCt = false;
     for (const auto &h : hdrs) {
@@ -142,7 +153,8 @@ HttpResult postJson(const QUrl &url,
     if (!hasCt)
         hdrs.append(qMakePair(QByteArray("Content-Type"), QByteArray("application/json")));
 
-    QNetworkReply *reply = nam.post(makeRequest(url, hdrs), body);
+    QNetworkAccessManager *nam = sharedNam();
+    QNetworkReply *reply = nam->post(makeRequest(url, hdrs), body);
 
     HttpResult r;
     QEventLoop loop;
@@ -197,7 +209,6 @@ HttpResult postSse(const QUrl &url,
                    int timeoutMs,
                    const std::function<void(const QByteArray &data)> &onData)
 {
-    QNetworkAccessManager nam;
     auto hdrs = headers;
     bool hasCt = false;
     bool hasAccept = false;
@@ -213,7 +224,8 @@ HttpResult postSse(const QUrl &url,
     if (!hasAccept)
         hdrs.append(qMakePair(QByteArray("Accept"), QByteArray("text/event-stream")));
 
-    QNetworkReply *reply = nam.post(makeRequest(url, hdrs), body);
+    QNetworkAccessManager *nam = sharedNam();
+    QNetworkReply *reply = nam->post(makeRequest(url, hdrs), body);
 
     HttpResult r;
     QEventLoop loop;
@@ -255,7 +267,11 @@ HttpResult postSse(const QUrl &url,
         }
     };
 
+    // 超时语义 = 空闲超时:每收到字节就重置计时。SSE 长回复(含长思考)不再
+    // 受"总时长"封顶,只有连接在 timeoutMs 内一个字节都不来才掐断;
+    // 网关的心跳/注释行同样会触发 readyRead,能防正常空闲误断
     QObject::connect(reply, &QNetworkReply::readyRead, reply, [&]() {
+        timer.start();   // 重置空闲计时(保持原 interval)
         consumeChunk(reply->readAll());
     });
 

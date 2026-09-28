@@ -199,7 +199,7 @@ int main(int argc, char *argv[])
     QApplication app(argc, argv);
     QApplication::setApplicationName(QStringLiteral("Mswrite"));
     QApplication::setOrganizationName(QStringLiteral("Mswrite"));
-    QApplication::setApplicationVersion(QStringLiteral("1.0.0"));
+    QApplication::setApplicationVersion(QStringLiteral("2.0.0"));
     qInstallMessageHandler(fileMessageHandler);
 
     const QStringList args = QCoreApplication::arguments();

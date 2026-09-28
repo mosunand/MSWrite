@@ -7,7 +7,7 @@
 ; (MSWriteData),用户目录下没有权限问题;装 Program Files 需要额外授权。
 
 #define AppName "Mswrite"
-#define AppVersion "1.0.0"
+#define AppVersion "2.0.0"
 #define AppPublisher "moshuai"
 #define AppExe "Mswrite.exe"
 ; 安装源:由 make-installer.ps1 准备的干净暂存目录(已剔除运行期产物:
@@ -43,7 +43,10 @@ MinVersion=10.0
 AllowNoIcons=yes
 
 [Languages]
-Name: "english"; MessagesFile: "compiler:Default.isl"
+; 安装向导使用简体中文(与软件界面一致)。isl 取自 Inno 官方仓库
+; (Files/Languages/ChineseSimplified.isl, 6.5.0+ 版翻译),随工程分发;
+; 本机编译器较旧时,isl 里多出的键会被忽略并回落英文。
+Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
