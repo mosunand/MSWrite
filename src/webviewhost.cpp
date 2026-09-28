@@ -343,6 +343,7 @@ struct WebViewHost::Impl {
     double zoom = 1.0;                  // 页面缩放(控制器就绪后恢复)
     QList<QPair<QString, QString>> extraMappings; // 启动后补加的虚拟主机
     std::function<void()> renderedCb;   // waitRendered 的在途回调
+    int renderRequest = 0;
 
     // ---- 共享环境 ----
     static ICoreWebView2Environment *s_env;
@@ -501,7 +502,7 @@ struct WebViewHost::Impl {
             }
             // 渲染完成信号(waitRendered 注入的脚本回传),内部消费不上抛
             if (obj.value(QStringLiteral("t")).toString() == QLatin1String("rendered")) {
-                if (renderedCb) {
+                if (renderedCb && obj.value(QStringLiteral("request")).toInt() == renderRequest) {
                     auto cb = std::move(renderedCb);
                     renderedCb = nullptr;
                     cb();
@@ -587,8 +588,10 @@ struct WebViewHost::Impl {
     void runScriptNow(const QString &js,
                       const std::function<void(const QString &)> &resultCb = {})
     {
-        if (!web)
+        if (!web) {
+            if (resultCb) resultCb(QString());
             return;
+        }
         auto *done = new ScriptDoneHandler;
         if (resultCb)
             done->onResult = resultCb;
@@ -655,7 +658,8 @@ struct WebViewHost::Impl {
         auto *h = new PrintToPdfHandler;
         h->onDone = std::move(done);
         const std::wstring out = QDir::toNativeSeparators(outPath).toStdWString();
-        web7->PrintToPdf(out.c_str(), ps, h);
+        const HRESULT hr = web7->PrintToPdf(out.c_str(), ps, h);
+        if (FAILED(hr) && h->onDone) h->onDone(false, hr);
         if (ps) ps->Release();
         web7->Release();
         h->Release(); // 运行时在调用期间自持引用,与 runScriptNow 一致
@@ -695,6 +699,9 @@ WebViewHost::WebViewHost(QWidget *parent)
 
 WebViewHost::~WebViewHost()
 {
+    // Controller::Close can synchronously complete pending COM operations,
+    // before QObject's destructor has invalidated QPointers.
+    m_closing = true;
     d->shutdown();
     delete d;
 }
@@ -796,7 +803,9 @@ void WebViewHost::evalWithResult(const QString &js,
 {
     // 不等 pageReady:能收到 JS 消息时 web 必然存在,
     // NavigationCompleted 可能晚于 JS ready(资源仍在加载)
-    d->runScriptNow(js, std::move(result));
+    d->runScriptNow(js, [guard = QPointer<WebViewHost>(this), result = std::move(result)](const QString &value) {
+        if (guard && !guard->m_closing && result) result(value);
+    });
 }
 
 void WebViewHost::openDevTools()
@@ -844,7 +853,9 @@ QString WebViewHost::currentUrl() const
 
 void WebViewHost::printToPdf(const QString &outputPath, std::function<void(bool, HRESULT)> done)
 {
-    d->doPrintToPdf(outputPath, std::move(done));
+    d->doPrintToPdf(outputPath, [guard = QPointer<WebViewHost>(this), done = std::move(done)](bool ok, HRESULT hr) {
+        if (guard && !guard->m_closing && done) done(ok, hr);
+    });
 }
 
 void WebViewHost::waitRendered(std::function<void()> done)
@@ -858,9 +869,10 @@ void WebViewHost::waitRendered(std::function<void()> done)
     // JS 完成后回传 {t:'rendered'};ExecuteScript 无法 await Promise,
     // 因此不能像旧实现那样"发出去 + 猜 500ms"
     d->renderedCb = std::move(done);
+    const int request = ++d->renderRequest;
     // 兜底:页面异常/图片永不 decode 时也要放行,否则导出永久卡住
-    QTimer::singleShot(kRenderTimeoutMs, this, [this] {
-        if (!d->renderedCb)
+    QTimer::singleShot(kRenderTimeoutMs, this, [this, request] {
+        if (!d->renderedCb || d->renderRequest != request)
             return;
         qWarning() << "Mswrite: 渲染等待超时,继续导出";
         auto cb = std::move(d->renderedCb);
@@ -873,11 +885,11 @@ void WebViewHost::waitRendered(std::function<void()> done)
         L"return Promise.all(Array.prototype.map.call(a,function(i){"
         L"return (i.decode?i.decode():Promise.resolve()).catch(function(){0;})}));}"
         L"var fonts=(document.fonts&&document.fonts.ready)?document.fonts.ready:Promise.resolve();"
-        L"function post(){try{window.chrome.webview.postMessage({t:'rendered'});}catch(e){}}"
+        L"function post(){try{window.chrome.webview.postMessage({t:'rendered',request:%1});}catch(e){}}"
         L"new Promise(function(r){requestAnimationFrame(function(){"
         L"requestAnimationFrame(function(){r(0);});});})"
         L".then(function(){return Promise.all([fonts,imgs()]);}).then(post,post);})()";
-    d->runScriptNow(QString::fromWCharArray(js.c_str()));
+    d->runScriptNow(QString::fromWCharArray(js.c_str()).arg(request));
 }
 
 void WebViewHost::resizeEvent(QResizeEvent *event)

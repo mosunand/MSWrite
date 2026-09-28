@@ -7,6 +7,7 @@
 #include <QMainWindow>
 #include <QFutureWatcher>
 #include <QPair>
+#include <QPointer>
 #include <QVector>
 #include <functional>
 
@@ -78,6 +79,7 @@ private:
         bool dirty = false;
         bool awaitingContent = false;  // 正等该 host 回传全文(保存)
         bool closeAfterSave = false;   // 保存完成后关闭此标签
+        bool choosingSavePath = false;
         QTimer *autoSave = nullptr;
         int saveRequest = 0;
         QString saveError;
@@ -119,6 +121,8 @@ private:
     void syncStatusFromTab();
     // 未命名文档落盘:标题冲突时加序号;无可用标题回退时间戳名
     QString uniqueUntitledPath(const QString &title) const;
+    // 另存为/导出前的默认名兜底:firstLine 消息未到时同步向页面取一次首行
+    void refreshTitleHint(Tab &tab);
 
     void applyTheme(const QString &theme, bool persist = true);
     void broadcastTheme() const;
@@ -146,6 +150,7 @@ private:
     void requestExport(int kind);                // 0=html 1=pdf 2=word
     void ensureExportHost();
     void finishExport(const QString &bodyHtml, Tab *tab);
+    void resetExport();
     QString welcomeContent() const;
 
     // 组合键处理(编辑区获得焦点时)
@@ -171,6 +176,9 @@ private:
     QString m_exportPdfTarget;
     bool m_exportAlternates = false;
     int m_exportKind = -1;                       // 待完成的导出类型
+    bool m_exportBusy = false;
+    int m_exportRequest = 0;
+    QPointer<WebViewHost> m_exportSource;
 
     QTabBar *m_tabbar = nullptr;
     QStackedWidget *m_stack = nullptr;

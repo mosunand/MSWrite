@@ -4,7 +4,7 @@
  */
 (function () {
     'use strict';
-    var MSW_BRIDGE_VERSION = 137;
+    var MSW_BRIDGE_VERSION = 139;
     window.msbridgeVer = MSW_BRIDGE_VERSION;
     window.mswValue = function () { return vd ? vd.getValue() : ''; }; // 启动校验(C++ 读日志) // 缓存排查:每次改动必须递增
 
@@ -17,6 +17,7 @@
     var rev = 0;                   // 文档修订号:每次内容变化自增,保存快照靠它判新旧
     var suppressUntil = 0;         // 程序设值后此时间窗内不视为脏
     var statsTimer = null;
+    var selectionStatsTimer = null;
     var initial = window.msInitialState || {};
     var lastValue = typeof initial.content === 'string' ? initial.content : '';
     var themePending = initial.theme || 'light';
@@ -100,7 +101,7 @@
     // ------------------------------------------------------------------
     function firstLineRaw() {
         if (!lastValue) return '';
-        var lines = lastValue.split('\n');
+        var lines = lastValue.slice(0, 65536).split('\n');
         var fenceCh = null, fenceLen = 0, inMath = false;
         for (var i = 0; i < lines.length; i++) {
             var t = lines[i].trim();
@@ -120,11 +121,19 @@
     }
     var lastFirstLine = null;
     function pushFirstLine() {
-        var t = firstLineRaw();
+        // Native code owns Markdown stripping. Send a bounded prefix so blank
+        // markers, comments and front matter cannot hide the real first title.
+        var t = lastValue.slice(0, 65536);
         if (t === lastFirstLine) return;   // 没变就不发
         lastFirstLine = t;
         post({ t: 'firstLine', text: t });
     }
+    // 供 C++ 在"另存为/导出"对话框弹出前同步兜底取一次首行:
+    // firstLine 消息有 300ms 防抖,打完字立刻保存时还没发出
+    window.mswFirstLine = firstLineRaw;
+    window.mswTitleSource = function () {
+        return (vd ? vd.getValue() : lastValue).slice(0, 65536);
+    };
 
     // Empty math loaded by Lute contains wbr caret bookmarks. Vditor restores
     // the FIRST wbr on Enter/undo, even if it belongs to an unrelated formula.
@@ -493,6 +502,7 @@
         scheduleGutters();
         scheduleLangSuggest();
         clearTimeout(statsTimer);
+        clearTimeout(selectionStatsTimer);
         statsTimer = setTimeout(function () {
             pushStats();
             pushOutline();
@@ -563,8 +573,9 @@
             } catch (e) {}
         }
         scheduleCbEditSync();
-        clearTimeout(statsTimer);
-        statsTimer = setTimeout(function () { pushStats(); renderColorTags(); }, 350);
+        // Moving the caret must not cancel pending content/title/outline work.
+        clearTimeout(selectionStatsTimer);
+        selectionStatsTimer = setTimeout(function () { pushStats(); renderColorTags(); }, 350);
     }
     document.addEventListener('selectionchange', onSelectionChange);
 
@@ -847,6 +858,7 @@
     // 超大代码块(行数超过此值)不做语法着色/编辑态覆盖层:
     // 每次按键都全文重着色 + 整块 innerHTML 替换会把主线程拖死(卡死)
     var MS_HL_MAX_LINES = 400;
+    var MS_HL_MAX_CHARS = 32000;
     // 光标所在块的可视代码元素:编辑态用源码 pre,阅读态用预览 pre。
     // 两者取错会导致行号贴到 display:none 的元素上(矩形全零)
     function activeCodeEl(block) {
@@ -954,6 +966,12 @@
         for (var i = 0; i < blocks.length; i++) {
             var block = blocks[i];
             var col = cols[i];
+            // With line numbers off, only the active block needs geometry or
+            // source text. Reading every code block on every scroll is costly.
+            if (!showLineNumbers && block !== window._msCbEdit) {
+                block.classList.remove('ms-cb-hi-ready');
+                continue;
+            }
             if (showLineNumbers && !col) {
                 col = document.createElement('div');
                 col.className = 'ms-gutter-col';
@@ -1005,7 +1023,7 @@
             if (block === window._msCbEdit
                 && block.classList.contains('vditor-ir__node--expand')
                 && window.hljs && !isRenderedBlock(block, lang)
-                && n <= MS_HL_MAX_LINES) {
+                && n <= MS_HL_MAX_LINES && text.length <= MS_HL_MAX_CHARS) {
                 seenHi = true;
                 if (!hiCol || hiCol.parentNode !== layer) {
                     hiCol = document.createElement('div');
@@ -1014,7 +1032,8 @@
                     layer.appendChild(hiCol);
                 }
                 hiPre = codeEl.closest('pre');
-                var html = highlightCode(text, lang);
+                var signature = lang + '\n' + text;
+                var html = hiCol.__source === signature ? hiCol.__html : highlightCode(text, lang);
                 if (html === null) {
                     var d = document.createElement('div');
                     d.textContent = text;
@@ -1024,6 +1043,7 @@
                     hiCol.__html = html;
                     hiCol.innerHTML = html;
                 }
+                hiCol.__source = signature;
                 var preRect = hiPre.getBoundingClientRect();
                 var hiCss = 'display:block;' + fontCssOf(cs)
                     + 'left:' + (codeRect.left - irRect.left) + 'px;'
@@ -1036,6 +1056,7 @@
                 // 滚动监听跟着当前 pre 走:两个代码块之间直接跳转时,
                 // hiCol 复用但 pre 换了,监听必须重绑到新 pre 上
                 if (hiCol._msBoundPre !== hiPre && hiPre) {
+                    if (hiCol._msBoundPre) hiCol._msBoundPre.removeEventListener('scroll', scheduleGutters);
                     hiCol._msBoundPre = hiPre;
                     hiPre.addEventListener('scroll', scheduleGutters);
                 }
@@ -1048,13 +1069,14 @@
             }
         }
         if (!seenHi) {
+            if (hiCol && hiCol._msBoundPre) hiCol._msBoundPre.removeEventListener('scroll', scheduleGutters);
             if (hiCol && hiCol.parentNode) hiCol.remove();
             hiCol = null;
             hiPre = null;
         }
     }
     function highlightCode(text, lang) {
-        if (!window.hljs) return null;
+        if (!window.hljs || text.length > MS_HL_MAX_CHARS) return null;
         // 只按已知语言着色;未标语言/未知语言保持纯文本(Typora 同款),
         // 不做 auto 猜测 —— 猜错比不上色更糟
         if (!lang || !window.hljs.getLanguage(lang)) return null;
@@ -1082,7 +1104,7 @@
         if (isRenderedBlock(block, lang)) return;
         var raw = previewRawText(code);
         // 超大块跳过重着色(每次输入都整块重写会拖死界面)
-        if (raw.split('\n').length > MS_HL_MAX_LINES) return;
+        if (raw.length > MS_HL_MAX_CHARS || raw.split('\n').length > MS_HL_MAX_LINES) return;
         ensureHljs();
         // Vditor 自己的 codeRender 已经用同一个 hljs 着过色(span 还在),
         // 我们再整块重写一遍纯属重复劳动 —— 直接记签名跳过。
@@ -3765,10 +3787,12 @@
         },
 
         // 导出用:渲染后的 HTML(含公式/图表的最终形态)
-        requestHtml: function () {
+        requestHtml: function (request) {
+            var titleSource = window.mswTitleSource();
             renderExportHtml().then(function (html) {
-                post({ t: 'html', html: html });
+                post({ t: 'html', html: html, titleSource: titleSource, request: request || 0 });
             }).catch(function (error) {
+                post({ t: 'exportError', request: request || 0 });
                 post({ t: 'jserror', msg: String(error), src: 'export' });
                 notice('导出渲染失败，请重试');
             });

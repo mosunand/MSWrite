@@ -13,6 +13,8 @@
 #include <QCommandLineParser>
 #include <QDateTime>
 #include <QFile>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QRect>
 #include <QIcon>
 #include <QScreen>
@@ -26,8 +28,17 @@ namespace {
 // 文件日志:排障用(WebView2 打印失败/JS 错误等在 GUI 下无处可见)
 void fileMessageHandler(QtMsgType type, const QMessageLogContext &, const QString &msg)
 {
+    // Qt calls message handlers on the emitting thread, including AI workers.
+    static QMutex mutex;
+    const QMutexLocker lock(&mutex);
     static QFile log(QCoreApplication::applicationDirPath()
                      + QStringLiteral("/mswrite.log"));
+    if (log.isOpen() && log.size() > 2 * 1024 * 1024) {
+        log.close();
+        const QString previous = log.fileName() + QStringLiteral(".1");
+        QFile::remove(previous);
+        QFile::rename(log.fileName(), previous);
+    }
     if (!log.isOpen())
         log.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text);
     if (!log.isOpen())

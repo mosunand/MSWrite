@@ -48,6 +48,7 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QSaveFile>
+#include <QScopeGuard>
 #include <QStackedWidget>
 #include <QStandardPaths>
 #include <QStatusBar>
@@ -71,7 +72,7 @@ QString pageUrl()
 {
     // ?v= 与 bridge.js 版本同步递增:editor.html 本体也绕过缓存
     QString url = QStringLiteral("https://") + QLatin1String(kVirtualHost)
-                + QStringLiteral("/editor.html?v=137");
+                + QStringLiteral("/editor.html?v=139");
     // 开发态才把排障开关传给页面(按键记录器等),生产环境不启用
     if (qEnvironmentVariableIsSet("MSWRITE_DEV"))
         url += QStringLiteral("&dev=1");
@@ -147,6 +148,19 @@ QString imageExtForMime(const QString &mime)
     if (m.contains(QLatin1String("svg")))  return QStringLiteral("svg");
     if (m.contains(QLatin1String("avif"))) return QStringLiteral("avif");
     return QStringLiteral("png");
+}
+
+// ExecuteScript 的结果是 JSON 序列化文本:字符串带引号与转义,包一层数组解析
+QString unquoteJsonString(const QString &v)
+{
+    QString s = v.trimmed();
+    if (s.size() >= 2 && s.startsWith(QLatin1Char('"')) && s.endsWith(QLatin1Char('"'))) {
+        const QJsonDocument d = QJsonDocument::fromJson(
+            QStringLiteral("[%1]").arg(s).toUtf8());
+        if (d.isArray() && d.array().size() == 1)
+            return d.array().at(0).toString();
+    }
+    return v;
 }
 
 } // namespace
@@ -385,7 +399,7 @@ int MainWindow::addTab(const QString &path, const QString &content,
     t.titleHint = FileService::titleFromMarkdown(content);
     connect(t.autoSave, &QTimer::timeout, this, [this,host=t.host] {
         auto *tab=tabForHost(host);
-        if(tab && tab->dirty && m_autoSave)
+        if(tab && tab->dirty && m_autoSave && !tab->choosingSavePath)
             requestContent(*tab);
     });
     t.host->showStartupPreview(content, m_theme, m_fontSize);
@@ -405,8 +419,20 @@ int MainWindow::addTab(const QString &path, const QString &content,
                   QString::fromLatin1(kVirtualHost),
                   resourcesWebDir(),
                   pageUrl(), bootstrap);
-    t.host->setAcceleratorFilter([this](int vk, bool ctrl, bool shift, bool alt) {
-        return handleAccelerator(vk, ctrl, shift, alt);
+    t.host->setAcceleratorFilter([this, host = QPointer<WebViewHost>(t.host)](int vk, bool ctrl, bool shift, bool alt) {
+        if (!ctrl) return false;
+        const bool handled = alt ? (vk == 0xBB || vk == 0xBD || vk == '0')
+            : shift ? QStringLiteral("NSOTFEPW12").contains(QChar(vk))
+            : (QStringLiteral("SOPNWQF0").contains(QChar(vk))
+               || vk == 0xBF || vk == 0xBB || vk == 0xBD || vk == 0xBC);
+        if (!handled) return false;
+        // WebView2 accelerator callbacks are synchronous. Opening a modal
+        // dialog or closing its controller here can deadlock/reenter COM.
+        QTimer::singleShot(0, this, [this, host, vk, ctrl, shift, alt] {
+            if (host && currentTab() && currentTab()->host == host)
+                handleAccelerator(vk, ctrl, shift, alt);
+        });
+        return true;
     });
     // 恢复该文档上次使用的整页缩放(按路径持久化)
     t.zoom = QSettings().value(QStringLiteral("zoom/") + path, 1.0).toDouble();
@@ -455,7 +481,7 @@ int MainWindow::findTabByPath(const QString &path) const
     const QString canon = QFileInfo(path).absoluteFilePath();
     for (int i = 0; i < m_tabs.size(); ++i) {
         if (!m_tabs[i].path.isEmpty()
-            && QFileInfo(m_tabs[i].path).absoluteFilePath() == canon)
+            && QFileInfo(m_tabs[i].path).absoluteFilePath().compare(canon, Qt::CaseInsensitive) == 0)
             return i;
     }
     return -1;
@@ -487,6 +513,33 @@ QString MainWindow::uniqueUntitledPath(const QString &title) const
         path = dir + QLatin1Char('/') + name + QLatin1Char('-')
              + QString::number(i) + QStringLiteral(".md");
     return path;
+}
+
+// 另存为/导出对话框的默认名:titleHint 平时由页面 firstLine 消息维护,
+// 但它有 300ms 防抖 —— 打完字立刻保存时可能还没到。这里同步向页面
+// 要一次文档首行(mswFirstLine),保证对话框默认名总是正确的。
+// 立即回传时事件循环零等待;页面无响应时 800ms 兜底放弃。
+void MainWindow::refreshTitleHint(Tab &tab)
+{
+    if (!tab.host || !tab.host->isPageReady())
+        return;
+    const QPointer<WebViewHost> host(tab.host);
+    QEventLoop loop;
+    QTimer::singleShot(800, &loop, &QEventLoop::quit);
+    host->evalWithResult(
+        QStringLiteral("window.mswTitleSource ? window.mswTitleSource() : null"),
+        [guard = QPointer<QEventLoop>(&loop)](const QString &v) {
+            if (!guard) return; // A late response must never touch a dead stack.
+            guard->setProperty("result", v);
+            guard->quit();
+        });
+    if (!loop.property("result").isValid())
+        loop.exec(QEventLoop::ExcludeUserInputEvents);
+    const QString raw = loop.property("result").toString();
+    // The nested loop can close/reorder tabs. Re-resolve by host identity.
+    if (host && raw.startsWith(QLatin1Char('"')))
+        if (auto *liveTab = tabForHost(host))
+            liveTab->titleHint = FileService::titleFromMarkdown(unquoteJsonString(raw));
 }
 
 MainWindow::Tab *MainWindow::tabForHost(WebViewHost *host)
@@ -591,44 +644,48 @@ void MainWindow::newTab()
 
 void MainWindow::closeTab(int index)
 {
-    if (index < 0 || index >= m_tabs.size())
+    if (m_flushingSaves || index < 0 || index >= m_tabs.size())
         return;
+    if (m_tabs[index].choosingSavePath) return;
     WebViewHost *host=m_tabs[index].host;
     if(host && !m_flushingSaves && m_tabs[index].dirty && m_autoSave) {
         flushSaves({host});
         index=indexOfHost(host);
         if(index<0)return;
     }
-    Tab &t = m_tabs[index];
-    if (t.dirty) {
-        if(t.autoSave)t.autoSave->stop();
+    if (m_tabs[index].dirty) {
+        if(m_tabs[index].autoSave)m_tabs[index].autoSave->stop();
         const auto ret = UiDialogs::confirmSave(this,m_theme,
-            {t.path.isEmpty() ? tr("未命名文档") : QFileInfo(t.path).fileName()},false);
-        if (ret == UiDialogs::SaveChoice::Cancel)
+            {m_tabs[index].path.isEmpty() ? tr("未命名文档") : QFileInfo(m_tabs[index].path).fileName()},false);
+        index = indexOfHost(host);
+        if (index < 0) return;
+        if (ret == UiDialogs::SaveChoice::Cancel) {
+            if (m_autoSave && m_tabs[index].dirty) m_tabs[index].autoSave->start(2000);
             return;
+        }
         if (ret == UiDialogs::SaveChoice::Save) {
             // 先立"存完即关"的意图,再走保存:未命名文档要经另存为,
             // 期间内容回传时靠 closeAfterSave 才能真正把标签关掉
-            t.closeAfterSave = true;
-            if (t.path.isEmpty()) {
+            m_tabs[index].closeAfterSave = true;
+            if (m_tabs[index].path.isEmpty()) {
                 // 未命名文档:先另存为,成功后再走保存关闭流程
-                const int cur = currentTabIndex();
+                const QString activeId = currentTab() ? currentTab()->aiId : QString();
                 m_tabbar->setCurrentIndex(index);
                 const bool okAs = saveFileAs();
-                if (cur >= 0 && cur != index)
-                    m_tabbar->setCurrentIndex(cur);
+                for (int i = 0; i < m_tabs.size(); ++i)
+                    if (m_tabs[i].aiId == activeId) { m_tabbar->setCurrentIndex(i); break; }
                 if (!okAs) {
-                    t.closeAfterSave = false;   // 用户取消了另存为,别等下轮误关
-                    return;
+                    if (auto *live = tabForHost(host)) live->closeAfterSave = false;
                 }
-                if (t.awaitingContent)
-                    return; // saveFileAs 已发起保存,回传后由 closeAfterSave 关闭
+                return;
             }
-            if (!t.awaitingContent)
-                requestContent(t);
+            requestContent(m_tabs[index]);
             return; // 等保存回传后真正关闭
         }
     }
+    Tab &t = m_tabs[index];
+    if (t.autoSave) t.autoSave->stop();
+    if (m_exportSource == host && m_exportKind >= 0) resetExport();
     // 立即关闭(记录到重开栈)
     if (!t.path.isEmpty())
         m_closedFiles.append(t.path);
@@ -889,10 +946,11 @@ bool MainWindow::saveFileAs()
     if (!t)
         return false;
     if (t->pdf) {
-        const QString dest = QFileDialog::getSaveFileName(this, tr("PDF 另存为"), t->path, tr("PDF (*.pdf)"));
+        const QString sourcePath = t->path;
+        const QString dest = QFileDialog::getSaveFileName(this, tr("PDF 另存为"), sourcePath, tr("PDF (*.pdf)"));
         if (dest.isEmpty()) return false;
-        if (QFileInfo(dest).absoluteFilePath() == QFileInfo(t->path).absoluteFilePath()) return true;
-        QFile source(t->path);
+        if (QFileInfo(dest).absoluteFilePath() == QFileInfo(sourcePath).absoluteFilePath()) return true;
+        QFile source(sourcePath);
         QSaveFile target(dest);
         if (!source.open(QIODevice::ReadOnly) || !target.open(QIODevice::WriteOnly)) return false;
         while (!source.atEnd()) {
@@ -901,26 +959,48 @@ bool MainWindow::saveFileAs()
         }
         return target.commit();
     }
+    const QPointer<WebViewHost> selfHost(t->host);
+    if (t->choosingSavePath) return false;
+    t->choosingSavePath = true;
+    const auto restoreAutoSave = qScopeGuard([this, selfHost] {
+        if (auto *live = selfHost ? tabForHost(selfHost) : nullptr) {
+            live->choosingSavePath = false;
+            if (m_autoSave && live->dirty && !live->awaitingContent) live->autoSave->start(2000);
+        }
+    });
+    // Do not let a pending automatic save close this tab or change its path
+    // while the Save As dialog is running its nested event loop.
+    const bool closeAfterSave = t->closeAfterSave;
+    t->closeAfterSave = false;
+    t->autoSave->stop();
+    if (t->awaitingContent && !flushSaves({selfHost})) return false;
+    t = selfHost ? tabForHost(selfHost) : nullptr;
+    if (!t) return false;
     QString suggested = t->path;
     if (suggested.isEmpty()) {
-        // 新建文档:默认名取文档开头正文(titleHint,页面编辑中上报维护);
-        // 没有可用标题回退"未命名"。保存目录默认 exe/MSWriteData
+        // 新建文档:默认名取文档开头正文;firstLine 消息未到时同步兜底取一次
+        // (打完字立刻 Ctrl+S 也能拿到正确默认名)。保存目录默认 exe/MSWriteData
+        refreshTitleHint(*t);
+        t = selfHost ? tabForHost(selfHost) : nullptr;
+        if (!t) return false;
         suggested = m_files->defaultSaveDir() + QLatin1Char('/')
                   + (t->titleHint.isEmpty() ? tr("未命名") : t->titleHint)
                   + QStringLiteral(".md");
     }
     QString path = QFileDialog::getSaveFileName(this, tr("另存为"), suggested,
-                                                FileService::markdownFilters()
-                                                    .join(QStringLiteral(";;")));
-    if (path.isEmpty())
+        tr("Markdown 文档 (*.md *.markdown *.mdown *.txt);;所有文件 (*.*)"));
+    t = selfHost ? tabForHost(selfHost) : nullptr;
+    if (!t) return false;
+    if (path.isEmpty()) {
+        if (m_autoSave && t->dirty) t->autoSave->start(2000);
         return false;
+    }
     if (QFileInfo(path).suffix().isEmpty())
         path += QStringLiteral(".md");
 
     // 另存为到"另一个已打开标签"的路径:直接覆盖会让两个标签指向同一文件,
     // 之后两边各自保存互相踩。先关掉那个已开标签。
-    WebViewHost *selfHost = t->host;
-    const int existing = findTabByPath(path);
+    int existing = findTabByPath(path);
     if (existing >= 0 && m_tabs[existing].host != selfHost) {
         if (m_tabs[existing].dirty) {
             const auto ret = QMessageBox::question(this, tr("文件已打开"),
@@ -929,13 +1009,19 @@ bool MainWindow::saveFileAs()
                 QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
             if (ret != QMessageBox::Yes)
                 return false;
+            t = selfHost ? tabForHost(selfHost) : nullptr;
+            if (!t) return false;
         }
         // 用户已确认覆盖:不要再走 closeTab 的保存询问,否则弹两次。
         // host 指针先记下 —— closeTab 会挪动 QVector,旧 Tab* 立刻失效。
-        m_tabs[existing].dirty = false;
-        m_tabs[existing].awaitingContent = false;
-        m_tabs[existing].closeAfterSave = false;
-        closeTab(existing);
+        existing = findTabByPath(path);
+        if (existing >= 0 && m_tabs[existing].host != selfHost) {
+            if (m_tabs[existing].choosingSavePath) return false;
+            m_tabs[existing].dirty = false;
+            m_tabs[existing].awaitingContent = false;
+            m_tabs[existing].closeAfterSave = false;
+            closeTab(existing);
+        }
         t = tabForHost(selfHost);
         if (!t)
             return false;
@@ -943,6 +1029,7 @@ bool MainWindow::saveFileAs()
 
     const int idx = indexOfHost(t->host);
     t->path = path;
+    t->closeAfterSave = closeAfterSave;
     // 未命名时设的文档默认语言随另存为落到新路径
     if (!t->docLang.isEmpty())
         QSettings().setValue(QStringLiteral("doclang/") + path, t->docLang);
@@ -952,7 +1039,8 @@ bool MainWindow::saveFileAs()
     updateTitle();
     m_files->pushRecentFile(path);
     m_files->setLastOpenedFile(path);
-    return saveFile();
+    requestContent(*t);
+    return true;
 }
 
 void MainWindow::requestContent(Tab &tab)
@@ -1567,7 +1655,7 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
         // DevTools is enabled. The legacy destructive smoke test is opt-in.
         if (qEnvironmentVariableIsSet("MSWRITE_DEV")
             && qEnvironmentVariableIsSet("MSWRITE_SELF_TEST") && tab->path.isEmpty())
-        QTimer::singleShot(3000, this, [this, host = tab->host] {
+        QTimer::singleShot(3000, tab->host, [host = tab->host] {
             host->runScript(QStringLiteral(
                 "(function(){"
                 "var post=function(o){window.chrome.webview.postMessage(o)};"
@@ -1734,13 +1822,25 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
         return;
     }
     if (t == QLatin1String("html")) {
+        if (!m_exportBusy || sender != m_exportSource
+            || obj.value(QStringLiteral("request")).toInt() != m_exportRequest) return;
+        tab->titleHint = FileService::titleFromMarkdown(obj.value(QStringLiteral("titleSource")).toString());
         // 延后到 COM 回调之外:导出要开文件对话框(嵌套事件循环)
         const QString html = obj.value(QStringLiteral("html")).toString();
-        QTimer::singleShot(0, this, [this, host = sender, html] {
+        QTimer::singleShot(0, this, [this, host = QPointer<WebViewHost>(sender), html, request = m_exportRequest] {
+            if (!host || !m_exportBusy || m_exportSource != host || request != m_exportRequest) return;
             Tab *tb = tabForHost(host);   // 回传者才是导出对象,不一定是当前标签
             if (tb)
                 finishExport(html, tb);
         });
+        return;
+    }
+    if (t == QLatin1String("exportError")) {
+        if (m_exportBusy && sender == m_exportSource
+            && obj.value(QStringLiteral("request")).toInt() == m_exportRequest) {
+            resetExport();
+            statusBar()->showMessage(tr("导出渲染失败，请重试"), 5000);
+        }
         return;
     }
     if (t == QLatin1String("pickImage")) {
@@ -1789,12 +1889,13 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
             Tab *lt = tabForHost(host);
             if (!lt)
                 return;
+            const QPointer<WebViewHost> editor(lt->host);
             const QString url = QInputDialog::getText(this, tr("插入链接"),
                 tr("链接地址(选中文字将作为链接文字):"),
                 QLineEdit::Normal, QStringLiteral("https://"));
-            if (url.isEmpty())
+            if (url.isEmpty() || !editor || !tabForHost(editor))
                 return;
-            lt->host->runScript(Bridge::call(QStringLiteral("insertLink"), { url, selText }));
+            editor->runScript(Bridge::call(QStringLiteral("insertLink"), { url, selText }));
         });
         return;
     }
@@ -1934,10 +2035,13 @@ void MainWindow::handlePickImage()
     Tab *t = currentTab();
     if (!t || !t->host)
         return;
+    const QPointer<WebViewHost> editor(t->host);
     const QString src = QFileDialog::getOpenFileName(this, tr("插入图片"),
         m_workspace, tr("图片 (*.png *.jpg *.jpeg *.gif *.webp *.bmp *.svg);;所有文件 (*.*)"));
     if (src.isEmpty())
         return;
+    t = editor ? tabForHost(editor) : nullptr;
+    if (!t) return;
     // 拷入文档 assets(与粘贴同款流程)
     QFile in(src);
     if (!in.open(QIODevice::ReadOnly)) {
@@ -2100,6 +2204,7 @@ void MainWindow::handleReplaceDialog(const QString &prefill)
     Tab *t = currentTab();
     if (!t || !t->host)
         return;
+    const QPointer<WebViewHost> editor(t->host);
     bool okFind = false;
     const QString find = QInputDialog::getText(this, tr("替换 — 查找"), tr("查找内容:"),
                                                QLineEdit::Normal, prefill, &okFind);
@@ -2109,9 +2214,9 @@ void MainWindow::handleReplaceDialog(const QString &prefill)
     const QString repl = QInputDialog::getText(this, tr("替换 — 替换为"),
                                                tr("将 \"%1\" 替换为:").arg(find),
                                                QLineEdit::Normal, QString(), &okRepl);
-    if (!okRepl)
+    if (!okRepl || !editor || !tabForHost(editor))
         return; // 取消不能当成"替换成空"(会把所有命中删掉)
-    t->host->runScript(Bridge::call(QStringLiteral("replaceAll"), { find, repl }));
+    editor->runScript(Bridge::call(QStringLiteral("replaceAll"), { find, repl }));
 }
 
 void MainWindow::onOutlineGoto(int index)
@@ -2315,8 +2420,34 @@ void MainWindow::requestExport(int kind)
     Tab *t = currentTab();
     if (!t || !t->host)
         return;
+    if (m_exportBusy) {
+        statusBar()->showMessage(tr("正在导出，请等待当前导出完成"), 3000);
+        return;
+    }
+    m_exportBusy = true;
+    m_exportSource = t->host;
     m_exportKind = kind;
-    t->host->runScript(QStringLiteral("window.msbridge.requestHtml()"));
+    const int request = ++m_exportRequest;
+    t->host->runScript(QStringLiteral("window.msbridge.requestHtml(%1)").arg(request));
+    QTimer::singleShot(30000, this, [this, request] {
+        if (m_exportBusy && m_exportRequest == request && m_exportKind >= 0) {
+            resetExport();
+            statusBar()->showMessage(tr("导出等待超时，请重试"), 5000);
+        }
+    });
+}
+
+void MainWindow::resetExport()
+{
+    m_exportBusy = false;
+    m_exportKind = -1;
+    m_exportSource.clear();
+    m_exportPdfTarget.clear();
+    m_exportNavPending = false;
+    if (m_exportHost) {
+        m_exportHost->setAlwaysVisible(false);
+        m_exportHost->hide();
+    }
 }
 
 void MainWindow::finishExport(const QString &bodyHtml, Tab *tab)
@@ -2328,8 +2459,7 @@ void MainWindow::finishExport(const QString &bodyHtml, Tab *tab)
 
     // 用"回传 html 的那个标签",而不是 currentTab():请求与回传之间
     // 用户可能已切标签,否则导出文件名与图片映射会张冠李戴
-    const Tab &docTab = *tab;
-    // 未命名文档:导出默认名同样取文档开头正文(titleHint)
+    const Tab docTab = *tab; // Stable across modal dialogs and tab-vector moves.
     const QString base = docTab.path.isEmpty()
                              ? (docTab.titleHint.isEmpty() ? tr("未命名")
                                                            : docTab.titleHint)
@@ -2343,14 +2473,19 @@ void MainWindow::finishExport(const QString &bodyHtml, Tab *tab)
         filter = tr("HTML 页面 (*.html *.htm)");
 
     QString target = QFileDialog::getSaveFileName(this, tr("导出"),
-        (docTab.path.isEmpty() ? QString() : QFileInfo(docTab.path).absolutePath()
-                           + QStringLiteral("/"))
+        (docTab.path.isEmpty() ? m_files->defaultSaveDir() : QFileInfo(docTab.path).absolutePath())
+            + QStringLiteral("/")
             + base + (kind == kExportPdf ? QStringLiteral(".pdf")
                        : kind == kExportWord ? QStringLiteral(".doc")
                                              : QStringLiteral(".html")),
         filter);
-    if (target.isEmpty())
+    if (target.isEmpty()) {
+        resetExport();
         return;
+    }
+    if (QFileInfo(target).suffix().isEmpty())
+        target += kind == kExportPdf ? QStringLiteral(".pdf")
+            : kind == kExportWord ? QStringLiteral(".doc") : QStringLiteral(".html");
 
     QString doc = composeExportHtml(bodyHtml, docTab);
 
@@ -2360,6 +2495,7 @@ void MainWindow::finishExport(const QString &bodyHtml, Tab *tab)
     //   HTML/Word-> 全部还原为 file:/// 本地路径
     {
         QList<ImgMap> all = m_imgMaps;
+        if (!docTab.docHost.isEmpty()) all.append({docTab.docHost, docTab.docDir});
         for (const Tab &t : m_tabs) {
             if (!t.docHost.isEmpty() && !t.docDir.isEmpty())
                 all.append({ t.docHost, t.docDir });
@@ -2388,12 +2524,14 @@ void MainWindow::finishExport(const QString &bodyHtml, Tab *tab)
         if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)
             || f.write(bytes) != bytes.size()) {
             QMessageBox::warning(this, tr("导出失败"), tr("无法写入临时导出页"));
+            resetExport();
             return;
         }
         qWarning() << "Mswrite: 临时导出页已写" << (exeDir + "/export-tmp" + name)
                 << doc.size() << "字符";
         m_exportPdfTarget = target;
         ensureExportHost();
+        if (!docTab.docHost.isEmpty()) m_exportHost->addHostMapping(docTab.docHost, docTab.docDir);
         // 映射必须在每次导出时补:导出宿主只创建一次,映射是创建时登记的,
         // 换文档(或另存为换了目录)后 docHost 变了,不补就解析不到图片。
         // 所有标签一起映射:正文里可能引用其它已打开文档目录下的绝对路径
@@ -2419,12 +2557,19 @@ void MainWindow::finishExport(const QString &bodyHtml, Tab *tab)
             m_exportNavPending = true; // 宿主就绪后由 pageReady 驱动
             m_exportNavUrl = url;
         }
+        QTimer::singleShot(30000, this, [this, request = m_exportRequest] {
+            if (m_exportBusy && m_exportRequest == request && !m_exportPdfTarget.isEmpty()) {
+                resetExport();
+                statusBar()->showMessage(tr("PDF 导出页加载超时，请重试"), 5000);
+            }
+        });
         return;
     }
 
     // HTML / Word:直接写盘
-    QFile f(target);
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    QSaveFile f(target);
+    if (!f.open(QIODevice::WriteOnly)) {
+        resetExport();
         QMessageBox::warning(this, tr("导出失败"), tr("无法写入:\n%1").arg(target));
         return;
     }
@@ -2436,8 +2581,10 @@ void MainWindow::finishExport(const QString &bodyHtml, Tab *tab)
                                    "xmlns:w=\"urn:schemas-microsoft-com:office:word\" "
                                    "xmlns=\"http://www.w3.org/TR/REC-html40\" lang=\"zh-CN\">"));
     }
-    f.write(out.toUtf8());
-    statusBar()->showMessage(tr("已导出 %1").arg(target), 4000);
+    const QByteArray bytes = out.toUtf8();
+    const bool ok = f.write(bytes) == bytes.size() && f.commit();
+    resetExport();
+    statusBar()->showMessage(ok ? tr("已导出 %1").arg(target) : tr("导出失败:无法写入 %1").arg(target), 5000);
 }
 
 void MainWindow::ensureExportHost()
@@ -2469,6 +2616,11 @@ void MainWindow::ensureExportHost()
                 << "待打印=" << !m_exportPdfTarget.isEmpty();
         if (!m_exportPdfTarget.isEmpty()
             && m_exportHost->currentUrl().contains(QLatin1String("export.local/export-"))) {
+            if (!ok) {
+                resetExport();
+                statusBar()->showMessage(tr("PDF 导出页加载失败，请重试"), 5000);
+                return;
+            }
             // 硬闸:当前页确为本次导出页才打印(防止打印到旧页/空白页)
             const QString target = m_exportPdfTarget;
             m_exportPdfTarget.clear();
@@ -2487,8 +2639,7 @@ void MainWindow::ensureExportHost()
                         statusBar()->showMessage(tr("导出 PDF 失败(错误码见 mswrite.log)"), 4000);
                     }
                     // 降级为可隐藏:否则 Chromium 认为永远可见,导出后持续耗 CPU
-                    m_exportHost->setAlwaysVisible(false);
-                    m_exportHost->hide();
+                    resetExport();
                 });
             });
         }
@@ -2701,21 +2852,6 @@ QString MainWindow::insertAiText(const QString &documentId,const QString &text)
     return QStringLiteral("Inserted %1 characters at the caret.")
                .arg(text.size());
 }
-
-namespace {
-// ExecuteScript 的结果是 JSON 序列化文本:字符串带引号与转义,包一层数组解析
-QString unquoteJsonString(const QString &v)
-{
-    QString s = v.trimmed();
-    if (s.size() >= 2 && s.startsWith(QLatin1Char('"')) && s.endsWith(QLatin1Char('"'))) {
-        const QJsonDocument d = QJsonDocument::fromJson(
-            QStringLiteral("[%1]").arg(s).toUtf8());
-        if (d.isArray() && d.array().size() == 1)
-            return d.array().at(0).toString();
-    }
-    return v;
-}
-} // namespace
 
 // 异步读当前文档全文(window.mswValue 由 bridge.js 暴露)
 QJsonObject MainWindow::aiDocumentContext()

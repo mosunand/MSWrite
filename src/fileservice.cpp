@@ -109,8 +109,6 @@ QString FileService::readFile(const QString &path, bool *ok, Encoding *encOut, b
         return {};
     }
     QByteArray raw = f.readAll();
-    if (crlfOut)
-        *crlfOut = raw.contains("\r\n");
     Encoding enc = Encoding::Utf8;
     QString text;
 
@@ -135,6 +133,8 @@ QString FileService::readFile(const QString &path, bool *ok, Encoding *encOut, b
         }
     }
 
+    // Inspect decoded text: UTF-16 stores a zero byte between CR and LF.
+    if (crlfOut) *crlfOut = text.contains(QStringLiteral("\r\n"));
     if (ok) *ok = true;
     if (encOut) *encOut = enc;
     return text;
@@ -193,10 +193,17 @@ QString FileService::sanitizeFileName(QString name)
     name.replace(blanks, QStringLiteral(" "));
     name.remove(illegal);
     name = name.trimmed();
-    if (name.size() > 60)
-        name = name.left(60).trimmed();
-    while (name.endsWith(QLatin1Char('.')))
+    if (name.size() > 60) {
+        int length = 60;
+        if (name.at(length - 1).isHighSurrogate()) --length;
+        name = name.left(length).trimmed();
+    }
+    while (name.endsWith(QLatin1Char('.')) || name.endsWith(QLatin1Char(' ')))
         name.chop(1);
+    static const QRegularExpression reserved(QStringLiteral(
+        "^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\\.|$)"),
+        QRegularExpression::CaseInsensitiveOption);
+    if (reserved.match(name).hasMatch()) name.prepend(QLatin1Char('_'));
     return name;
 }
 
@@ -205,7 +212,14 @@ QString FileService::titleFromMarkdown(const QString &markdown)
     if (markdown.isEmpty())
         return {};
     // 只看开头:标题候选不会埋在 64KB 之后;超大文档不必全文扫描
-    const QStringList lines = markdown.left(64 * 1024).split(QLatin1Char('\n'));
+    QString prefix = markdown.left(64 * 1024);
+    prefix.remove(QChar(0xfeff));
+    static const QRegularExpression comments(QStringLiteral("<!--[\\s\\S]*?(?:-->|$)"));
+    prefix.remove(comments);
+    static const QRegularExpression frontMatter(QStringLiteral(
+        "^---[ \\t]*\\r?\\n[\\s\\S]*?\\n(?:---|\\.\\.\\.)[ \\t]*(?:\\r?\\n|$)"));
+    prefix.remove(frontMatter);
+    const QStringList lines = prefix.split(QRegularExpression(QStringLiteral("\\r\\n|[\\r\\n]")));
 
     // 行首块级标记:可重复组合(# 标题、> 引用、- 列表、1. 有序、[x] 任务)
     static const QRegularExpression lead(QStringLiteral(
@@ -220,11 +234,13 @@ QString FileService::titleFromMarkdown(const QString &markdown)
     static const QRegularExpression italUnder(QStringLiteral("_([^_\\s]+)_"));
     static const QRegularExpression displayMath(QStringLiteral("\\$\\$([^$]+)\\$\\$"));
     static const QRegularExpression inlineMath(QStringLiteral("\\$([^$]+)\\$"));
+    static const QRegularExpression closingHeading(QStringLiteral("\\s+#+\\s*$"));
+    static const QRegularExpression markersOnly(QStringLiteral("^[\\s#*_~`$>+\\-=]+$"));
+    static const QRegularExpression referenceLink(QStringLiteral("!?\\[([^\\]]+)\\]\\[[^\\]]*\\]"));
 
     bool inFence = false;
     QChar fenceChar;
     int fenceLength = 0;
-    bool inMathBlock = false;
     static const QRegularExpression fenceOpen(QStringLiteral("^(`{3,}|~{3,})"));
 
     for (const QString &raw : lines) {
@@ -238,11 +254,6 @@ QString FileService::titleFromMarkdown(const QString &markdown)
                 inFence = false;
             continue;
         }
-        if (inMathBlock) {
-            if (line == QLatin1String("$$"))
-                inMathBlock = false;
-            continue;
-        }
         const auto fence = fenceOpen.match(line);
         if (fence.hasMatch()) {
             inFence = true;
@@ -251,16 +262,17 @@ QString FileService::titleFromMarkdown(const QString &markdown)
             continue;
         }
         if (line == QLatin1String("$$")) {
-            inMathBlock = true;
             continue;
         }
-        if (line.isEmpty())
+        if (line.isEmpty() || markersOnly.match(line).hasMatch())
             continue;
 
         QString t = line;
         t.remove(lead);
+        if (line.startsWith(QLatin1Char('#'))) t.remove(closingHeading);
         t.replace(image, QStringLiteral("\\1"));
         t.replace(link, QStringLiteral("\\1"));
+        t.replace(referenceLink, QStringLiteral("\\1"));
         t.remove(htmlTag);
         t.replace(displayMath, QStringLiteral("\\1"));
         t.replace(inlineMath, QStringLiteral("\\1"));
@@ -269,6 +281,7 @@ QString FileService::titleFromMarkdown(const QString &markdown)
         t.remove(QLatin1Char('*'));
         t.remove(QLatin1Char('~'));
         t.remove(QLatin1Char('`'));
+        t.remove(QLatin1Char('$'));
         t.remove(QChar(0x200b));
         const QString name = sanitizeFileName(t);
         if (!name.isEmpty())

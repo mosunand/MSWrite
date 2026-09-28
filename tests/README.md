@@ -8,6 +8,7 @@ node tests/editor-regression.cjs
 
 Set `NODE_PATH` if Playwright is supplied by an external runtime. Set
 `MSWRITE_BROWSER` to override the default Windows Edge executable path.
+Set `MSWRITE_TEST_FILTER` to run only editor checks whose names contain that text.
 The suite starts a temporary localhost server and closes its browser on exit.
 It does not launch Mswrite, modify user Markdown files, or use saved profiles.
 
@@ -135,3 +136,15 @@ The native suites check Windows clipboard availability first. When OpenClipboard
 is denied, clipboard assertions are printed as SKIP, and the original clipboard is
 not overwritten. Such a run does not verify OS clipboard integration; the remaining
 UI, selection and document tests still run.
+
+## Naming and callback lifetime checks
+
+With `MSWRITE_NATIVE_SMOKE=ON`, CTest also runs `stability-regression`. It uses
+temporary files and Qt file dialogs to verify real WebView2 PDF output, fresh
+Markdown/PDF filename suggestions, manual names, concurrent export requests,
+tab creation during Save As, late title responses, callbacks during controller
+destruction, and UTF-16 CRLF detection. Run native tests in a Windows session
+where WebView2 can start; the restricted filesystem sandbox may prevent navigation.
+
+Editor checks cover selection changes during pending title/outline updates,
+bounded title snapshots and reuse of code highlighting during layout refreshes.

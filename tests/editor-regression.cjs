@@ -50,6 +50,7 @@ async function main() {
         });
         let passed = 0;
         const test = async (name, run) => {
+            if (process.env.MSWRITE_TEST_FILTER && !name.includes(process.env.MSWRITE_TEST_FILTER)) return;
             const errorCount = errors.length;
             await run();
             assert.deepEqual(errors.slice(errorCount), [], `Browser errors in ${name}`);
@@ -586,6 +587,56 @@ x^2 & x < 0 \\
             assert.match(exported.image, /^data:image\/png;base64,/);
             assert.equal(exported.ui, 0);
             assert.equal(await value(), before, 'Export must not change the document');
+        });
+        await test('Caret movement cannot cancel pending title and outline updates', async () => {
+            await load('# Opening title\n\nBody');
+            await page.locator('h1').click();
+            await page.keyboard.press('End');
+            await page.evaluate(() => { window.__messages = []; });
+            await page.keyboard.type(' revised');
+            // Vditor debounces input delivery; move the caret after its final
+            // value reaches the bridge but before our 300 ms content timer.
+            await page.waitForFunction(() => window.mswFirstLine().includes('revised'));
+            await page.evaluate(() => {
+                document.dispatchEvent(new Event('selectionchange'));
+            });
+            await page.waitForFunction(() => window.__messages.some(m => m.t === 'firstLine' && m.text.includes('revised')));
+            const messages = await page.evaluate(() => window.__messages);
+            assert.ok(messages.some(m => m.t === 'firstLine' && m.text.includes('revised')), JSON.stringify(messages));
+            assert.ok(messages.some(m => m.t === 'outline' && m.items.some(i => i.text.includes('revised'))));
+        });
+        await test('Unchanged active code reuses highlighting across layout refreshes', async () => {
+            await load('```javascript\nconst performanceMarker = 42;\nconsole.log(performanceMarker);\n```\n\nTail');
+            await page.locator(`${root} [data-type="code-block"]`).click();
+            await pause(800);
+            assert.ok(await page.locator('.ms-hi-col').count(), 'Fixture must enter highlighted code editing');
+            await page.evaluate(() => {
+                window.__highlightCalls = 0;
+                window.__originalHighlight = window.hljs.highlight;
+                window.hljs.highlight = function (...args) {
+                    window.__highlightCalls++;
+                    return window.__originalHighlight.apply(this, args);
+                };
+            });
+            for (let i = 0; i < 8; i++) {
+                await page.evaluate(() => window.msbridge.resyncDecor());
+                await pause(80);
+            }
+            const calls = await page.evaluate(() => {
+                window.hljs.highlight = window.__originalHighlight;
+                return window.__highlightCalls;
+            });
+            console.log(`HIGHLIGHT_CALLS_FOR_8_LAYOUT_REFRESHES ${calls}`);
+            assert.equal(calls, 0, 'Scrolling/layout must not rerun syntax highlighting for unchanged code');
+        });
+        await test('Title snapshot bounds large documents and export carries its request identity', async () => {
+            await load('**Current title**\n\n' + 'Long body '.repeat(8000));
+            assert.equal(await page.evaluate(() => window.mswTitleSource().length), 65536);
+            await page.evaluate(() => { window.__messages = []; window.msbridge.requestHtml(913); });
+            await page.waitForFunction(() => window.__messages.some(m => m.t === 'html' && m.request === 913));
+            const snapshot = await page.evaluate(() => window.__messages.find(m => m.t === 'html'));
+            assert.ok(snapshot.titleSource.startsWith('**Current title**'));
+            assert.equal(snapshot.titleSource.length, 65536);
         });
         assert.deepEqual(errors, []);
         console.log(`${passed} browser regression checks passed.`);

@@ -155,8 +155,8 @@ int main(int argc, char **argv)
         { "ordered task", QStringLiteral("1. [x] 已完成任务"), QStringLiteral("已完成任务") },
         { "inline code prefix", QStringLiteral("`代码开头`的文档"), QStringLiteral("代码开头的文档") },
         { "inline math prefix", QStringLiteral("$E=mc^2$ 的推导"), QStringLiteral("E=mc^2 的推导") },
-        { "display math skipped", QStringLiteral("$$\n\\frac{1}{2}\n$$\n\n公式后面的标题"),
-          QStringLiteral("公式后面的标题") },
+        { "display math delimiters ignored", QStringLiteral("$$\nE=mc^2\n$$\n\n公式后面的标题"),
+          QStringLiteral("E=mc^2") },
         { "code fence skipped", QStringLiteral("```python\nprint('hi')\n```\n\n围栏后面的标题"),
           QStringLiteral("围栏后面的标题") },
         { "link text kept", QStringLiteral("[链接文字](https://example.com) 开头"),
@@ -170,6 +170,14 @@ int main(int argc, char **argv)
           QStringLiteral("报告 20260928 (第一版)") },
         { "blank lines skipped", QStringLiteral("\n\n**第二行才有效**"), QStringLiteral("第二行才有效") },
         { "empty document", QString(), QString() },
+        { "closing heading markers", QStringLiteral("## **周报** ###"), QStringLiteral("周报") },
+        { "marker-only lines", QStringLiteral("---\n###\n***\n\n**正文标题**"), QStringLiteral("正文标题") },
+        { "display delimiters stripped", QStringLiteral("$$AI生成多媒体内容安全与可信溯源$$"),
+          QStringLiteral("AI生成多媒体内容安全与可信溯源") },
+        { "front matter and comment", QStringLiteral("---\ntitle: metadata\n---\n<!-- hidden\ncomment -->\n# 正文标题"), QStringLiteral("正文标题") },
+        { "reserved device name", QStringLiteral("**CON.txt**"), QStringLiteral("_CON.txt") },
+        { "bare carriage return", QStringLiteral("\r\r# 首行\r正文"), QStringLiteral("首行") },
+        { "reference link", QStringLiteral("[项目文档][ref]\n\n[ref]: https://example.com"), QStringLiteral("项目文档") },
     };
     for (const auto &c : titleCases) {
         test(c.name, [&] {
@@ -187,6 +195,11 @@ int main(int argc, char **argv)
               QStringLiteral("whitespace collapsed: got \"%1\"").arg(collapsed));
         check(FileService::sanitizeFileName(QStringLiteral("尾部点..."))
                   == QStringLiteral("尾部点"), QStringLiteral("trailing dots removed"));
+        const QString emoji = QString(59, QLatin1Char('a')) + QString::fromUtf8("😀");
+        const QString shortName = FileService::sanitizeFileName(emoji);
+        check(!shortName.back().isHighSurrogate(), QStringLiteral("emoji is not split on truncation"));
+        check(FileService::sanitizeFileName(QStringLiteral("NUL")) == QStringLiteral("_NUL"),
+              QStringLiteral("Windows device name is safe"));
     });
 
     const QStringList formulas = {

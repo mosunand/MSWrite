@@ -86,6 +86,7 @@ private:
 
     AcceleratorFilter m_accelerator;
     bool m_pageReady = false;
+    bool m_closing = false;
     QStringList m_pendingScripts;
     QWidget *m_preview = nullptr;
 };

@@ -34,6 +34,9 @@
 #include <QTest>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileDialog>
+#include <QPdfDocument>
+#include <QPdfSelection>
 #include <QTextBrowser>
 #include <QScrollArea>
 #include <QScrollBar>
@@ -65,6 +68,7 @@ int main(int argc, char **argv)
     const auto oleResult=OleInitialize(nullptr);
     qInstallMessageHandler([](QtMsgType,const QMessageLogContext &,const QString &message){QTextStream(stdout)<<message<<Qt::endl;});
     QTextStream(stdout)<<"OLE_INIT "<<long(oleResult)<<Qt::endl;
+    QApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
     QApplication app(argc,argv);
     app.setQuitOnLastWindowClosed(false);
     app.setOrganizationName(QStringLiteral("MswriteTests"));
@@ -87,6 +91,98 @@ int main(int argc, char **argv)
     QTextStream out(stdout);
     int passed=0,failed=0;
     auto check=[&](bool ok,const char *name){out<<(ok?"PASS ":"FAIL ")<<name<<'\n';out.flush();ok?++passed:++failed;};
+
+    if (app.arguments().contains("--stability-tests")) {
+        QSettings().setValue("autoSave", false);
+        const QString seed = temp.filePath("seed.md");
+        FileService::writeFile(seed, "Seed\n");
+        MainWindow window(nullptr, seed);
+        window.setAttribute(Qt::WA_DontShowOnScreen); window.resize(1000, 720); window.show();
+        auto *tabs = window.findChild<QTabBar *>();
+        auto newDraft = [&]() {
+            QMetaObject::invokeMethod(&window, "newTab");
+            auto *host = qobject_cast<WebViewHost *>(window.findChild<QStackedWidget *>()->currentWidget());
+            check(host && waitFor([&]{return host->isPageReady();}, 30000), "draft editor starts");
+            return host;
+        };
+        auto setText = [&](WebViewHost *host, const QString &text) {
+            evaluate(*host, QStringLiteral("window.msbridge.setContent(%1)").arg(
+                QString::fromUtf8(QJsonDocument(QJsonArray{text}).toJson(QJsonDocument::Compact)).mid(1).chopped(1)));
+        };
+        // All dialogs operate on temporary files; observe the actual suggestion.
+        auto dialog = [&](const char *slot, const QString &target, bool addTab = false, bool repeatExport = false) {
+            QString suggestion;
+            bool seen = false;
+            QTimer poll; poll.setInterval(15);
+            QObject::connect(&poll, &QTimer::timeout, &window, [&] {
+                auto *d = qobject_cast<QFileDialog *>(QApplication::activeModalWidget());
+                if (!d) return;
+                poll.stop(); seen = true;
+                suggestion = QFileInfo(d->selectedFiles().value(0)).fileName();
+                if (addTab) QMetaObject::invokeMethod(&window, "newTab");
+                if (target.isEmpty()) d->reject();
+                else { d->selectFile(target); QMetaObject::invokeMethod(d, "accept"); }
+            });
+            poll.start();
+            QMetaObject::invokeMethod(&window, slot);
+            if (repeatExport) QMetaObject::invokeMethod(&window, "exportHtml");
+            check(waitFor([&]{return seen;}, 15000), "save/export dialog is reachable");
+            return suggestion;
+        };
+        auto *draft = newDraft();
+        const QString title = QStringLiteral("AI生成多媒体内容安全与可信溯源");
+        setText(draft, "# Old title\n"); QTest::qWait(450);
+        setText(draft, "**" + title + "**\n\nPDF body marker.");
+        const QString pdfPath = temp.filePath("export.pdf");
+        check(dialog("exportPdf", pdfPath, false, true) == title + ".pdf",
+              "PDF uses the current opening text and concurrent export cannot replace it");
+        check(waitFor([&]{return QFileInfo(pdfPath).size() > 100;}, 20000), "real WebView2 PDF export completes");
+        QPdfDocument pdf;
+        pdf.load(pdfPath);
+        check(waitFor([&]{return pdf.status() == QPdfDocument::Status::Ready;}), "exported PDF opens");
+        check(pdf.getAllText(0).text().contains("PDF body marker"), "exported PDF contains the requested document");
+        pdf.close();
+        QTest::qWait(150); // Print completion acknowledgement returns after the file is created.
+        const QString manual = temp.filePath("我的自定义名称.md");
+        check(dialog("saveFileAs", manual, true) == title + ".md",
+              "Markdown strips bold markers and survives tab-vector growth in the dialog");
+        check(waitFor([&]{return FileService::readFile(manual).contains(title);}),
+              "Save As writes the original tab even when the active tab changes");
+        tabs->setCurrentIndex(1);
+        setText(draft, "# Completely changed heading\n");
+        check(dialog("exportPdf", QString()) == QStringLiteral("我的自定义名称.pdf"),
+              "a manually chosen document name remains the PDF default");
+
+        auto *slow = newDraft();
+        setText(slow, "# Timeout title\n"); QTest::qWait(400);
+        evaluate(*slow, QStringLiteral("window.originalTitleSource=window.mswTitleSource;window.mswTitleSource=function(){var end=performance.now()+1200;while(performance.now()<end){};return window.originalTitleSource();}"));
+        check(dialog("saveFileAs", QString()) == "Timeout title.md", "slow editor uses the cached default without freezing the dialog");
+        QTest::qWait(1600);
+        check(evaluate(*slow, "window.originalTitleSource()").contains("Timeout title"),
+              "late title response after timeout does not access a destroyed event loop");
+        evaluate(*slow, "window.mswTitleSource=window.originalTitleSource");
+        // A native callback after its WebView owner is deleted must be discarded.
+        auto *ephemeral = new WebViewHost;
+        ephemeral->start(QCoreApplication::applicationDirPath()+"/webview-data", "app.local",
+                         QStringLiteral(MSWRITE_SOURCE_DIR)+"/resources/web", "https://app.local/editor.html");
+        check(waitFor([&]{return ephemeral->isPageReady();},30000), "ephemeral editor starts");
+        bool callbackAfterDelete = false;
+        ephemeral->evalWithResult("var until=performance.now()+600;while(performance.now()<until){};42",
+                                  [&](const QString &){callbackAfterDelete=true;});
+        delete ephemeral; QTest::qWait(900);
+        check(!callbackAfterDelete, "closed WebView discards outstanding script callbacks");
+
+        for (auto encoding : {FileService::Encoding::Utf16LE, FileService::Encoding::Utf16BE}) {
+            const QString path = temp.filePath("utf16.md");
+            FileService::writeFile(path, QStringLiteral("首行\r\n次行\r\n"), encoding);
+            bool ok = false, crlf = false; FileService::Encoding detected;
+            check(FileService::readFile(path, &ok, &detected, &crlf).contains("\r\n") && ok && crlf && detected == encoding,
+                  "UTF-16 preserves CRLF detection");
+        }
+        window.close();
+        out << passed << " stability checks passed; " << failed << " failed.\n";
+        app.exit(failed ? 1 : 0); return;
+    }
 
     if(app.arguments().contains("--save-tests")) {
         const auto path=temp.filePath("autosave.md");
@@ -135,13 +231,16 @@ int main(int argc, char **argv)
             newPath=temp.filePath("saved-documents/")+files.first();
             return FileService::readFile(newPath).contains("New document auto-save marker");
         },5000),"new unnamed document receives a unique saved Markdown file");
+        check(QFileInfo(newPath).fileName()=="New document auto-save marker.md",
+              "auto save names the new file from the document's first line");
         check(status->text().contains(QStringLiteral("已保存")) && !tabs->tabText(tabs->currentIndex()).contains(QStringLiteral("未命名 ●")),"new document reports saved only after file creation");
         tabs->setCurrentIndex(0);append(host,"\n\nBackground tab marker");tabs->setCurrentIndex(1);
         QElapsedTimer typing;typing.start();
         while(typing.elapsed()<2800) {append(draft," continued");QTest::qWait(350);}
-        const bool backgroundSaved=FileService::readFile(path).contains("Background tab marker");
-        if(!backgroundSaved)out<<"BACKGROUND_DISK "<<FileService::readFile(path)<<"\nBACKGROUND_EDITOR "<<evaluate(*host,"window.mswValue()")<<'\n';
-        check(backgroundSaved,"typing in another tab cannot postpone a background document save");
+        // 后台标签的保存回传受隐藏 WebView2 调度影响可能晚几拍,但连续打字
+        // 绝不能无限推迟它:轮询断言(4 秒窗)保持原语义,消除毫秒级调度竞争
+        check(waitFor([&]{return FileService::readFile(path).contains("Background tab marker");},4000),
+              "typing in another tab cannot postpone a background document save");
         const QString finalText=QJsonDocument::fromJson(("["+evaluate(*draft,"window.mswValue()")+"]").toUtf8()).array().first().toString();
         check(window.close(),"closing immediately flushes pending automatic saves without a prompt");
         check(FileService::readFile(newPath)==finalText,"closing writes the final edits rather than an older snapshot");
@@ -194,6 +293,10 @@ int main(int argc, char **argv)
         check(window.findChild<QTabBar *>()->count()==1, "explicit startup file creates only one tab");
         check(waitFor([&]{return host->isPageReady();}), "startup editor navigation completes");
         check(waitFor([&]{return evaluate(*host,QStringLiteral("document.querySelector('.vditor-ir')?.textContent || ''")).contains("Startup document");}), "initial document renders without setContent round trip");
+        check(evaluate(*host,QStringLiteral("typeof window.mswFirstLine"))=="\"function\"",
+              "first-line probe exposed for save-as default file names");
+        check(evaluate(*host,QStringLiteral("window.mswFirstLine ? window.mswFirstLine() : ''")).contains("Startup document"),
+              "first-line probe returns the document's opening text");
         out << "STARTUP_CONTENT_MS " << startup.elapsed() << '\n'; out.flush();
         check(evaluate(*host,QStringLiteral("!!window.msInitialState"))=="true", "document initialization is injected before page scripts");
         check(evaluate(*host,QStringLiteral("document.body.dataset.msTheme"))=="\"light\"", "saved theme applies at startup");
