@@ -11,6 +11,16 @@ MSWriteData/
 webview-data/
 export-tmp/
 mswrite.log
+mswrite.log.*
+ai-providers*.json
+ai-session*.json
+ai-doctor.txt
+ai-smoke.txt
+providers.json
+auth.json
+credentials*.json
+.env
+.env.*
 
 # Qt / IDE
 *.user

@@ -25,7 +25,6 @@ protected:
 private:
     void sync();
     void schedule();
-    void updateFallback();
     ChatModel *m_model;
     QTimer m_timer;
     QSet<int> m_dirty;
@@ -37,4 +36,5 @@ private:
     bool m_inFlight = false;
     bool m_pendingSync = false;
     int m_failures = 0;
+    int m_sequence = 0;
 };

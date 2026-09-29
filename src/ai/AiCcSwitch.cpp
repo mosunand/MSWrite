@@ -11,6 +11,7 @@
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QVariant>
+#include <QUuid>
 
 namespace {
 
@@ -58,7 +59,7 @@ AiCcProvider parseSettings(const QString &id, const QString &name,
             QStringLiteral("ANTHROPIC_MODEL"),
             QStringLiteral("ANTHROPIC_DEFAULT_SONNET_MODEL"),
         });
-        // 模型名保留 [1M] 后缀:导入时拆成 contextWindow
+        // 模型名原样保留，包括网关后缀。
     } else if (appType == QLatin1String("codex")) {
         p.protocol = Protocol::OpenAi;
         p.apiKey = auth.value(QStringLiteral("OPENAI_API_KEY")).toString();
@@ -87,43 +88,6 @@ AiCcProvider parseSettings(const QString &id, const QString &name,
     return p;
 }
 
-AiCcProvider loadWhere(const QString &whereSql, const QVariant &bind)
-{
-    AiCcProvider p;
-    const QString dbPath = AiCcSwitch::dbPath();
-    if (!QFileInfo::exists(dbPath)) {
-        p.error = QStringLiteral("cc-switch db not found: %1").arg(dbPath);
-        return p;
-    }
-
-    const QString conn = QStringLiteral("mswrite-ccswitch");
-    {
-        QSqlDatabase db = QSqlDatabase::contains(conn)
-            ? QSqlDatabase::database(conn)
-            : QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), conn);
-        db.setDatabaseName(dbPath);
-        db.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
-        if (!db.open()) {
-            p.error = QStringLiteral("cannot open cc-switch db: %1").arg(db.lastError().text());
-            return p;
-        }
-        QSqlQuery q(db);
-        q.prepare(QStringLiteral(
-            "SELECT id, name, app_type, settings_config FROM providers WHERE %1 LIMIT 1")
-                      .arg(whereSql));
-        q.addBindValue(bind);
-        if (!q.exec() || !q.next()) {
-            p.error = QStringLiteral("no matching cc-switch provider");
-            return p;
-        }
-        p = parseSettings(q.value(0).toString(),
-                          q.value(1).toString(),
-                          q.value(2).toString(),
-                          q.value(3).toString());
-    }
-    return p;
-}
-
 } // namespace
 
 QString AiCcSwitch::dbPath()
@@ -137,20 +101,19 @@ QString AiCcSwitch::dbPath()
 
 AiCcProvider AiCcSwitch::loadCurrent()
 {
-    // 优先当前选中的 claude 系供应商
-    AiCcProvider p = loadWhere(QStringLiteral("is_current = 1 AND app_type LIKE ?"),
-                               QStringLiteral("claude%"));
-    if (p.ok)
-        return p;
-    p = loadWhere(QStringLiteral("is_current = 1 AND app_type = ?"), QStringLiteral("codex"));
-    if (p.ok)
-        return p;
-    p = loadWhere(QStringLiteral("is_current = 1 AND id IS NOT ?"), QString());
-    if (p.ok)
-        return p;
-    if (p.error.isEmpty())
-        p.error = QStringLiteral("cc-switch has no current provider");
-    return p;
+    AiCcProvider selected;
+    int bestRank = 100;
+    for (const AiCcProvider &p : listAll()) {
+        const int rank = p.appType.startsWith(QLatin1String("claude")) ? 0
+                       : p.appType == QLatin1String("codex") ? 1 : 2;
+        if (p.ok && p.isCurrent && rank < bestRank) {
+            selected = p;
+            bestRank = rank;
+        }
+    }
+    if (!selected.ok)
+        selected.error = QStringLiteral("cc-switch has no current provider");
+    return selected;
 }
 
 QVector<AiCcProvider> AiCcSwitch::listAll()
@@ -160,25 +123,26 @@ QVector<AiCcProvider> AiCcSwitch::listAll()
     if (!QFileInfo::exists(dbPath))
         return out;
 
-    const QString conn = QStringLiteral("mswrite-ccswitch");
-    QSqlDatabase db = QSqlDatabase::contains(conn)
-        ? QSqlDatabase::database(conn)
-        : QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), conn);
-    db.setDatabaseName(dbPath);
-    db.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY"));
-    if (!db.open())
-        return out;
-
-    QSqlQuery q(db);
-    if (!q.exec(QStringLiteral(
-            "SELECT id, name, app_type, settings_config FROM providers ORDER BY name"))) {
-        return out;
+    const QString conn = QStringLiteral("mswrite-ccswitch-") + QUuid::createUuid().toString();
+    {
+        QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"), conn);
+        db.setDatabaseName(dbPath);
+        // Bound startup delay when cc-switch is writing; retry on the next launch.
+        db.setConnectOptions(QStringLiteral("QSQLITE_OPEN_READONLY;QSQLITE_BUSY_TIMEOUT=250"));
+        if (db.open()) {
+            QSqlQuery q(db);
+            if (q.exec(QStringLiteral(
+                    "SELECT id, name, app_type, settings_config, is_current FROM providers ORDER BY name, app_type, id"))) {
+                while (q.next()) {
+                    AiCcProvider p = parseSettings(q.value(0).toString(), q.value(1).toString(),
+                                                  q.value(2).toString(), q.value(3).toString());
+                    p.isCurrent = q.value(4).toBool();
+                    out.push_back(p);
+                }
+            }
+        }
     }
-    while (q.next()) {
-        out.push_back(parseSettings(q.value(0).toString(),
-                                    q.value(1).toString(),
-                                    q.value(2).toString(),
-                                    q.value(3).toString()));
-    }
+    // Release SQLite handles after every read; no persistent connection to the user's DB.
+    QSqlDatabase::removeDatabase(conn);
     return out;
 }

@@ -9,13 +9,19 @@
 #include <QJsonDocument>
 #include <QUrl>
 #include <QPointer>
-#include <QLabel>
+#include <QSettings>
 #include <algorithm>
 
 ChatWebView::ChatWebView(ChatModel *model, QWidget *parent)
     : WebViewHost(parent), m_model(model)
 {
-    updateFallback();
+    m_light = QSettings().value(QStringLiteral("aiTheme"),
+        QSettings().value(QStringLiteral("theme"), QStringLiteral("light")).toString() == QLatin1String("dark") ? 0 : 1).toInt() == 1;
+    showLoading(m_light ? "light" : "dark", tr("正在加载对话…"));
+    connect(this, &WebViewHost::loadingRetry, this, [this] {
+        m_ready = false; m_rendered = false; m_reset = true; m_inFlight = false; m_failures = 0;
+        ++m_sequence;
+    });
     m_timer.setSingleShot(true);
     m_timer.setInterval(60);
     connect(&m_timer, &QTimer::timeout, this, &ChatWebView::sync);
@@ -42,11 +48,15 @@ ChatWebView::ChatWebView(ChatModel *model, QWidget *parent)
             m_reset = true;
             sync();
         } else if(type==QLatin1String("chatRendered")) {
+            if (o.value("sequence").toInt() != m_sequence) return;
             m_rendered=true;
             m_failures=0;
+            finishLoading();
         } else if(type==QLatin1String("chatError")) {
             qWarning()<<"Mswrite: chat page error"<<o.value("message").toString();
-            m_rendered=false;updateFallback();
+            m_rendered=false;
+            showLoading(m_light ? "light" : "dark", tr("正在加载对话…"));
+            showLoadingError(tr("对话排版失败，请重新加载。对话内容仍然保留。"));
         } else if (type == QLatin1String("chatCopy")) {
             QApplication::clipboard()->setText(o.value("text").toString());
         } else if (type == QLatin1String("chatRegenerate") && !m_busy) {
@@ -69,30 +79,14 @@ ChatWebView::ChatWebView(ChatModel *model, QWidget *parent)
         web = QStringLiteral(MSWRITE_SOURCE_DIR) + QStringLiteral("/resources/web");
 #endif
     start(exe + QStringLiteral("/webview-data"), QStringLiteral("chat.local"),
-          QDir(web).absolutePath(), QStringLiteral("https://chat.local/chat.html?v=2"));
-}
-
-void ChatWebView::updateFallback()
-{
-    if(m_rendered) return;
-    QStringList messages;
-    int size=0;
-    for(int i=m_model->rowCount()-1;i>=0 && size<28000;--i) {
-        const auto *message=m_model->msgAt(i);
-        if(message->kind==ChatMsg::Thinking) continue;
-        const QString text=QStringLiteral("## %1\n\n%2").arg(message->kind==ChatMsg::User ? tr("我") : tr("AI"),message->text);
-        messages.prepend(text);size+=text.size();
-    }
-    showStartupPreview(messages.join("\n\n"),m_light ? "light" : "dark",16);
-    if(auto *hint=findChild<QLabel *>(QStringLiteral("startupHint")))
-        hint->setText(tr("对话内容已保留 · 正在准备排版…"));
+          QDir(web).absolutePath(), QStringLiteral("https://chat.local/chat.html?v=3"));
 }
 
 void ChatWebView::showEvent(QShowEvent *event)
 {
     WebViewHost::showEvent(event);
-    // Resynchronize after hidden-window navigation or a browser reload.
-    m_reset=true;schedule();
+    // Visibility changes do not invalidate the DOM or the user's scroll position.
+    schedule();
 }
 
 void ChatWebView::schedule()
@@ -101,7 +95,7 @@ void ChatWebView::schedule()
     if (!m_timer.isActive()) m_timer.start();
 }
 
-void ChatWebView::setLightTheme(bool light) { m_light = light; schedule(); }
+void ChatWebView::setLightTheme(bool light) { m_light = light; setLoadingTheme(light ? "light" : "dark"); schedule(); }
 void ChatWebView::setBusy(bool busy) { m_busy = busy; schedule(); }
 
 void ChatWebView::scrollToBottom(bool force)
@@ -113,8 +107,7 @@ void ChatWebView::scrollToBottom(bool force)
 
 void ChatWebView::sync()
 {
-    updateFallback();
-    if (!m_ready || m_inFlight) return;
+    if (!m_ready || m_inFlight || !isVisible()) return;
     m_pendingSync=false;
     QJsonArray rows;
     QList<int> changed;
@@ -132,19 +125,22 @@ void ChatWebView::sync()
             {"meta", m->meta}, {"role", m->role}, {"finalized", m->finalized},
             {"fullText", m->fullText}, {"expandable", m->expandable}, {"preferLatex",m->preferLatex}});
     }
-    const QJsonObject payload{{"reset", m_reset}, {"count", m_model->rowCount()},
+    const int sequence = ++m_sequence;
+    const QJsonObject payload{{"reset", m_reset}, {"count", m_model->rowCount()}, {"sequence", sequence},
                              {"rows", rows}, {"light", m_light}, {"busy", m_busy}};
     m_dirty.clear();
     m_reset = false;
     m_inFlight=true;
     evalWithResult(QStringLiteral("(()=>{if(!window.chatView)return false;window.chatView.update(%1);return true;})()")
         .arg(QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact))),
-        [guard=QPointer<ChatWebView>(this)](const QString &result){
-            if(!guard)return;
+        [guard=QPointer<ChatWebView>(this), sequence](const QString &result){
+            if(!guard || sequence != guard->m_sequence)return;
             guard->m_inFlight=false;
             if(result!=QLatin1String("true")) {
-                guard->m_rendered=false;guard->m_reset=true;guard->updateFallback();
+                guard->m_rendered=false;guard->m_reset=true;
+                guard->showLoading(guard->m_light ? "light" : "dark", tr("正在加载对话…"));
                 if(++guard->m_failures<3) guard->m_timer.start(250);
+                else guard->showLoadingError(tr("对话排版失败，请重新加载。对话内容仍然保留。"));
                 return;
             }
             if(guard->m_pendingSync || guard->m_reset || !guard->m_dirty.isEmpty()) guard->schedule();

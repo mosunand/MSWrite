@@ -196,8 +196,8 @@ void UiDialogs::showAbout(QWidget *parent,const QString &theme)
     layout->addWidget(label(QObject::tr("阅读与 AI"),d));
     layout->addWidget(label(QObject::tr("PDF 文字选择、搜索与目录导航。AI 可按需读取当前文档，支持选区翻译、分析，以及自定义技能。"),d,true));
     layout->addStretch();
-    layout->addWidget(label(QObject::tr("版本 2.0.0  ·  Qt %1  ·  Windows\n编辑内核：WebView2 / Vditor / Lute / KaTeX\n文档保存在本机；AI 请求使用你配置的服务。致敬 Typora。")
-        .arg(QStringLiteral(QT_VERSION_STR)),d,true));
+    layout->addWidget(label(QObject::tr("版本 %1  ·  Qt %2  ·  Windows\n编辑内核：WebView2 / Vditor / Lute / KaTeX\n文档保存在本机；AI 请求使用你配置的服务。致敬 Typora。")
+        .arg(QCoreApplication::applicationVersion(),QStringLiteral(QT_VERSION_STR)),d,true));
     auto *folder=new QPushButton(QObject::tr("打开程序目录"),d);
     QObject::connect(folder,&QPushButton::clicked,d,[]{QDesktopServices::openUrl(QUrl::fromLocalFile(QCoreApplication::applicationDirPath()));});
     layout->addWidget(folder,0,Qt::AlignLeft);closeButton(d);d->show();

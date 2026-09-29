@@ -9,6 +9,7 @@
 
 struct AiCcProvider {
     bool ok = false;
+    bool isCurrent = false;
     QString error;
     QString id;
     QString name;
@@ -16,7 +17,7 @@ struct AiCcProvider {
     Protocol protocol = Protocol::Anthropic;
     QString apiKey;
     QString baseUrl;
-    QString model;   // 可能带 [1M] 后缀,导入时拆分
+    QString model;   // 原样保留，包括 [1M] 等网关后缀
 };
 
 class AiCcSwitch {

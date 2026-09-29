@@ -15,7 +15,8 @@ class QSpinBox;
 class AiConfigDialog : public QDialog {
     Q_OBJECT
 public:
-    explicit AiConfigDialog(AiProviderStore *store, QWidget *parent = nullptr);
+    explicit AiConfigDialog(AiProviderStore *store, QWidget *parent = nullptr,
+                            const QString &theme = QStringLiteral("light"));
 
 private slots:
     void onSelect();
@@ -47,5 +48,6 @@ private:
     QLabel *status_ = nullptr;
     QLabel *fromLabel_ = nullptr;
     bool creating_ = false;
+    bool dark_ = false;
     QString editingName_;
 };

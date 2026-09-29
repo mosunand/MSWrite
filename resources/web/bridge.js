@@ -4,7 +4,7 @@
  */
 (function () {
     'use strict';
-    var MSW_BRIDGE_VERSION = 139;
+    var MSW_BRIDGE_VERSION = 143;
     window.msbridgeVer = MSW_BRIDGE_VERSION;
     window.mswValue = function () { return vd ? vd.getValue() : ''; }; // 启动校验(C++ 读日志) // 缓存排查:每次改动必须递增
 
@@ -14,6 +14,7 @@
     var vd = null;                 // Vditor 实例
     var currentMode = 'ir';
     var imgSeq = 0;
+    var pendingImages = Object.create(null);
     var rev = 0;                   // 文档修订号:每次内容变化自增,保存快照靠它判新旧
     var suppressUntil = 0;         // 程序设值后此时间窗内不视为脏
     var statsTimer = null;
@@ -3403,6 +3404,7 @@
     //   ./assets/xx(旧文档相对路径)-> https://<docHost>/assets/xx
     // ------------------------------------------------------------------
     var imgDirs = [];  // [{host, prefix}] 由 C++ setImgDirs 下发
+    var savedImageHosts = [], savedImageFiles = {}, savedImageHostSignature = '';
 
     function rewriteImg(img) {
         var src = img.getAttribute('src') || '';
@@ -3419,6 +3421,14 @@
             return; // 不在任何池中:不改写
         }
         if (!docHost) return;
+        for (var hi = 0; hi < savedImageHosts.length; hi++) {
+            var oldPrefix = 'https://' + savedImageHosts[hi] + '/';
+            if (src.indexOf(oldPrefix) === 0 && savedImageFiles[src.slice(oldPrefix.length)]) {
+                var nextSrc = 'https://' + docHost + '/' + src.slice(oldPrefix.length);
+                if (nextSrc !== src) img.setAttribute('src', nextSrc);
+                return;
+            }
+        }
         var m = /^(\.\/|\/)?(assets\/[^?#]+)$/.exec(src);
         if (m)
             img.setAttribute('src', 'https://' + docHost + '/' + m[2]);
@@ -3449,10 +3459,21 @@
     // ------------------------------------------------------------------
     // 图片粘贴:统一入口。截图(剪贴板)与拖拽文件都走这里
     // ------------------------------------------------------------------
+    function captureImagePaste(rid) {
+        var root = editorRoot(), selection = window.getSelection();
+        var range = selection && selection.rangeCount ? selection.getRangeAt(0) : null;
+        var active = document.activeElement;
+        pendingImages[rid] = { root: root,
+            blocked: active && /^(INPUT|TEXTAREA)$/.test(active.tagName) && (!root || !root.contains(active)),
+            range: range && root && root.contains(range.commonAncestorContainer)
+            ? range.cloneRange() : null };
+    }
     function sendImage(file) {
         var rid = ++imgSeq;
+        captureImagePaste(rid);
         var reader = new FileReader();
         reader.onload = function () {
+            if (!pendingImages[rid]) return; // The document was replaced while reading.
             var res = String(reader.result);
             var b64 = res.split(',')[1] || '';
             // 带上真实 MIME:C++ 侧按它决定落盘扩展名(截图/拖入的 jpg、webp
@@ -3464,6 +3485,10 @@
                 mime: mime,
                 base64: b64
             });
+        };
+        reader.onerror = function () {
+            delete pendingImages[rid];
+            notice('无法读取剪贴板图片，请重新截图后粘贴');
         };
         reader.readAsDataURL(file);
     }
@@ -3507,13 +3532,24 @@
 
     // 捕获阶段拦截:Ctrl+Shift+V 纯文本 / 图片粘贴
     document.addEventListener('paste', function (e) {
+        var root = editorRoot();
+        if (!root || !root.contains(e.target)) return;
+        // Screenshots may also advertise HTML/text. Prefer actual image bytes
+        // before rich-text or LaTeX paste handling can consume the event.
+        var imageItems = e.clipboardData && e.clipboardData.items;
+        for (var ii = 0; imageItems && ii < imageItems.length; ii++) {
+            if (imageItems[ii].kind !== 'file' || !/^image\//.test(imageItems[ii].type || '')) continue;
+            var imageFile = imageItems[ii].getAsFile();
+            if (imageFile) {
+                e.preventDefault(); e.stopPropagation(); sendImage(imageFile); return;
+            }
+        }
         if (e.clipboardData && Array.prototype.indexOf.call(e.clipboardData.types, 'text/plain') !== -1 &&
             insertMathSource(e.clipboardData.getData('text/plain'))) {
             e.preventDefault();
             e.stopPropagation();
             return;
         }
-        var root = editorRoot();
         var codeTarget = preferLatex && currentMode === 'ir' ? currentCodeBlock() : null;
         if (codeTarget && e.clipboardData) {
             var beforeCodePaste = blockMarkdown(codeTarget);
@@ -3550,19 +3586,6 @@
                 }
             }
         }
-        if (!items)
-            return;
-        for (var i = 0; i < items.length; i++) {
-            if (items[i].kind === 'file' && /^image\//.test(items[i].type || '')) {
-                var file = items[i].getAsFile();
-                if (file) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    sendImage(file);
-                }
-                return;
-            }
-        }
         // 纯文本/富文本粘贴:不拦截,交给 vditor
     }, true);
 
@@ -3591,7 +3614,7 @@
         vd = new Vditor('vd', {
             mode: mode,
             lang: 'zh_CN',
-            theme: 'classic',
+            theme: themePending === 'dark' ? 'dark' : 'classic',
             cdn: 'vditor',
             value: value || '',
             height: '100%',
@@ -3667,6 +3690,15 @@
                         try { q[i](); } catch (e) { console.error(e); }
                     }
                     post({ t: 'ready' });
+                    window.msWaitForRender(document.getElementById('vd'), function () {
+                        return Array.from(document.querySelectorAll('.vditor-ir__preview .language-math'))
+                            .some(function (el) { return el.textContent.trim() && !el.querySelector('.katex,.katex-error')
+                                && !el.classList.contains('vditor-reset--error'); })
+                            || Array.from(document.querySelectorAll('.vditor-ir__preview .language-mermaid'))
+                            .some(function (el) { return el.textContent.trim() && !el.querySelector('svg')
+                                && !el.classList.contains('vditor-reset--error'); });
+                    }).then(function () { post({ t: 'editorRendered' }); },
+                            function () { post({ t: 'editorLoadError' }); });
                 }
             }
         });
@@ -3763,6 +3795,7 @@
             latexBefore = null; clearTimeout(latexTimer);
         },
         setContent: function (md) {
+            pendingImages = Object.create(null);
             contextMathBlock = null;
             if (!vd) return;
             suppressUntil = Date.now() + 200; // 覆盖 input 事件的触发窗口
@@ -3810,6 +3843,9 @@
 
         // 设置文档目录虚拟主机,并把现有图片 src 改写过去
         setDocHost: function (name) {
+            if (docHost !== String(name || '')) {
+                savedImageHosts = []; savedImageFiles = {}; savedImageHostSignature = '';
+            }
             docHost = String(name || '');
             rewriteAllImgs(document);
             if (!imgObserverStarted && document.body) {
@@ -3831,15 +3867,48 @@
             rewriteAllImgs(document);
         },
 
+        captureImagePaste: captureImagePaste,
+
+        rebindImageHosts: function (hosts, name, files) {
+            // Called only after assets and Markdown were successfully saved.
+            files = files || [];
+            var signature = name + ':' + hosts.join(',') + ':' + files.join(',');
+            if (signature === savedImageHostSignature) return;
+            savedImageHostSignature = signature;
+            savedImageFiles = {};
+            files.forEach(function (file) { savedImageFiles[file] = true; });
+            savedImageHosts = hosts; docHost = name;
+            rewriteAllImgs(document);
+        },
+
         imageSaved: function (rid, rel) {
             if (!vd) return;
+            var pending = pendingImages[rid];
+            if (rid && !pending) return; // Ignore stale/duplicate replies.
+            delete pendingImages[rid];
+            if (pending && pending.blocked) { notice('请先将光标放到文档中，再粘贴图片'); return; }
+            if (pending && pending.root !== editorRoot()) {
+                notice('编辑视图已切换，请重新粘贴图片'); return;
+            }
+            vd.focus();
+            if (pending && pending.range && pending.range.startContainer.isConnected && pending.range.endContainer.isConnected) {
+                var selection = window.getSelection();
+                selection.removeAllRanges(); selection.addRange(pending.range);
+            }
             // ![image-20260916100852457](./assets/image-20260916100852457.png)
             var base = String(rel).split('/').pop().replace(/\.[^.]+$/, '');
-            vd.insertValue('\n![' + base + '](' + rel + ')\n', true);
-            vd.focus();
+            // Explicit user paste must be dirty even immediately after loading.
+            suppressUntil = 0;
+            recordMathUndo();
+            vd.insertMD('\n![' + base + '](' + rel + ')\n');
+            rerender();
+            recordMathUndo();
+            onInput(vd.getValue());
         },
 
         imageRejected: function (rid, err) {
+            delete pendingImages[rid];
+            notice('图片粘贴失败：' + err);
             console.warn('图片保存失败:', err);
         },
 

@@ -38,6 +38,45 @@
     /* 字号(由宿主 setFontSize 调整) */
     .vditor-reset { font-size: var(--ms-font-size, 16px); }
 
+    /* Align prose beside Markdown images with the image center. Exclude
+       emoji and math assets; expanded image sources keep their block preview. */
+    .vditor-ir [data-type="img"] > img,
+    .vditor-preview .vditor-reset img:not(.emoji),
+    .vditor-wysiwyg .vditor-reset img:not(.emoji) { vertical-align: middle; }
+
+    /* Keep editable image Markdown above its preview. An inline image makes
+       the last wrapped source line as tall as the image, splitting the URL
+       between the top and bottom of the preview. Preserve Vditor's marker
+       nodes and expansion lifecycle so selection, undo and serialization work. */
+    .vditor-ir .vditor-ir__node[data-type="img"].vditor-ir__node--expand {
+        display: inline-block;
+        box-sizing: border-box;
+        width: 100%;
+        max-width: 100%;
+        padding: 8px 10px;
+        border: 1px solid var(--border-color, #d1d5da);
+        border-radius: 6px;
+        background: var(--code-background, #f6f8fa);
+        vertical-align: top;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+    }
+    .vditor-ir .vditor-ir__node[data-type="img"].vditor-ir__node--expand > .vditor-ir__marker {
+        font-family: "Cascadia Code", "JetBrains Mono", Consolas, "Courier New", monospace;
+        font-size: 13px;
+        color: var(--textarea-text-color, #24292e);
+        overflow-wrap: anywhere;
+    }
+    .vditor-ir .vditor-ir__node[data-type="img"].vditor-ir__node--expand > .vditor-ir__marker--link {
+        color: var(--ir-link-color, #4285f4);
+    }
+    .vditor-ir .vditor-ir__node[data-type="img"].vditor-ir__node--expand > img {
+        display: block;
+        max-width: 100%;
+        height: auto;
+        margin: 8px auto 0;
+    }
+
     /* 专注模式:淡化非当前块(块在 pre.vditor-reset 内,不在 .vditor-ir 直接子级) */
     body.ms-focus .vditor-ir pre.vditor-reset > *,
     body.ms-focus .vditor-wysiwyg pre.vditor-reset > * {
@@ -557,11 +596,13 @@
 </head>
 <body data-ms-theme="light">
 <div id="vd"></div>
-    <script src="vditor/dist/index.min.js"></script>
-    <script src="vditor/dist/js/highlight.js/highlight.min.js"></script>
-    <script id="vditorKatexScript" src="vditor/dist/js/katex/katex.min.js"></script>
-    <script id="vditorKatexChemScript" src="vditor/dist/js/katex/mhchem.min.js"></script>
-<script src="latex-preference.js?v=136"></script>
-<script src="bridge.js?v=139"></script>
+    <script defer src="vditor/dist/index.min.js"></script>
+    <script defer id="vditorLuteScript" src="vditor/dist/js/lute/lute.min.js"></script>
+    <script defer src="vditor/dist/js/highlight.js/highlight.min.js"></script>
+    <script defer id="vditorKatexScript" src="vditor/dist/js/katex/katex.min.js"></script>
+    <script defer id="vditorKatexChemScript" src="vditor/dist/js/katex/mhchem.min.js"></script>
+<script defer src="latex-preference.js?v=136"></script>
+<script defer src="render-ready.js?v=143"></script>
+<script defer src="bridge.js?v=143"></script>
 </body>
 </html>

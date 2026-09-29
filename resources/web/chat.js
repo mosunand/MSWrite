@@ -11,7 +11,7 @@
     const lute = Lute.New();
     if (lute.SetSanitize) lute.SetSanitize(true);
     if (lute.SetInlineMathAllowDigitAfterOpenMarker) lute.SetInlineMathAllowDigitAfterOpenMarker(true);
-    let follow = true, busy = false, toastTimer;
+    let follow = true, busy = false, toastTimer, paintTicket = 0;
     const button = (label, action) => {
         const b = document.createElement('button'); b.textContent = label; b.dataset.action = action;
         return b;
@@ -126,10 +126,11 @@
             const actions = document.createElement('div'); actions.className='actions';
             el.append(content, actions);
         }
-        if (record.renderedText !== d.text) {
+        if (record.renderedText !== d.text || record.renderedPreferLatex !== !!d.preferLatex) {
             if (d.kind === 0) content.textContent = d.text;
             else markdown(d.preferLatex ? window.msLatexPreference.normalize(d.text) : d.text, content);
             record.renderedText = d.text;
+            record.renderedPreferLatex = !!d.preferLatex;
         }
         content.classList.toggle('streaming', d.kind === 1 && !d.finalized);
         const actions = el.querySelector('.actions'); actions.replaceChildren();
@@ -168,8 +169,13 @@
                 r.data=data; render(r);
             }
             root.querySelectorAll('[data-action="regenerate"]').forEach(b => { b.disabled=busy; });
-            post({t:'chatRendered', count:records.size});
             scrollToBottom();
+            const ticket = ++paintTicket;
+            window.msWaitForRender(root).then(() => {
+                if (ticket === paintTicket) post({t:'chatRendered', count:records.size, sequence:payload.sequence});
+            }, () => {
+                if (ticket === paintTicket) post({t:'chatError', message:'Conversation rendering failed'});
+            });
         }
     };
     window.addEventListener('scroll', () => {

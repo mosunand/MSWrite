@@ -8,6 +8,7 @@
 #include <QFutureWatcher>
 #include <QPair>
 #include <QPointer>
+#include <QSet>
 #include <QVector>
 #include <functional>
 
@@ -91,6 +92,8 @@ private:
         QString stats;                 // 最近统计文本(切标签时恢复)
         QString docHost;               // 本标签文档目录的虚拟主机名(doc{n}.local)
         QString docDir;                // 本标签文档所在目录(与 docHost 配对,用于落盘还原)
+        QVector<QPair<QString, QString>> imageMappings; // Previous document roots survive Save As.
+        QSet<QString> copiedImageTargets;
         QString titleHint;             // 文档开头正文的清洗标题(未命名文档的默认文件名候选)
     };
 
@@ -144,6 +147,8 @@ private:
 
     // 把内部虚拟域 URL 还原为绝对路径(imgpool/doc 主机),保证落盘/导出数据干净
     QString restoreImagePaths(const Tab &tab, QString md) const;
+    bool copyImageAssets(Tab &tab, const QString &markdown, const QString &rawMarkdown,
+                         const QString &path, QString *error) const;
 
     // 导出
     QString composeExportHtml(const QString &bodyHtml, const Tab &tab);
@@ -159,7 +164,7 @@ private:
     // ---------- AI 写作助手 ----------
     void ensureAiDock();                          // 懒创建右侧对话面板
     void toggleAiDock();
-    void openAiConfig();                          // AI 供应商设置对话框
+    void openAiConfig(QWidget *owner = nullptr, const QString &theme = QString());
     void applyCurrentAiProvider();               // 当前供应商 → 面板标签 + 工作线程
     QString insertAiText(const QString &documentId,const QString &text);
     QJsonObject aiDocumentContext();

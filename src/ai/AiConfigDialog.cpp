@@ -1,10 +1,11 @@
 // ai/AiConfigDialog.cpp — see ai/AiConfigDialog.h.
-// 布局参考 MS-Agent 的 ConfigWindow(左列表 + 右表单),配色跟随系统,
+// 布局参考 MS-Agent 的 ConfigWindow(左列表 + 右表单),配色跟随打开它的窗口,
 // 与 Mswrite 其它对话框一致。
 
 #include "ai/AiConfigDialog.h"
 
 #include <QComboBox>
+#include <QCheckBox>
 #include <QDir>
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -14,72 +15,95 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSize>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QSplitter>
 #include <QVBoxLayout>
+#include <windows.h>
 
 namespace {
 
-// 深色主题(与 AI 聊天窗口同一套视觉)
-QString configQss()
+QString configQss(const QString &theme)
 {
+    const bool dark = theme == QLatin1String("dark");
     return QStringLiteral(R"(
 QDialog {
-  background: #0d0d11;
+  background: %1; color: %2;
   font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
   font-size: 13px;
 }
-QLabel { color: #e4e4e7; background: transparent; }
-QLabel#brand { color: #fafafa; font-size: 17px; font-weight: 700; }
-QLabel#sub, QLabel#hint { color: #71717a; font-size: 12px; }
-QLabel#from { color: #a1a1aa; font-size: 12px; }
+QLabel, QCheckBox { color: %2; background: transparent; }
+QLabel#brand { color: %2; font-size: 17px; font-weight: 700; }
+QLabel#sub, QLabel#hint, QLabel#from { color: %5; font-size: 12px; }
 QLineEdit, QComboBox, QSpinBox {
-  background: #16161b; color: #e4e4e7;
-  border: 1px solid #2b2b33; border-radius: 8px; padding: 7px 10px;
+  background: %3; color: %2;
+  border: 1px solid %4; border-radius: 8px; padding: 7px 10px;
   selection-background-color: #2563eb;
 }
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid #3b82f6; }
-QComboBox:editable { background: #16161b; }
+QComboBox:editable { background: %3; }
 QComboBox QAbstractItemView {
-  background: #16161b; color: #e4e4e7;
-  border: 1px solid #2b2b33; selection-background-color: #2563eb;
+  background: %3; color: %2;
+  border: 1px solid %4; selection-background-color: #2563eb; selection-color:white;
 }
 QSpinBox::up-button, QSpinBox::down-button { width: 0; border: none; }
 QListWidget {
-  background: #121216; color: #e4e4e7;
-  border: 1px solid #242429; border-radius: 10px; padding: 4px; outline: none;
+  background: %3; color: %2;
+  border: 1px solid %4; border-radius: 10px; padding: 4px; outline: none;
 }
-QListWidget::item { padding: 8px 10px; border-radius: 8px; margin: 1px; color: #d4d4d8; }
+QListWidget::item { padding: 8px 10px; border-radius: 8px; margin: 1px; color: %2; }
 QListWidget::item:selected { background: #2563eb; color: #ffffff; }
-QListWidget::item:hover:!selected { background: #1b1b21; }
+QListWidget::item:hover:!selected { background: %6; }
 QPushButton {
-  background: #1b1b21; color: #e4e4e7;
-  border: 1px solid #33333c; border-radius: 8px; padding: 7px 14px;
+  background: %3; color: %2;
+  border: 1px solid %4; border-radius: 8px; padding: 7px 14px;
 }
-QPushButton:hover { background: #24242c; }
-QPushButton:pressed { background: #2a2a33; }
+QPushButton:hover, QPushButton:pressed { background: %6; }
 QPushButton#primary { background: #2563eb; border: 1px solid #1d4ed8; color: #fff; font-weight: 600; }
 QPushButton#primary:hover { background: #1d4ed8; }
-QPushButton#danger { color: #f87171; border: 1px solid #7f1d1d; }
-QPushButton#danger:hover { background: #2a1418; }
-QSplitter::handle { background: #16161b; }
+QPushButton#danger { color: %7; border: 1px solid %4; }
+QPushButton#danger:hover { background: %6; border-color:%7; }
+QSplitter::handle { background: %4; }
 QScrollBar:vertical { background: transparent; width: 10px; }
-QScrollBar::handle:vertical { background: #2a2a31; border-radius: 5px; min-height: 36px; }
+QScrollBar::handle:vertical { background: %4; border-radius: 5px; min-height: 36px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-)");
+)").arg(dark ? "#0d0d11" : theme == QLatin1String("paper") ? "#fffdf8" : "#f6f7fa",
+        dark ? "#e4e4e7" : "#253041", dark ? "#16161b" : "#ffffff",
+        dark ? "#33333c" : "#dce1e8", dark ? "#a1a1aa" : "#65738a",
+        dark ? "#24242c" : "#edf2fa", dark ? "#f87171" : "#b42333");
 }
 
 } // namespace
 
-AiConfigDialog::AiConfigDialog(AiProviderStore *store, QWidget *parent)
+AiConfigDialog::AiConfigDialog(AiProviderStore *store, QWidget *parent, const QString &theme)
     : QDialog(parent)
     , store_(store)
+    , dark_(theme == QLatin1String("dark"))
 {
     setWindowTitle(tr("AI 供应商设置"));
     setMinimumSize(QSize(760, 480));
     resize(880, 560);
-    setStyleSheet(configQss());
+    setObjectName(QStringLiteral("aiConfigDialog"));
+    QPalette p = palette();
+    const QColor bg(dark_ ? "#0d0d11" : theme == QLatin1String("paper") ? "#fffdf8" : "#f6f7fa");
+    const QColor fg(dark_ ? "#e4e4e7" : "#253041");
+    p.setColor(QPalette::Window, bg); p.setColor(QPalette::WindowText, fg);
+    p.setColor(QPalette::Base, QColor(dark_ ? "#16161b" : "#ffffff"));
+    p.setColor(QPalette::Text, fg); p.setColor(QPalette::ButtonText, fg);
+    p.setColor(QPalette::PlaceholderText, QColor(dark_ ? "#a1a1aa" : "#65738a"));
+    setPalette(p);
+    setStyleSheet(configQss(theme));
+    using SetAttribute = HRESULT(WINAPI *)(HWND, DWORD, LPCVOID, DWORD);
+    static HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    static auto setAttribute = dwm ? reinterpret_cast<SetAttribute>(GetProcAddress(dwm, "DwmSetWindowAttribute")) : nullptr;
+    if (setAttribute) {
+        const HWND hwnd = reinterpret_cast<HWND>(winId());
+        const BOOL useDark = dark_;
+        const COLORREF caption = RGB(bg.red(), bg.green(), bg.blue()), ink = RGB(fg.red(), fg.green(), fg.blue());
+        setAttribute(hwnd, 20, &useDark, sizeof(useDark));
+        setAttribute(hwnd, 35, &caption, sizeof(caption)); setAttribute(hwnd, 36, &ink, sizeof(ink));
+    }
 
     auto *split = new QSplitter(Qt::Horizontal, this);
 
@@ -115,6 +139,30 @@ AiConfigDialog::AiConfigDialog(AiProviderStore *store, QWidget *parent)
     leftBtns->addWidget(importBtn);
     leftBtns->addWidget(ccBtn);
     leftLay->addLayout(leftBtns);
+
+    auto *autoImport = new QCheckBox(tr("启动时自动导入 cc-switch（含 Key）"), left);
+    autoImport->setObjectName(QStringLiteral("autoImportCcSwitch"));
+    autoImport->setChecked(store_->autoImportCcSwitch());
+    autoImport->setToolTip(tr("读取本机 cc-switch，新增供应商或补全匹配条目的空 Key。\n"
+                            "保留已有配置和当前选择；删除的导入项不会自动恢复。"));
+    connect(autoImport, &QCheckBox::toggled, this, [this, autoImport](bool enabled) {
+        const QString error = store_->setAutoImportCcSwitch(enabled);
+        if (!error.isEmpty()) {
+            const QSignalBlocker blocker(autoImport);
+            autoImport->setChecked(store_->autoImportCcSwitch());
+            setStatus(error, true);
+            return;
+        }
+        if (enabled) {
+            QString report;
+            const int n = store_->importFromCcSwitch(&report, true);
+            rebuildList(store_->currentName());
+            setStatus(report, n < 0);
+        } else {
+            setStatus(tr("已关闭自动导入，已有配置保留"));
+        }
+    });
+    leftLay->addWidget(autoImport);
 
     auto *pathHint = new QLabel(tr("保存到 %1").arg(
         QDir::toNativeSeparators(AiProviderStore::defaultFilePath())), left);
@@ -215,8 +263,8 @@ AiConfigDialog::AiConfigDialog(AiProviderStore *store, QWidget *parent)
 void AiConfigDialog::setStatus(const QString &text, bool error)
 {
     status_->setText(text);
-    status_->setStyleSheet(error ? QStringLiteral("color:#f87171;")
-                                  : QStringLiteral("color:#34d399;"));
+    status_->setStyleSheet(QStringLiteral("color:%1;").arg(error
+        ? (dark_ ? "#f87171" : "#b42333") : (dark_ ? "#34d399" : "#087f5b")));
 }
 
 QString AiConfigDialog::selectedName() const
@@ -235,12 +283,17 @@ void AiConfigDialog::rebuildList(const QString &selectName)
         const bool on = p.name.compare(current, Qt::CaseInsensitive) == 0;
         auto *item = new QListWidgetItem;
         item->setData(Qt::UserRole, p.name);
-        item->setText(QStringLiteral("%1%2\n%3 · %4")
+        const QString state = p.apiKey.trimmed().isEmpty() ? tr("未配置 API Key")
+                            : p.model.trimmed().isEmpty() ? tr("未配置模型")
+                            : p.baseUrl.trimmed().isEmpty() ? tr("未配置 API 地址")
+                            : p.importedFrom.startsWith(QLatin1String("cc-switch:")) ? tr("来自 cc-switch")
+                            : tr("本机配置");
+        item->setText(QStringLiteral("%1%2\n%3 · %4\n%5")
                           .arg(on ? QStringLiteral("● ") : QStringLiteral("   "),
                                p.name,
                                p.model,
-                               protocolName(p.protocol)));
-        item->setSizeHint(QSize(0, 48));
+                               protocolName(p.protocol), state));
+        item->setSizeHint(QSize(0, 70));
         item->setToolTip(p.baseUrl);
         list_->addItem(item);
         if (p.name.compare(want, Qt::CaseInsensitive) == 0)
@@ -358,10 +411,8 @@ void AiConfigDialog::onSave()
 
 void AiConfigDialog::onSetCurrent()
 {
-    if (creating_ || nameEdit_->text().trimmed() != editingName_) {
-        if (!saveEditor())
-            return;
-    }
+    if (!saveEditor())
+        return;
     const QString name = editingName_.isEmpty() ? nameEdit_->text().trimmed() : editingName_;
     const QString err = store_->setCurrent(name);
     if (!err.isEmpty()) {

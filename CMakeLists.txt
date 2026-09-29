@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Mswrite VERSION 2.0.0 LANGUAGES CXX)
+project(Mswrite VERSION 2.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -47,6 +47,7 @@ target_include_directories(Mswrite PRIVATE
 # 源码目录注入:开发态运行时从源码树读取 resources/web 页面资源
 target_compile_definitions(Mswrite PRIVATE
     MSWRITE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    MSWRITE_VERSION="${PROJECT_VERSION}"
 )
 
 target_link_libraries(Mswrite PRIVATE

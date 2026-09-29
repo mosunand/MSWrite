@@ -5,6 +5,7 @@
 #include "ai/Types.h"
 
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 struct AiProvider {
@@ -17,6 +18,7 @@ struct AiProvider {
     Protocol protocol = Protocol::Anthropic;
     int maxTokens = 0;     // 0 = 默认 4096
     QString importedFrom;  // 来源标记(cc-switch:app/name),不参与业务
+    QString importedId;    // 稳定来源标识(cc-switch:app/id)，改名后仍可去重
 };
 
 class AiProviderStore {
@@ -35,16 +37,21 @@ public:
 
     QString add(const AiProvider &p);        // 空 = 成功
     QString upsert(const AiProvider &p, const QString &originalName);
-    QString remove(const QString &name);      // 不能删当前
+    QString remove(const QString &name);      // 删除当前项时选择下一项可用配置
     QString setCurrent(const QString &name);
+    bool autoImportCcSwitch() const { return autoImportCcSwitch_; }
+    QString setAutoImportCcSwitch(bool enabled);
     int importFromMsAgent(QString *report);   // 从 ~/.ms-agent/providers.json 复制副本
-    int importFromCcSwitch(QString *report);  // 从本机 cc-switch(SQLite,只读)复制副本
-    bool hasImportedFrom(const QString &tag) const;
+    int importFromCcSwitch(QString *report, bool automatic = false);
 
 private:
     bool save(QString *err) const;
+    void ensureCurrent();
 
     QString path_;
     QString current_;
     QVector<AiProvider> items_;
+    bool autoImportCcSwitch_ = true;
+    QStringList ignoredCcSwitch_; // 用户删除的来源，自动导入时不恢复
+    QString loadError_;           // 配置损坏/不可读时禁止自动覆盖
 };

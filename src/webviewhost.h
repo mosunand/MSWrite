@@ -19,8 +19,12 @@ public:
     // 返回 true 表示已消费(阻止 Chromium 默认行为)。
     using AcceleratorFilter = std::function<bool(int vk, bool ctrl, bool shift, bool alt)>;
     void setAcceleratorFilter(AcceleratorFilter filter);
-    // Readable first content while the asynchronous browser runtime starts.
-    void showStartupPreview(const QString &markdown, const QString &theme, int fontSize);
+    // Opaque native loading surface; no partially rendered document is exposed.
+    void showLoading(const QString &theme, const QString &text);
+    void setLoadingTheme(const QString &theme);
+    void showLoadingError(const QString &text);
+    void finishLoading();
+    bool isLoading() const { return m_loading != nullptr; }
 
     // 异步启动:首次调用创建共享环境,后续实例直接复用
     void start(const QString &userDataFolder,
@@ -28,7 +32,7 @@ public:
                const QString &virtualFolder,
                const QString &startUrl, const QString &initialScript = QString());
 
-    // 追加虚拟主机映射(须在 navigate 之前设置)
+    // 追加文档/图片目录映射,当前页面立即生效,无需重新导航。
     void addHostMapping(const QString &virtualHost, const QString &folder);
 
     // 置 true 后 WebView2 视为始终可见(隐藏导出页用:不可见时渲染会挂起)
@@ -70,6 +74,7 @@ public:
 signals:
     void pageReady();                 // 首次导航完成
     void navigated(bool ok);          // 每次导航完成
+    void loadingRetry();
     void message(const QJsonObject &obj);               // JS -> C++
 
 protected:
@@ -81,6 +86,8 @@ protected:
 
 private:
     friend struct Impl;
+    void raiseLoading();
+    void retryLoading();
     struct Impl;
     Impl *d = nullptr;
 
@@ -88,5 +95,5 @@ private:
     bool m_pageReady = false;
     bool m_closing = false;
     QStringList m_pendingScripts;
-    QWidget *m_preview = nullptr;
+    QWidget *m_loading = nullptr;
 };

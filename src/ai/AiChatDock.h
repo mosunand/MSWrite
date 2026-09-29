@@ -47,6 +47,7 @@ public:
     void applyProvider(const AiProvider &p); // 更新标签 + 下发工作线程
     void setNoProvider();                    // 未配置时的提示标签
     void clearConversation();                // 清历史 + 清屏
+    bool isLightTheme() const { return m_lightTheme; }
 
 public slots:
     // 工作线程经 BlockingQueuedConnection 调用(在 GUI 线程执行)

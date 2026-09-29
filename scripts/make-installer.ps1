@@ -1,4 +1,4 @@
-# 一键生成安装包:刷新 dist → 准备干净暂存目录 → Inno Setup 编译
+# 一键生成安装包:检查源码 → 从构建/源码组装新目录 → 检查凭据 → Inno Setup 编译
 # 用法: powershell -ExecutionPolicy Bypass -File scripts\make-installer.ps1
 param(
     [string]$QtBin   = "D:\Users\qt\6.8.3\mingw_64\bin",
@@ -9,16 +9,17 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 
-# 1) 刷新便携发布目录(exe + windeployqt + resources/skills)
-& powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "package.ps1") -QtBin $QtBin -BuildDir $BuildDir
+# 1) Audit source and assemble a fresh stage directly from build/source inputs.
+# Never use dist/Mswrite or another installation as an installer source.
+foreach ($sourceDir in @('src','resources','scripts','installer')) {
+    & (Join-Path $PSScriptRoot 'assert-release-clean.ps1') -Path (Join-Path $root $sourceDir)
+}
+$stage = Join-Path $root ("build\installer-stage-" + [Guid]::NewGuid().ToString('N'))
+& powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "package.ps1") -QtBin $QtBin -BuildDir $BuildDir -OutputDir $stage
 if ($LASTEXITCODE -ne 0) { throw "package.ps1 失败" }
 
-# 2) 暂存目录:整目录复制,剔除运行期产物(用户数据/缓存/日志/临时导出)
-$src   = Join-Path $root "dist\Mswrite"
-$stage = Join-Path $root "dist\_stage"
-if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
-robocopy $src $stage /E /XD webview-data export-tmp MSWriteData /XF mswrite.log /NFL /NDL /NJH /NJS /NP | Out-Null
-if ($LASTEXITCODE -ge 8) { throw "robocopy 失败:$LASTEXITCODE" }
+# 2) Refuse private runtime files and literal credentials before compression.
+& (Join-Path $PSScriptRoot 'assert-release-clean.ps1') -Path $stage -Release
 
 $files = (Get-ChildItem $stage -Recurse -File | Measure-Object).Count
 $size  = "{0:N1} MB" -f ((Get-ChildItem $stage -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
@@ -26,7 +27,7 @@ Write-Output "暂存目录就绪:$stage($files 个文件,$size)"
 
 # 3) 编译安装包
 if (-not (Test-Path $Iscc)) { throw "找不到 ISCC.exe:$Iscc" }
-& $Iscc (Join-Path $root "installer\Mswrite.iss")
+& $Iscc /Qp "/DStageDir=$stage" (Join-Path $root "installer\Mswrite.iss")
 if ($LASTEXITCODE -ne 0) { throw "ISCC 编译失败:$LASTEXITCODE" }
 
 $setup = Get-ChildItem (Join-Path $root "dist") -Filter "*-setup.exe" |
@@ -34,17 +35,5 @@ $setup = Get-ChildItem (Join-Path $root "dist") -Filter "*-setup.exe" |
 Write-Output ""
 Write-Output ("安装包完成:{0}({1:N1} MB)" -f $setup.FullName, ($setup.Length / 1MB))
 
-# 4) 发布目录只保留安装包:清掉打包中转(便携目录 + 暂存)。
-# dist\Mswrite 只是打包脚本的组装车间(package.ps1 填充 → robocopy 剔除运行期
-# 产物),编译成功后不再需要。MSWriteData 若有用户文档先搬到 dist 保留。
-$portable = Join-Path $root "dist\Mswrite"
-$userDocs = Join-Path $portable "MSWriteData"
-if ((Test-Path $userDocs) -and (Get-ChildItem $userDocs -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0) {
-    $keep = Join-Path $root "dist\MSWriteData-backup"
-    if (Test-Path $keep) { Remove-Item $keep -Recurse -Force }
-    Move-Item $userDocs $keep
-    Write-Output "便携目录里发现用户文档,已保留到:$keep"
-}
-if (Test-Path $portable) { Remove-Item $portable -Recurse -Force }
-if (Test-Path $stage)    { Remove-Item $stage -Recurse -Force }
-Write-Output "已清理打包中转目录(dist 今后只保留安装包)"
+# 保留便携版及已有数据/备份。每次构建使用独立暂存目录,不递归删除目录。
+Write-Output "验证用暂存目录已保留:$stage；已有便携版未修改"

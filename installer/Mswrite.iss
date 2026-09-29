@@ -7,12 +7,14 @@
 ; (MSWriteData),用户目录下没有权限问题;装 Program Files 需要额外授权。
 
 #define AppName "Mswrite"
-#define AppVersion "2.0.0"
+#define AppVersion "2.2.0"
 #define AppPublisher "moshuai"
 #define AppExe "Mswrite.exe"
 ; 安装源:由 make-installer.ps1 准备的干净暂存目录(已剔除运行期产物:
 ; webview-data / export-tmp / MSWriteData / mswrite.log)
+#ifndef StageDir
 #define StageDir "..\dist\_stage"
+#endif
 
 [Setup]
 AppId={{DB969F9E-765B-4F8A-9271-5B2DCE819775}
@@ -53,7 +55,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; 整目录安装(exe + Qt 运行库 + QML/插件 + resources/skills + WebView2Loader)
-Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#StageDir}\*"; DestDir: "{app}"; Excludes: "ai-providers*.json,providers.json,ai-session*.json,auth.json,credentials*,.env*,mswrite.log*,ai-doctor.txt,ai-smoke.txt,MSWriteData\*,webview-data\*,export-tmp\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"

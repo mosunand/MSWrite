@@ -1,20 +1,26 @@
 # 生成可分发的便携版(全部产物在工程 dist/ 内,零系统安装)
 param(
     [string]$QtBin = "D:\Users\qt\6.8.3\mingw_64\bin",
-    [string]$BuildDir = "build"
+    [string]$BuildDir = "build",
+    [string]$OutputDir
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$out = Join-Path $root "dist\Mswrite"
+$out = if ($OutputDir) { [IO.Path]::GetFullPath($OutputDir) } else { Join-Path $root "dist\Mswrite" }
+if (Test-Path -LiteralPath $out) {
+    if (@(Get-ChildItem -LiteralPath $out -Force).Count) {
+        if ($OutputDir) { throw "发布目录必须为空:$out" }
+        $out = Join-Path $root ("dist\Mswrite-release-" + [Guid]::NewGuid().ToString('N'))
+    }
+}
 
 $exe = Join-Path (Join-Path $root $BuildDir) "Mswrite.exe"
 if (-not (Test-Path $exe)) {
     Write-Error "请先完成编译:$exe 不存在"
 }
 
-# 更新同一个发布目录,保留 MSWriteData、用户文档和 WebView2 缓存。
-# 清理旧构建应独立核对,不能在打包时整目录删除。
+# Always assemble into a fresh directory. Never copy a previously run application.
 New-Item -ItemType Directory -Path $out -Force | Out-Null
 
 # 1. 主程序与 WebView2 加载器
@@ -31,7 +37,7 @@ $webOut = Join-Path $out "resources\web"
 New-Item -ItemType Directory -Path $webOut -Force | Out-Null
 Copy-Item "$root\resources\web\*" $webOut -Recurse -Force
 
-# Install bundled skills once; later updates preserve the user's edits.
+# Only repository-owned bundled skills are release inputs.
 $skillsOut=Join-Path $out 'skills'
 foreach($skill in Get-ChildItem -LiteralPath "$root\resources\skills" -Directory) {
     $target=Join-Path $skillsOut $skill.Name
@@ -39,6 +45,8 @@ foreach($skill in Get-ChildItem -LiteralPath "$root\resources\skills" -Directory
     $skillFile=Join-Path $target 'SKILL.md'
     if(-not(Test-Path -LiteralPath $skillFile)) { Copy-Item -LiteralPath (Join-Path $skill.FullName 'SKILL.md') -Destination $skillFile }
 }
+
+& (Join-Path $PSScriptRoot 'assert-release-clean.ps1') -Path $out -Release
 
 Write-Output ""
 Write-Output "打包完成: $out"

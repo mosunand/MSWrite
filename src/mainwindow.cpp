@@ -42,12 +42,14 @@
 #include <QPainter>
 #include <QPixmap>
 #include <QCursor>
+#include <QCryptographicHash>
 #include <QInputDialog>
 #include <QProcess>
 #include <QPointer>
 #include <QRegularExpression>
 #include <QSettings>
 #include <QSaveFile>
+#include <QSet>
 #include <QScopeGuard>
 #include <QStackedWidget>
 #include <QStandardPaths>
@@ -61,6 +63,7 @@
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QtConcurrent/QtConcurrentRun>
+#include <windows.h>
 
 namespace {
 constexpr const char *kVirtualHost = "app.local";
@@ -72,7 +75,7 @@ QString pageUrl()
 {
     // ?v= 与 bridge.js 版本同步递增:editor.html 本体也绕过缓存
     QString url = QStringLiteral("https://") + QLatin1String(kVirtualHost)
-                + QStringLiteral("/editor.html?v=139");
+                + QStringLiteral("/editor.html?v=143");
     // 开发态才把排障开关传给页面(按键记录器等),生产环境不启用
     if (qEnvironmentVariableIsSet("MSWRITE_DEV"))
         url += QStringLiteral("&dev=1");
@@ -349,15 +352,8 @@ QString MainWindow::saveImageAsset(const Tab &tab, const QString &base64, const 
         return {};
     }
     // 图片存文档同级 assets,插入相对路径(可移植,用户指定模式)
-    QString baseDir;
-    if (!tab.path.isEmpty())
-        baseDir = QFileInfo(tab.path).absolutePath();
-    else if (!m_workspace.isEmpty())
-        baseDir = m_workspace;
-    else {
-        *error = QStringLiteral("请先保存文档(图片将存到文档旁 assets 目录)");
-        return {};
-    }
+    // Keep using the displayed document root until Save As has succeeded.
+    const QString baseDir = tab.docDir.isEmpty() ? m_files->defaultSaveDir() : tab.docDir;
 
     const QDir assetsDir(baseDir + QStringLiteral("/assets"));
     if (!assetsDir.exists() && !QDir().mkpath(assetsDir.absolutePath())) {
@@ -365,16 +361,15 @@ QString MainWindow::saveImageAsset(const Tab &tab, const QString &base64, const 
         return {};
     }
 
-    const QString stamp = QDateTime::currentDateTime()
-                              .toString(QStringLiteral("yyyyMMddHHmmsszzz"));
+    const QString stamp = QUuid::createUuid().toString(QUuid::WithoutBraces);
     const QString ext = imageExtForMime(mime);
     QString name = QStringLiteral("image-%1.%2").arg(stamp, ext);
     for (int i = 0; assetsDir.exists(name); ++i)
         name = QStringLiteral("image-%1-%2.%3").arg(stamp).arg(i).arg(ext);
 
     const QByteArray bytes = QByteArray::fromBase64(base64.toLatin1());
-    QFile f(assetsDir.filePath(name));
-    if (!f.open(QIODevice::WriteOnly) || f.write(bytes) != bytes.size()) {
+    QSaveFile f(assetsDir.filePath(name));
+    if (bytes.isEmpty() || !f.open(QIODevice::WriteOnly) || f.write(bytes) != bytes.size() || !f.commit()) {
         *error = QStringLiteral("写入图片失败");
         return {};
     }
@@ -402,7 +397,7 @@ int MainWindow::addTab(const QString &path, const QString &content,
         if(tab && tab->dirty && m_autoSave && !tab->choosingSavePath)
             requestContent(*tab);
     });
-    t.host->showStartupPreview(content, m_theme, m_fontSize);
+    t.host->showLoading(m_theme, tr("正在打开文档…"));
     const int idx = m_stack->addWidget(t.host);
     Q_UNUSED(idx);
 
@@ -421,10 +416,16 @@ int MainWindow::addTab(const QString &path, const QString &content,
                   pageUrl(), bootstrap);
     t.host->setAcceleratorFilter([this, host = QPointer<WebViewHost>(t.host)](int vk, bool ctrl, bool shift, bool alt) {
         if (!ctrl) return false;
-        const bool handled = alt ? (vk == 0xBB || vk == 0xBD || vk == '0')
+        // Detect bitmap formats without opening the clipboard or entering OLE
+        // inside this synchronous callback. Read/encode on the queued Qt path.
+        const bool screenshot = !alt && !shift && vk == 'V'
+            && (IsClipboardFormatAvailable(CF_DIB) || IsClipboardFormatAvailable(CF_DIBV5)
+                || IsClipboardFormatAvailable(CF_BITMAP)
+                || IsClipboardFormatAvailable(RegisterClipboardFormatW(L"PNG")));
+        const bool handled = screenshot || (alt ? (vk == 0xBB || vk == 0xBD || vk == '0')
             : shift ? QStringLiteral("NSOTFEPW12").contains(QChar(vk))
             : (QStringLiteral("SOPNWQF0").contains(QChar(vk))
-               || vk == 0xBF || vk == 0xBB || vk == 0xBD || vk == 0xBC);
+               || vk == 0xBF || vk == 0xBB || vk == 0xBD || vk == 0xBC));
         if (!handled) return false;
         // WebView2 accelerator callbacks are synchronous. Opening a modal
         // dialog or closing its controller here can deadlock/reenter COM.
@@ -446,6 +447,23 @@ int MainWindow::addTab(const QString &path, const QString &content,
 
     const int tabIndex = m_tabs.size();
     m_tabs.append(t);
+
+    // Reloading the initial page must restore its live image mappings and any
+    // preferences changed while loading, as well as the bootstrap fallback.
+    connect(t.host, &WebViewHost::loadingRetry, this, [this, host=t.host, content] {
+        const auto *tab = tabForHost(host);
+        if (!tab) return;
+        host->runScript(Bridge::call(QStringLiteral("setDocHost"), { tab->docHost }));
+        syncImgMaps();
+        host->runScript(QStringLiteral("if(!window.msInitialState){%1}")
+            .arg(Bridge::call(QStringLiteral("setContent"), { content })));
+        host->runScript(Bridge::call(QStringLiteral("setTheme"), { m_theme }));
+        host->runScript(Bridge::call(QStringLiteral("setFontSize"), { m_fontSize }));
+        host->runScript(Bridge::call(QStringLiteral("setLineNumbers"), { m_lineNumbers }));
+        host->runScript(Bridge::call(QStringLiteral("setDocLang"), { tab->docLang }));
+        host->runScript(Bridge::call(QStringLiteral("setFocusMode"), { m_focusMode }));
+        host->runScript(Bridge::call(QStringLiteral("setTypewriter"), { m_typewriter }));
+    });
 
     const QString name = path.isEmpty() ? tr("未命名")
                                         : QFileInfo(path).fileName();
@@ -764,11 +782,13 @@ void MainWindow::attachTabCloseButton(int index)
 
 void MainWindow::applyDocDir(Tab &tab)
 {
+    const QString dir = tab.path.isEmpty() ? (tab.docDir.isEmpty() ? m_files->defaultSaveDir() : tab.docDir)
+                                          : QFileInfo(tab.path).absolutePath();
+    if (!tab.docHost.isEmpty() && tab.docDir == dir) return;
     // 每次生成新主机名再映射:避免"变更既有映射对当前页可能不生效"的限制
     tab.docHost = QStringLiteral("doc%1.local").arg(++m_docHostSeq);
-    tab.docDir = tab.path.isEmpty()
-                     ? QString()
-                     : QFileInfo(tab.path).absolutePath();
+    tab.docDir = dir;
+    tab.imageMappings.append({tab.docHost, tab.docDir});
     if (!tab.docDir.isEmpty())
         tab.host->addHostMapping(tab.docHost, tab.docDir);
     tab.host->runScript(Bridge::call(QStringLiteral("setDocHost"), { tab.docHost }));
@@ -780,8 +800,8 @@ QString MainWindow::restoreImagePaths(const Tab &tab, QString md) const
 {
     // 显示层把 ./assets/x.png 改写成 https://docN.local/assets/x.png,
     // 落盘时还原回 ./ 相对路径(保持文档可移植)
-    if (!tab.docHost.isEmpty())
-        md.replace(QStringLiteral("https://") + tab.docHost + QLatin1Char('/'),
+    for (const auto &mapping : tab.imageMappings)
+        md.replace(QStringLiteral("https://") + mapping.first + QLatin1Char('/'),
                    QStringLiteral("./"));
     // 历史遗留的中央池绝对路径图片:还原为原生绝对路径
     for (const ImgMap &m : m_imgMaps) {
@@ -789,6 +809,77 @@ QString MainWindow::restoreImagePaths(const Tab &tab, QString md) const
         md.replace(QStringLiteral("https://") + m.host + QLatin1Char('/'), nativePrefix);
     }
     return md;
+}
+
+bool MainWindow::copyImageAssets(Tab &tab, const QString &markdown, const QString &rawMarkdown,
+                                const QString &path, QString *error) const
+{
+    const QDir target(QFileInfo(path).absolutePath());
+    bool changedDirectory = false;
+    for (const auto &mapping : tab.imageMappings)
+        if (QDir(mapping.second).absolutePath().compare(target.absolutePath(), Qt::CaseInsensitive) != 0)
+            changedDirectory = true;
+    if (!changedDirectory) return true;
+    // Only app-created images: names cannot contain paths or Markdown syntax.
+    static const QRegularExpression asset(QString::fromLatin1(
+        R"RE((?:!\[(?:\\.|[^\]\\\r\n])*\]\(\s*<?|\bsrc\s*=\s*["']|(?:^|\n)[ \t]{0,3}\[(?:\\.|[^\]\\\r\n])+\]:[ \t]*<?)(?:\./)?(assets/image-[A-Za-z0-9.-]+)(?=[\s)>"']))RE"));
+    auto matches = asset.globalMatch(markdown);
+    QSet<QString> copied;
+    while (matches.hasNext()) {
+        const QString relative = matches.next().captured(1);
+        if (copied.contains(relative)) continue;
+        copied.insert(relative);
+        const QString dest = target.filePath(relative);
+        QString source;
+        // A rendered image carries its precise root; don't guess from another
+        // folder if the editor already points at the destination document.
+        for (const auto &mapping : tab.imageMappings) {
+            if (rawMarkdown.contains(QStringLiteral("https://") + mapping.first + QLatin1Char('/') + relative)) {
+                source = QDir(mapping.second).filePath(relative); break;
+            }
+        }
+        if (source.isEmpty()) {
+            const QString candidate = QDir(tab.docDir).filePath(relative);
+            if (QFileInfo::exists(candidate)) source = candidate;
+        }
+        if (source.isEmpty()) {
+            for (auto it = tab.imageMappings.crbegin(); it != tab.imageMappings.crend(); ++it) {
+                if (QDir(it->second).absolutePath().compare(target.absolutePath(), Qt::CaseInsensitive) == 0) continue;
+                const QString candidate = QDir(it->second).filePath(relative);
+                if (QFileInfo::exists(candidate)) { source = candidate; break; }
+            }
+        }
+        if (source.isEmpty()) continue; // Existing broken links remain editable.
+        if (QFileInfo(source).absoluteFilePath().compare(QFileInfo(dest).absoluteFilePath(), Qt::CaseInsensitive) == 0) continue;
+        const QString cacheKey = source + QLatin1Char('\n') + dest;
+        if (QFileInfo::exists(dest)) {
+            if (tab.copiedImageTargets.contains(cacheKey)) continue;
+            QFile original(source), existing(dest);
+            QCryptographicHash a(QCryptographicHash::Sha256), b(QCryptographicHash::Sha256);
+            if (original.open(QIODevice::ReadOnly) && existing.open(QIODevice::ReadOnly)
+                && original.size() == existing.size() && a.addData(&original) && b.addData(&existing)
+                && a.result() == b.result()) {
+                tab.copiedImageTargets.insert(cacheKey); continue;
+            }
+            *error = tr("目标目录已有不同内容的同名图片: %1。请另选保存目录，原图未被覆盖。").arg(dest);
+            return false;
+        }
+        QFile input(source);
+        QSaveFile output(dest);
+        if (!target.mkpath(QStringLiteral("assets")) || !input.open(QIODevice::ReadOnly)
+            || !output.open(QIODevice::WriteOnly)) {
+            *error = tr("无法复制图片到 %1，原图保留在 %2").arg(dest, source); return false;
+        }
+        while (!input.atEnd()) {
+            const QByteArray bytes = input.read(1024 * 1024);
+            if (input.error() != QFile::NoError || output.write(bytes) != bytes.size()) {
+                *error = tr("复制图片失败: %1").arg(source); return false;
+            }
+        }
+        if (!output.commit()) { *error = tr("无法保存图片: %1").arg(dest); return false; }
+        tab.copiedImageTargets.insert(cacheKey);
+    }
+    return true;
 }
 
 // 标签文字(含 ● 脏标记):所有改标签名的路径都走这里,
@@ -1033,7 +1124,7 @@ bool MainWindow::saveFileAs()
     // 未命名时设的文档默认语言随另存为落到新路径
     if (!t->docLang.isEmpty())
         QSettings().setValue(QStringLiteral("doclang/") + path, t->docLang);
-    applyDocDir(*t);
+    // The displayed image root changes only after the assets and document are saved.
     updateTabText(idx);     // 保留 ● 脏标记(此刻尚未落盘)
     m_tabbar->setTabToolTip(idx, QDir::toNativeSeparators(path));
     updateTitle();
@@ -1571,7 +1662,10 @@ void MainWindow::broadcastTheme() const
 {
     for (const Tab &t : m_tabs) {
         if (t.pdf) t.pdf->setTheme(m_theme);
-        else if (t.host) t.host->runScript(Bridge::call(QStringLiteral("setTheme"), { m_theme }));
+        else if (t.host) {
+            t.host->setLoadingTheme(m_theme);
+            t.host->runScript(Bridge::call(QStringLiteral("setTheme"), { m_theme }));
+        }
     }
 }
 
@@ -1642,9 +1736,12 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
     if (!tab)
         return; // 消息来自不在标签里的 host(理论上不存在,防御)
 
-    if (t == QLatin1String("ready")) {
+    if (t == QLatin1String("editorRendered")) {
         if (index == currentTabIndex())
             tab->host->runScript(QStringLiteral("window.msbridge.focus()"));
+        return;
+    }
+    if (t == QLatin1String("ready")) {
         // 启动校验:页面脚本版本(排查缓存送旧代码)
         tab->host->evalWithResult(QStringLiteral(
             "String(window.msbridgeVer || '未知')"),
@@ -1771,15 +1868,27 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
                 md.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
                 if (tab->crlf)
                     md.replace(QLatin1Char('\n'), QStringLiteral("\r\n"));
-                if (FileService::writeFile(path, md, tab->enc)) {
+                QString imageError;
+                if (copyImageAssets(*tab, md, obj.value(QStringLiteral("md")).toString(), path, &imageError)
+                    && FileService::writeFile(path, md, tab->enc)) {
                     tab->saveError.clear();
                     if(newFile) {
                         tab->path=path;
-                        applyDocDir(*tab);updateTabText(index);
+                        updateTabText(index);
                         m_tabbar->setTabToolTip(index,QDir::toNativeSeparators(path));
                         m_files->pushRecentFile(path);
                         if(index==currentTabIndex())m_files->setLastOpenedFile(path);
                     }
+                    applyDocDir(*tab);
+                    QJsonArray imageHosts;
+                    for (const auto &mapping : tab->imageMappings) imageHosts.append(mapping.first);
+                    QJsonArray imageFiles;
+                    const QString imageRoot = QFileInfo(path).absolutePath() + QLatin1Char('/');
+                    for (const auto &copy : tab->copiedImageTargets) {
+                        const QString dest = copy.section(QLatin1Char('\n'), -1);
+                        if (dest.startsWith(imageRoot, Qt::CaseInsensitive)) imageFiles.append(dest.mid(imageRoot.size()));
+                    }
+                    tab->host->runScript(Bridge::call(QStringLiteral("rebindImageHosts"), { imageHosts, tab->docHost, imageFiles }));
                     statusBar()->showMessage(
                         newFile ? tr("新文档已自动保存到 %1").arg(QDir::toNativeSeparators(path))
                                 : tr("已保存 %1").arg(QTime::currentTime().toString()), newFile ? 8000 : 2500);
@@ -1800,7 +1909,9 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
                     }
                 } else {
                     tab->closeAfterSave = false;
-                    tab->saveError=tr("无法写入 %1。请检查权限或另存为，当前内容仍保留在编辑器中。").arg(QDir::toNativeSeparators(path));
+                    tab->saveError = imageError.isEmpty()
+                        ? tr("无法写入 %1。请检查权限或另存为，当前内容仍保留在编辑器中。").arg(QDir::toNativeSeparators(path))
+                        : imageError;
                     markDirty(index,true);
                     statusBar()->showMessage(tab->saveError);
                 }
@@ -2077,22 +2188,23 @@ void MainWindow::pasteFromClipboard()
         return;
 
     const auto insertImage = [this, t](const QByteArray &bytes, const QString &fmtOrSuffix) {
+        t->host->runScript(QStringLiteral("window.msbridge.captureImagePaste(0)"));
         QString error;
         const QString rel = saveImageAsset(*t, QString::fromLatin1(bytes.toBase64()),
                                           fmtOrSuffix, &error);
         if (rel.isEmpty()) {
             statusBar()->showMessage(tr("图片未插入:%1").arg(error), 4000);
+            t->host->runScript(Bridge::call(QStringLiteral("imageRejected"), { 0, error }));
             return;
         }
-        const QString base = QFileInfo(rel).completeBaseName();
-        t->host->runScript(Bridge::call(QStringLiteral("insertText"),
-            { QStringLiteral("\n![%1](%2)\n").arg(base, rel) }));
+        t->host->runScript(Bridge::call(QStringLiteral("imageSaved"), { 0, rel }));
         statusBar()->showMessage(tr("已插入 %1").arg(rel), 3000);
     };
 
     // 1) 位图(截图/复制图片):统一转 PNG 落盘
     if (mime->hasImage()) {
-        const QImage img = qvariant_cast<QImage>(mime->imageData());
+        QImage img = QApplication::clipboard()->image();
+        if (img.isNull()) img = QApplication::clipboard()->pixmap().toImage();
         if (!img.isNull()) {
             QByteArray bytes;
             QBuffer buf(&bytes);
@@ -2376,6 +2488,7 @@ body.ms-export .vditor-reset > .language-math,body.ms-export .vditor-reset div.l
 body.ms-export .vditor-reset > .language-math .katex-display,body.ms-export .vditor-reset div.language-math .katex-display{margin:0!important;display:flex!important;align-items:center;justify-content:center;}
 body.ms-export .vditor-reset .katex-display{margin:0.2em 0!important;}
 body.ms-export .vditor-reset img{max-width:100%;height:auto;}
+body.ms-export .vditor-reset img:not(.emoji){vertical-align:middle;}
 body.ms-export .hljs-keyword,body.ms-export .hljs-selector-tag{color:#0057d9;}
 body.ms-export .hljs-title,body.ms-export .hljs-title.function_,body.ms-export .hljs-title.class_,body.ms-export .hljs-built_in,body.ms-export .hljs-type{color:#16825d;}
 body.ms-export .hljs-string,body.ms-export .hljs-attr{color:#b31d28;}
@@ -2719,6 +2832,7 @@ bool MainWindow::handleAccelerator(int vk, bool ctrl, bool shift, bool alt)
         }
     }
     switch (vk) {
+    case 'V':    return pasteFromClipboard(), true;    // Screenshot-only native accelerator route.
     case 'S':    return saveFile(), true;
     case 'O':    return openFile(), true;
     case 'P':    return quickOpen(), true;
@@ -2780,7 +2894,9 @@ void MainWindow::ensureAiDock()
     m_aiDock->setContextProvider([this]{return aiDocumentContext();});
     m_aiDock->setInsertHandler(
         [this](const QString &id,const QString &text) { return insertAiText(id,text); });
-    connect(m_aiDock, &AiChatDock::configRequested, this, [this] { openAiConfig(); });
+    connect(m_aiDock, &AiChatDock::configRequested, this, [this] {
+        openAiConfig(m_aiDock, m_aiDock->isLightTheme() ? QStringLiteral("light") : QStringLiteral("dark"));
+    });
     connect(m_aiDock, &AiChatDock::skillsRequested, this, &MainWindow::openAiSkills);
     // 菜单勾选态跟随窗口可见性
     connect(m_aiDock, &AiChatDock::visibilityChanged, this, [this](bool visible) {
@@ -2798,9 +2914,9 @@ void MainWindow::toggleAiDock()
         m_aiToggleAction->setChecked(m_aiDock->isVisible());
 }
 
-void MainWindow::openAiConfig()
+void MainWindow::openAiConfig(QWidget *owner, const QString &theme)
 {
-    AiConfigDialog dlg(&m_aiStore, this);
+    AiConfigDialog dlg(&m_aiStore, owner ? owner : this, theme.isEmpty() ? m_theme : theme);
     dlg.exec();
     applyCurrentAiProvider();
 }

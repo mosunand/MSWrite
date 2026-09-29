@@ -7,6 +7,8 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
+#include <QMimeDatabase>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
@@ -16,8 +18,9 @@
 #include <QTimer>
 #include <QUrl>
 #include <QPointer>
-#include <QTextBrowser>
 #include <QLabel>
+#include <QPainter>
+#include <QPushButton>
 #include <QVBoxLayout>
 
 #include <functional>
@@ -25,6 +28,7 @@
 
 #include <windows.h>
 #include <objbase.h>
+#include <shlwapi.h>
 #include "WebView2.h"
 
 // ---------------------------------------------------------------------------
@@ -50,11 +54,123 @@ namespace {
 // waitRendered 的兜底上限:超过则认为渲染已无意义,放行导出
 constexpr int kRenderTimeoutMs = 8000;
 
+// This is a native sibling above the WebView HWND. Keeping the browser visible
+// underneath lets fonts, diagrams and requestAnimationFrame finish at full speed.
+class LoadingSurface final : public QWidget {
+public:
+    explicit LoadingSurface(QWidget *parent) : QWidget(parent) {
+        setObjectName(QStringLiteral("loadingOverlay"));
+        setAttribute(Qt::WA_NativeWindow);
+        setAutoFillBackground(true);
+        auto *layout = new QVBoxLayout(this);
+        layout->setContentsMargins(24, 24, 24, 24);
+        layout->addStretch();
+        auto *ringSpace = new QWidget(this);
+        ringSpace->setFixedHeight(56);
+        layout->addWidget(ringSpace);
+        ring_ = ringSpace;
+        label_ = new QLabel(this);
+        label_->setObjectName(QStringLiteral("loadingLabel"));
+        label_->setAlignment(Qt::AlignCenter);
+        label_->setWordWrap(true);
+        layout->addWidget(label_);
+        retry_ = new QPushButton(tr("重新加载"), this);
+        retry_->setObjectName(QStringLiteral("loadingRetry"));
+        retry_->setFixedWidth(120);
+        retry_->hide();
+        layout->addWidget(retry_, 0, Qt::AlignHCenter);
+        layout->addStretch();
+        animation_.setInterval(33);
+        connect(&animation_, &QTimer::timeout, this, [this] { angle_ = (angle_ + 12) % 360; update(); });
+        timeout_.setSingleShot(true);
+        timeout_.setInterval(15000);
+        connect(&timeout_, &QTimer::timeout, this, [this] {
+            fail(tr("加载时间较长，可以重新加载。内容仍然保留。"));
+        });
+        connect(retry_, &QPushButton::clicked, this, [this] { if (retry) retry(); });
+    }
+    std::function<void()> retry;
+    void setTheme(const QString &theme) {
+        const bool dark = theme == QLatin1String("dark");
+        QPalette p = palette();
+        p.setColor(QPalette::Window, QColor(dark ? "#1e1e1e" : theme == QLatin1String("paper") ? "#fffdf8" : "#ffffff"));
+        p.setColor(QPalette::WindowText, QColor(dark ? "#d4d4d4" : "#536277"));
+        setPalette(p);
+        label_->setStyleSheet(QStringLiteral("color:%1;background:transparent;font-size:14px;")
+                                 .arg(p.color(QPalette::WindowText).name()));
+        retry_->setStyleSheet(QStringLiteral("QPushButton{background:%1;color:%2;border:1px solid %3;border-radius:6px;padding:8px;}QPushButton:hover{border-color:#5782dc;}")
+            .arg(dark ? "#252526" : "#f5f7fb", dark ? "#d4d4d4" : "#253041", dark ? "#42454c" : "#dce1e8"));
+        track_ = QColor(dark ? "#383d46" : "#e3e9f2");
+        accent_ = QColor(dark ? "#82aaff" : "#426fca");
+        update();
+    }
+    void begin(const QString &text) {
+        text_ = text;
+        failed_ = false;
+        retry_->hide();
+        label_->setText(text);
+        if (isVisible()) { animation_.start(); timeout_.start(); }
+        update();
+    }
+    void fail(const QString &text) {
+        failed_ = true;
+        animation_.stop(); timeout_.stop();
+        label_->setText(text); retry_->show(); update();
+    }
+    QString loadingText() const { return text_; }
+protected:
+    void showEvent(QShowEvent *event) override {
+        QWidget::showEvent(event);
+        if (!failed_) { animation_.start(); timeout_.start(); }
+    }
+    void hideEvent(QHideEvent *event) override {
+        animation_.stop(); timeout_.stop(); QWidget::hideEvent(event);
+    }
+    void paintEvent(QPaintEvent *event) override {
+        QWidget::paintEvent(event);
+        QPainter p(this); p.setRenderHint(QPainter::Antialiasing);
+        const QRectF ring(width()/2.0 - 18, ring_->y() + 6, 36, 36);
+        p.setPen(QPen(track_, 3, Qt::SolidLine, Qt::RoundCap)); p.drawEllipse(ring);
+        p.setPen(QPen(accent_, 3, Qt::SolidLine, Qt::RoundCap));
+        p.drawArc(ring, (failed_ ? 90 : -angle_)*16, 100*16);
+    }
+private:
+    QLabel *label_;
+    QPushButton *retry_;
+    QWidget *ring_;
+    QTimer animation_, timeout_;
+    QString text_;
+    QColor track_, accent_;
+    int angle_ = 0;
+    bool failed_ = false;
+};
+
 // -----------------------------------------------------------------------
 // COM 事件处理器:纯手写 COM,不依赖 WRL
 // -----------------------------------------------------------------------
 
 // JS postMessage 到达
+class ResourceHandler final : public ICoreWebView2WebResourceRequestedEventHandler {
+public:
+    std::function<void(ICoreWebView2WebResourceRequestedEventArgs *)> onRequest;
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++m_ref; }
+    ULONG STDMETHODCALLTYPE Release() override { const auto n = --m_ref; if (!n) delete this; return n; }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+        if (!out) return E_POINTER;
+        if (IsEqualIID(id, IID_IUnknown) || IsEqualIID(id, IID_ICoreWebView2WebResourceRequestedEventHandler)) {
+            *out = static_cast<ICoreWebView2WebResourceRequestedEventHandler *>(this);
+            AddRef(); return S_OK;
+        }
+        *out = nullptr; return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *, ICoreWebView2WebResourceRequestedEventArgs *args) override {
+        if (onRequest) onRequest(args);
+        return S_OK;
+    }
+private:
+    std::atomic<ULONG> m_ref{1};
+};
+
 class MessageHandler final : public ICoreWebView2WebMessageReceivedEventHandler {
 public:
     std::function<void(const QString &)> onMessage;
@@ -321,6 +437,7 @@ private:
 // ---------------------------------------------------------------------------
 
 struct WebViewHost::Impl {
+    friend class WebViewHost;
     WebViewHost *q = nullptr;
 
     ICoreWebView2Controller *ctrl = nullptr;
@@ -329,19 +446,22 @@ struct WebViewHost::Impl {
     MessageHandler           *hMsg = nullptr;
     NavCompletedHandler      *hNav = nullptr;
     AcceleratorHandler       *hAcc = nullptr;
+    ResourceHandler          *hResource = nullptr;
 
     EventRegistrationToken tokMsg{};
     EventRegistrationToken tokNav{};
     EventRegistrationToken tokAcc{};
+    EventRegistrationToken tokResource{};
 
     QString virtualHost;
     QString virtualFolder;
     QString startUrl;
     QString initialScript;
+    QString userDataFolder;
     QString curUrl;                      // 最近一次导航的 URL
     bool alwaysVisible = false;         // 导出页等隐藏场景:渲染不挂起
     double zoom = 1.0;                  // 页面缩放(控制器就绪后恢复)
-    QList<QPair<QString, QString>> extraMappings; // 启动后补加的虚拟主机
+    QHash<QString, QString> resourceFolders; // Live document/image roots, including Save As.
     std::function<void()> renderedCb;   // waitRendered 的在途回调
     int renderRequest = 0;
 
@@ -435,7 +555,46 @@ struct WebViewHost::Impl {
         }
     }
 
-    // 页面资源拦截保留于头文件之外——图片经专用虚拟主机(doc{n}.local)提供
+    void serveResource(ICoreWebView2WebResourceRequestedEventArgs *args)
+    {
+        ICoreWebView2WebResourceRequest *request = nullptr;
+        if (FAILED(args->get_Request(&request)) || !request) return;
+        LPWSTR raw = nullptr;
+        request->get_Uri(&raw);
+        const QUrl url(raw ? QString::fromWCharArray(raw) : QString());
+        if (raw) CoTaskMemFree(raw);
+        request->Release();
+        const auto folder = resourceFolders.constFind(url.host().toLower());
+        if (folder == resourceFolders.cend() || url.scheme() != QLatin1String("https")) return;
+
+        // Canonical paths prevent escaped separators, '..' and junctions from
+        // exposing files outside the directory explicitly mapped for this tab.
+        const QString root = QFileInfo(*folder).canonicalFilePath();
+        const QString relative = url.path(QUrl::FullyDecoded).mid(1);
+        const QFileInfo file(QDir(*folder).filePath(relative));
+        const QString canonical = file.canonicalFilePath();
+        const QString rootPrefix = root.endsWith(QLatin1Char('/')) ? root : root + QLatin1Char('/');
+        const bool allowed = !root.isEmpty() && file.isFile()
+            && canonical.startsWith(rootPrefix, Qt::CaseInsensitive);
+        IStream *stream = nullptr;
+        if (allowed) {
+            const auto native = QDir::toNativeSeparators(canonical).toStdWString();
+            SHCreateStreamOnFileEx(native.c_str(), STGM_READ | STGM_SHARE_DENY_NONE,
+                                  FILE_ATTRIBUTE_NORMAL, FALSE, nullptr, &stream);
+        }
+        const bool ok = stream != nullptr;
+        const QString mime = ok ? QMimeDatabase().mimeTypeForFile(file, QMimeDatabase::MatchExtension).name()
+                                : QStringLiteral("text/plain");
+        const auto headers = (QStringLiteral("Content-Type: ") + mime
+            + QStringLiteral("\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache")).toStdWString();
+        ICoreWebView2WebResourceResponse *response = nullptr;
+        if (SUCCEEDED(env->CreateWebResourceResponse(stream, ok ? 200 : 404, ok ? L"OK" : L"Not Found",
+                                                     headers.c_str(), &response)) && response) {
+            args->put_Response(response);
+            response->Release();
+        }
+        if (stream) stream->Release();
+    }
 
     void onEnvironment(ICoreWebView2Environment *environment)
     {
@@ -473,6 +632,8 @@ struct WebViewHost::Impl {
             || result==HRESULT_FROM_WIN32(ERROR_INVALID_STATE);
         if (transient && controllerAttempts<3) {
             QTimer::singleShot(250*controllerAttempts,q,[this]{createController();});
+        } else {
+            q->showLoadingError(QObject::tr("编辑器内核未能启动，请重新加载。"));
         }
     }
 
@@ -491,15 +652,10 @@ struct WebViewHost::Impl {
                 return;
             const QJsonObject obj = doc.object();
             const QString type=obj.value(QStringLiteral("t")).toString();
-            if ((type==QLatin1String("ready") || type==QLatin1String("chatRendered")) && q->m_preview) {
-                QTimer::singleShot(0, q, [guard = QPointer<WebViewHost>(q)] {
-                    if (!guard || !guard->m_preview) return;
-                    guard->m_preview->hide();
-                    guard->m_preview->deleteLater();
-                    guard->m_preview = nullptr;
-                    if (guard->d->ctrl) guard->d->ctrl->put_IsVisible(guard->d->alwaysVisible || guard->isVisible());
-                });
-            }
+            if (type == QLatin1String("editorRendered"))
+                QTimer::singleShot(0, q, &WebViewHost::finishLoading);
+            else if (type == QLatin1String("editorLoadError"))
+                QTimer::singleShot(0, q, [this] { q->showLoadingError(QObject::tr("文档排版未能完成，请重新加载。")); });
             // 渲染完成信号(waitRendered 注入的脚本回传),内部消费不上抛
             if (obj.value(QStringLiteral("t")).toString() == QLatin1String("rendered")) {
                 if (renderedCb && obj.value(QStringLiteral("request")).toInt() == renderRequest) {
@@ -519,6 +675,8 @@ struct WebViewHost::Impl {
         n->onDone = [this](bool ok, HRESULT err) {
             Q_UNUSED(err);
             emit q->navigated(ok);
+            if (!ok)
+                q->showLoadingError(QObject::tr("页面加载失败，请重新加载。"));
             // 首次导航失败不能标成就绪:否则排队的 setContent 会打到错误页上,
             // 之后即使用户刷新也已经把"已就绪"门关上了
             if (!ok || q->m_pageReady)
@@ -557,13 +715,25 @@ struct WebViewHost::Impl {
             settings->Release();
         }
 
-        // 虚拟主机映射:主映射 + 追加映射(文档目录经 doc{n}.local 提供)
+        // WebView2 snapshots native folder mappings when a page starts. Serve
+        // document roots through requests so Save As works without reloading
+        // the editor and losing its selection/undo history.
+        hResource = new ResourceHandler;
+        hResource->onRequest = [this](ICoreWebView2WebResourceRequestedEventArgs *args) { serveResource(args); };
+        web->add_WebResourceRequested(hResource, &tokResource);
+        // Only live document roots require C++ interception. Bundled scripts,
+        // fonts and styles load directly through WebView2 without GUI-thread IPC.
+        for (auto it = resourceFolders.cbegin(); it != resourceFolders.cend(); ++it) {
+            const auto filter = (QStringLiteral("https://") + it.key() + QStringLiteral("/*")).toStdWString();
+            web->AddWebResourceRequestedFilter(filter.c_str(), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+        }
+
+        // Bundled page resources stay on WebView2's native mapping.
         setMapping(virtualHost, virtualFolder);
-        for (const auto &pair : extraMappings)
-            setMapping(pair.first, pair.second);
 
         applyBounds();
-        ctrl->put_IsVisible(alwaysVisible || (q->isVisible() && !q->m_preview));
+        ctrl->put_IsVisible(alwaysVisible || q->isVisible());
+        q->raiseLoading();
         if (!qFuzzyCompare(zoom, 1.0))
             ctrl->put_ZoomFactor(zoom);   // 控制器就绪后恢复缩放
 
@@ -609,6 +779,7 @@ struct WebViewHost::Impl {
         if (web) {
             if (hMsg) web->remove_WebMessageReceived(tokMsg);
             if (hNav) web->remove_NavigationCompleted(tokNav);
+            if (hResource) web->remove_WebResourceRequested(tokResource);
         }
         if (ctrl) {
             if (hAcc) ctrl->remove_AcceleratorKeyPressed(tokAcc);
@@ -622,6 +793,7 @@ struct WebViewHost::Impl {
         rel(reinterpret_cast<void **>(&hMsg));
         rel(reinterpret_cast<void **>(&hNav));
         rel(reinterpret_cast<void **>(&hAcc));
+        rel(reinterpret_cast<void **>(&hResource));
         rel(reinterpret_cast<void **>(&hCtrl));
     }
 
@@ -711,47 +883,60 @@ void WebViewHost::setAcceleratorFilter(AcceleratorFilter filter)
     m_accelerator = std::move(filter);
 }
 
-void WebViewHost::showStartupPreview(const QString &markdown, const QString &theme, int fontSize)
+void WebViewHost::showLoading(const QString &theme, const QString &text)
 {
-    if(m_preview) {
-        if(auto *text=m_preview->findChild<QTextBrowser *>(QStringLiteral("startupText")))
-            text->setMarkdown(markdown.left(32000));
+    if (m_loading) {
+        setLoadingTheme(theme);
         return;
     }
-    // Never load embedded image URLs in this short-lived, read-only preview.
-    class PreviewText final : public QTextBrowser {
-    public:
-        using QTextBrowser::QTextBrowser;
-        QVariant loadResource(int, const QUrl &) override { return {}; }
-    };
-    m_preview = new QWidget(this);
-    m_preview->setObjectName(QStringLiteral("startupPreview"));
-    auto *layout = new QVBoxLayout(m_preview);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(0);
-    auto *hint = new QLabel(tr("内容已打开 · 编辑器准备中…"), m_preview);
-    hint->setObjectName(QStringLiteral("startupHint"));
-    hint->setStyleSheet(QStringLiteral("font-size:12px; padding:8px 28px; color:%1;")
-        .arg(theme == QLatin1String("dark") ? "#a3adbd" : "#66748a"));
-    auto *text = new PreviewText(m_preview);
-    text->setObjectName(QStringLiteral("startupText"));
-    text->setFrameShape(QFrame::NoFrame);
-    text->setOpenLinks(false);
-    text->setOpenExternalLinks(false);
-    const bool dark = theme == QLatin1String("dark");
-    text->setStyleSheet(QStringLiteral("QTextBrowser { background:%1; color:%2; padding:20px 40px; font-family:'Segoe UI','Microsoft YaHei UI'; font-size:%3px; }")
-        .arg(dark ? "#181b20" : theme == QLatin1String("paper") ? "#fffdf8" : "#ffffff",
-             dark ? "#e5e7eb" : "#253041").arg(fontSize));
-    // Bound work for very large documents; the browser receives the full content.
-    QFont previewFont(QStringLiteral("Segoe UI"));
-    previewFont.setPixelSize(fontSize);
-    text->document()->setDefaultFont(previewFont);
-    text->setMarkdown(markdown.left(32000));
-    layout->addWidget(hint);
-    layout->addWidget(text, 1);
-    m_preview->setGeometry(rect());
-    m_preview->show();
-    if(d->ctrl) d->ctrl->put_IsVisible(FALSE);
+    auto *surface = new LoadingSurface(this);
+    m_loading = surface;
+    surface->setTheme(theme);
+    surface->begin(text);
+    surface->retry = [this] { retryLoading(); };
+    surface->setGeometry(rect());
+    surface->show();
+    raiseLoading();
+}
+
+void WebViewHost::setLoadingTheme(const QString &theme)
+{
+    if (m_loading) static_cast<LoadingSurface *>(m_loading)->setTheme(theme);
+}
+
+void WebViewHost::showLoadingError(const QString &text)
+{
+    if (m_loading) static_cast<LoadingSurface *>(m_loading)->fail(text);
+}
+
+void WebViewHost::raiseLoading()
+{
+    if (!m_loading) return;
+    m_loading->raise();
+    SetWindowPos(reinterpret_cast<HWND>(m_loading->winId()), HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+void WebViewHost::finishLoading()
+{
+    if (!m_loading || m_closing) return;
+    m_loading->hide();
+    m_loading->deleteLater();
+    m_loading = nullptr;
+}
+
+void WebViewHost::retryLoading()
+{
+    if (!m_loading || m_closing) return;
+    auto *surface = static_cast<LoadingSurface *>(m_loading);
+    surface->begin(surface->loadingText());
+    m_pageReady = false;
+    emit loadingRetry();
+    if (d->web) navigate(d->startUrl);
+    else {
+        d->controllerAttempts = 0;
+        start(d->userDataFolder, d->virtualHost, d->virtualFolder, d->startUrl, d->initialScript);
+    }
 }
 
 void WebViewHost::start(const QString &userDataFolder,
@@ -759,6 +944,7 @@ void WebViewHost::start(const QString &userDataFolder,
                         const QString &virtualFolder,
                         const QString &startUrl, const QString &initialScript)
 {
+    d->userDataFolder = userDataFolder;
     d->virtualHost = virtualHost;
     d->virtualFolder = virtualFolder;
     d->startUrl = startUrl;
@@ -777,10 +963,12 @@ void WebViewHost::start(const QString &userDataFolder,
 
 void WebViewHost::addHostMapping(const QString &virtualHost, const QString &folder)
 {
-    if (d->web)
-        d->setMapping(virtualHost, folder);
-    else
-        d->extraMappings.append({ virtualHost, folder });
+    const QString host = virtualHost.toLower();
+    if (d->web && !d->resourceFolders.contains(host)) {
+        const auto filter = (QStringLiteral("https://") + host + QStringLiteral("/*")).toStdWString();
+        d->web->AddWebResourceRequestedFilter(filter.c_str(), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+    }
+    d->resourceFolders.insert(host, folder);
 }
 
 void WebViewHost::setAlwaysVisible(bool on)
@@ -895,7 +1083,7 @@ void WebViewHost::waitRendered(std::function<void()> done)
 void WebViewHost::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
-    if (m_preview) m_preview->setGeometry(rect());
+    if (m_loading) { m_loading->setGeometry(rect()); raiseLoading(); }
     d->applyBounds();
 }
 
@@ -912,7 +1100,8 @@ void WebViewHost::showEvent(QShowEvent *event)
     QWidget::showEvent(event);
     d->bindWindow();
     if (d->ctrl)
-        d->ctrl->put_IsVisible(d->alwaysVisible || !m_preview);
+        d->ctrl->put_IsVisible(TRUE);
+    raiseLoading();
 }
 
 void WebViewHost::hideEvent(QHideEvent *event)
