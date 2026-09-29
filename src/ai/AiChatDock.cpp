@@ -50,6 +50,8 @@
 #include <QThread>
 #include <QTime>
 #include <QTimer>
+#include <QSemaphore>
+#include <memory>
 #include <QVBoxLayout>
 
 namespace {
@@ -343,7 +345,17 @@ AiChatDock::~AiChatDock()
     // 先请求中断在途请求,再停线程:避免线程卡在 HTTP 里拖住退出
     HttpAbort::request();
     m_thread->quit();
-    m_thread->wait(3000);
+    if (!m_thread->wait(3000)) {
+        // 3 秒没退干净(线程多半还压在带超时的跨线程调用上):销毁一个
+        // 仍在运行的 QThread 是未定义行为,析构里绝不硬来 —— 脱离对象树,
+        // 转入托管回收:线程在超时返回后自然退出,finished 链上 deleteLater
+        // (wireWorker 里已挂 finished→worker deleteLater,线程收尾时统一清理)
+        qWarning() << "Mswrite: AI 工作线程 3 秒内未退出,转入托管回收";
+        m_thread->disconnect(this);
+        m_thread->setParent(nullptr);
+        connect(m_thread, &QThread::finished, m_thread, &QObject::deleteLater);
+        m_worker = nullptr;   // 生命周期已移交线程,防止析构后半段触碰
+    }
 }
 
 void AiChatDock::buildUi()
@@ -589,11 +601,6 @@ void AiChatDock::wireWorker()
         if (userRow < 0)
             return;
         const QString userText = m_msgs->msgAt(userRow)->text;
-        // 从 worker 历史里截断:保留 userRow 之前的(含该 user 消息)
-        const int keepCount = userRow + 1;
-        QMetaObject::invokeMethod(m_worker, [this, keepCount]() {
-            m_worker->truncateHistory(keepCount);
-        }, Qt::QueuedConnection);
         // 模型里删掉 userRow 之后的行(含 AI 回复)
         m_msgs->removeFrom(userRow + 1);
         scrollBottom();
@@ -603,6 +610,25 @@ void AiChatDock::wireWorker()
         const int clipMark = full.indexOf(QStringLiteral("\n📎 "));
         if (clipMark > 0)
             full = full.left(clipMark);
+        // worker 历史按"内容 + 序数"截断。GUI 行号与历史序列不对应
+        // (Thinking/Notice 行在历史里没有项,tool 消息在 GUI 里没有行),
+        // 旧实现拿 GUI 行号直接当历史下标,轻则旧回答全留在上下文,
+        // 重则切出"有 tool_use 没 tool_result"的非法序列被网关 400
+        int occurrence = 0;
+        for (int i = 0; i <= userRow; ++i) {
+            const ChatMsg *um = m_msgs->msgAt(i);
+            if (!um || um->kind != ChatMsg::User)
+                continue;
+            QString t = um->text;
+            const int mark = t.indexOf(QStringLiteral("\n📎 "));
+            if (mark > 0)
+                t = t.left(mark);
+            if (t == full)
+                ++occurrence;
+        }
+        QMetaObject::invokeMethod(m_worker, [this, full, occurrence]() {
+            m_worker->truncateAtUserMessage(full, occurrence);
+        }, Qt::QueuedConnection);
         m_dispatchImages.clear();
         m_dispatchMode = m_writeMode;
         m_dispatchLevel = m_thinkLevel;
@@ -1227,7 +1253,21 @@ void AiChatDock::saveSession()
         });
     }
     QJsonArray hist;
-    const QVector<ChatMessage> h = m_worker->historySnapshot();
+    // 快照经排队调用获取:run() 执行期间 worker 线程的事件循环被占用,本请求
+    // 只会在空闲(轮与轮之间)执行 —— 与 history_ 的修改天然串行,消除
+    // GUI 线程直读的跨线程数据竞争;超时则本次不落盘(保留上一份会话文件,
+    // 绝不能拿空历史覆盖掉旧记录)
+    struct SnapState { QSemaphore ready; QVector<ChatMessage> result; };
+    auto snap = std::make_shared<SnapState>();
+    QMetaObject::invokeMethod(m_worker, [this, snap]() {
+        snap->result = m_worker->historySnapshot();
+        snap->ready.release();
+    }, Qt::QueuedConnection);
+    if (!snap->ready.tryAcquire(1, 2000)) {
+        qWarning() << "Mswrite: AI 会话快照超时,本次不落盘";
+        return;
+    }
+    const QVector<ChatMessage> h = snap->result;
     for (const ChatMessage &mm : h) {
         QJsonObject o{
             { QStringLiteral("role"), mm.role },
@@ -1342,6 +1382,15 @@ void AiChatDock::setNoProvider()
 
 void AiChatDock::clearConversation()
 {
+    // 生成中不清:worker 的清除只是排队,在途的 run() 还会继续往 history_
+    // 和消息模型里追加输出,新会话会被旧回合污染、并被落盘
+    if (m_busy) {
+        m_msgs->append(ChatMsg::Notice,
+                       tr("正在生成,请先停止或等本轮结束后再开新对话。"),
+                       QStringLiteral("error"));
+        scrollBottom();
+        return;
+    }
     QMetaObject::invokeMethod(m_worker, [this]() {
         m_worker->clearHistory();
     }, Qt::QueuedConnection);

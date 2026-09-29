@@ -309,11 +309,18 @@ PdfViewWidget::~PdfViewWidget() = default;
 
 bool PdfViewWidget::load(const QString &path)
 {
-    if (!m_view->rootObject())
+    m_lastError.clear();
+    if (!m_view->rootObject()) {
+        m_lastError = tr("渲染组件未就绪");
         return false;
+    }
     const QPdfDocument::Error err = m_doc->load(path);
     if (err != QPdfDocument::Error::None) {
         m_loaded = false;
+        // 加密文档与损坏/权限错误分开说:拿着合法加密 PDF 的用户不该被告知"文件坏了"
+        m_lastError = (err == QPdfDocument::Error::IncorrectPassword)
+            ? tr("这个 PDF 带有密码保护,当前版本暂不支持打开加密 PDF。")
+            : tr("文件损坏或无权读取。");
         return false;
     }
     m_view->rootObject()->setProperty("source", QUrl::fromLocalFile(path));

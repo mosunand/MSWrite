@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(Mswrite VERSION 2.2.0 LANGUAGES CXX)
+project(Mswrite VERSION 2.2.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,9 +30,7 @@ add_executable(Mswrite WIN32
     src/ai/AiChatDock.h    src/ai/AiChatDock.cpp
     src/ai/ChatView.h      src/ai/ChatView.cpp
     src/ai/ChatWebView.h   src/ai/ChatWebView.cpp
-    src/ai/AiMath.h        src/ai/AiMath.cpp
     src/ai/AiMathPainter.h src/ai/AiMathPainter.cpp
-    src/ai/AiText.h        src/ai/AiText.cpp
     src/ai/AiCcSwitch.h    src/ai/AiCcSwitch.cpp
     src/ai/AiConfigDialog.h src/ai/AiConfigDialog.cpp
     resources/app.qrc

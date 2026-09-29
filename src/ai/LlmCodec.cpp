@@ -599,9 +599,16 @@ ChatResponse LlmCodec::StreamAssembler::finish(int httpStatus, const QByteArray 
             out_.error = transportError;
         else
             out_.error = QStringLiteral("HTTP %1").arg(httpStatus);
-    } else if (!transportError.isEmpty() && out_.text.isEmpty()
-               && out_.toolCalls.isEmpty() && !sawSse_) {
-        out_.error = transportError;
+    } else if (!transportError.isEmpty()) {
+        // 传输层错误必须透传,不能只在"一字未收"时采纳 —— 流中途断开时
+        // 已收到的部分文本不是完整答案,静默当完整回复返回会截断内容
+        if (transportError == QLatin1String("已中断")) {
+            out_.error = transportError;   // 用户主动中断
+        } else if (!out_.text.isEmpty() || !out_.toolCalls.isEmpty() || sawSse_) {
+            out_.error = transportError + QStringLiteral("(回复可能不完整)");
+        } else {
+            out_.error = transportError;
+        }
     }
     if (!sawSse_ && out_.text.isEmpty() && tools_.isEmpty() && out_.error.isEmpty())
         return LlmCodec::parse(protocol_, httpStatus, raw);

@@ -13,7 +13,10 @@
 
 namespace {
 
-std::atomic<bool> g_abort{false};
+// 中止采用"代次"而非一次性布尔:worker 在工具执行间隙点停止时,置位的
+// 标志无人消费,会滞留误伤下一个新请求(旧一次性设计的缺陷)。代次只对
+// "发起之后发生过停止"的请求生效,窗口外天然失效。
+std::atomic<int> g_abortGen{0};
 
 // 每线程一个 QNetworkAccessManager:同一网关的连续请求(流式/重试/回退)
 // 复用连接与 TLS 会话,而不是每个请求都重新握手。QThreadStorage 在线程
@@ -32,12 +35,17 @@ namespace HttpAbort {
 
 void request()
 {
-    g_abort.store(true);
+    g_abortGen.fetch_add(1, std::memory_order_relaxed);
 }
 
-bool consume()
+int generation()
 {
-    return g_abort.exchange(false);
+    return g_abortGen.load(std::memory_order_relaxed);
+}
+
+bool abortedSince(int generation)
+{
+    return g_abortGen.load(std::memory_order_relaxed) != generation;
 }
 
 } // namespace HttpAbort
@@ -84,8 +92,9 @@ HttpResult get(const QUrl &url,
     QTimer abortPoll;
     abortPoll.setInterval(100);
     bool aborted = false;
+    const int abortGen = HttpAbort::generation();
     QObject::connect(&abortPoll, &QTimer::timeout, [&]() {
-        if (HttpAbort::consume()) {
+        if (HttpAbort::abortedSince(abortGen)) {
             aborted = true;
             reply->abort();
         }
@@ -166,8 +175,9 @@ HttpResult postJson(const QUrl &url,
     QTimer abortPoll;
     abortPoll.setInterval(100);
     bool aborted = false;
+    const int abortGen = HttpAbort::generation();
     QObject::connect(&abortPoll, &QTimer::timeout, [&]() {
-        if (HttpAbort::consume()) {
+        if (HttpAbort::abortedSince(abortGen)) {
             aborted = true;
             reply->abort();
         }
@@ -237,8 +247,9 @@ HttpResult postSse(const QUrl &url,
     QTimer abortPoll;
     abortPoll.setInterval(100);
     bool aborted = false;
+    const int abortGen = HttpAbort::generation();
     QObject::connect(&abortPoll, &QTimer::timeout, [&]() {
-        if (HttpAbort::consume()) {
+        if (HttpAbort::abortedSince(abortGen)) {
             aborted = true;
             reply->abort();
         }

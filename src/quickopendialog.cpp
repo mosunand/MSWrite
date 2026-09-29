@@ -104,6 +104,7 @@ QuickOpenDialog::QuickOpenDialog(const QStringList &recentFiles, const QString &
                 const QString p = QDir::cleanPath(it.next());
                 const QFileInfo fi(p);
                 if (fi.suffix().compare(QLatin1String("txt"), Qt::CaseInsensitive) != 0
+                    && fi.suffix().compare(QLatin1String("pdf"), Qt::CaseInsensitive) != 0
                     && !p.endsWith(QLatin1String(".md"), Qt::CaseInsensitive)
                     && !p.endsWith(QLatin1String(".markdown"), Qt::CaseInsensitive)
                     && !p.endsWith(QLatin1String(".mdown"), Qt::CaseInsensitive))

@@ -31,14 +31,18 @@ namespace {
 void parseStrayToolCalls(ChatResponse &resp)
 {
     // DSML 格式:<｜DSML｜｜ invoke name="Insert"><｜DSML｜｜ parameter name="text" string="true">内容</｜DSML｜｜ parameter></｜DSML｜｜ invoke>
-    // 全角竖线 U+FF5C;匹配 invoke...parameter...value.../invoke 整段
+    // 全角竖线 U+FF5C;匹配 invoke...parameter...value.../invoke 整段。
+    // 旧版正则两处笔误(竖线数量与注释格式不符、结尾 "/uFF5C?" 丢了反斜杠),
+    // 实测从未匹配过任何输入 —— 本版经样例实测:名称/参数/值三组均正确捕获
     static const QRegularExpression invokeRe(
-        QStringLiteral("\uFF5C\uFF5CDSML\uFF5C\uFF5C\\s*invoke\\s+name=\"([^\"]+)\""
+        QStringLiteral("<\uFF5C+DSML\uFF5C+\\s*invoke\\s+name=\"([^\"]+)\"[^>]*>"
                        "[\\s\\S]*?"
-                       "\uFF5C\uFF5CDSML\uFF5C\uFF5C\\s*parameter\\s+name=\"([^\"]*)\"[^>]*>([\\s\\S]*?)"
-                       "\uFF5C\uFF5C/uFF5C?"));
+                       "<\uFF5C+DSML\uFF5C+\\s*parameter\\s+name=\"([^\"]*)\"[^>]*>([\\s\\S]*?)"
+                       "</\uFF5C+DSML\uFF5C+\\s*parameter>"
+                       "[\\s\\S]*?"
+                       "</\uFF5C+DSML\uFF5C+\\s*invoke>"));
     static const QRegularExpression tagRe(
-        QStringLiteral("<\uFF5C\uFF5CDSML\uFF5C\uFF5C[^>]*>"));
+        QStringLiteral("(?:</?)\uFF5C+DSML\uFF5C+[^>]*>"));
 
     bool found = false;
     QString cleaned;
@@ -165,13 +169,23 @@ QString AiWorker::runInsert(const QString &text)
 {
     if (!dock_)
         return QStringLiteral("Error: no document window");
-    // 阻塞跨线程:GUI 线程执行插入并回传结果文本。
-    // (GUI 若正被模态对话框占用会等待,属可接受行为)
-    QString res;
-    QMetaObject::invokeMethod(dock_, "insertAtCursor", Qt::BlockingQueuedConnection,
-                               Q_RETURN_ARG(QString, res),
-                               Q_ARG(QString, text));
-    return res;
+    // 跨线程插入改用"排队 + 信号量 + 超时",替代 BlockingQueuedConnection:
+    // 后者在 GUI 线程销毁 dock 时永远不会返回(事件无主可投递),worker 卡死、
+    // 析构 wait() 超时后销毁运行中的线程 —— 即退出崩溃的根源。排队调用随
+    // dock 析构自动丢弃,QPointer 守卫兜底,超时后以错误继续。
+    struct InsertState { QSemaphore ready; QString result; };
+    auto state = std::make_shared<InsertState>();
+    QMetaObject::invokeMethod(dock_, [guard = QPointer<AiChatDock>(dock_), text, state] {
+        if (!guard) {
+            state->result = QStringLiteral("Error: document window closed");
+        } else {
+            state->result = guard->insertAtCursor(text);
+        }
+        state->ready.release();
+    }, Qt::QueuedConnection);
+    if (!state->ready.tryAcquire(1, 8000))
+        return QStringLiteral("Error: document window is busy; the text was not inserted.");
+    return state->result;
 }
 
 AiDocumentResult AiWorker::readDocument(const QJsonObject &request)
@@ -193,9 +207,18 @@ AiDocumentResult AiWorker::readDocument(const QJsonObject &request)
 void AiWorker::run(const QString &userText, const QString &docMarkdown,
                    int writeMode, int thinkLevel, const QVector<AiAttach> &images)
 {
-    if (userText.trimmed().isEmpty())
+    // 纯附件(空文本 + 带图)是合法输入:补一条默认指令让模型看图干活。
+    QString prompt = userText;
+    if (prompt.trimmed().isEmpty() && !images.isEmpty())
+        prompt = QStringLiteral("请查看我发送的图片附件并按要求处理。");
+    if (prompt.trimmed().isEmpty()) {
+        // 防御路径:绝不静默返回 —— busyChanged 不配对会把面板永久卡在忙态
+        emit busyChanged(true);
+        emit turnFinished(QStringLiteral("没有可发送的内容"));
+        emit busyChanged(false);
         return;
-    qWarning() << "Mswrite: AI 轮次开始(输入" << userText.size()
+    }
+    qWarning() << "Mswrite: AI 轮次开始(输入" << prompt.size()
                << "字,文档" << docMarkdown.size()
                << "字,写入模式" << writeMode << ",思考" << thinkLevel
                << ",图片" << images.size() << "张)";
@@ -215,7 +238,7 @@ void AiWorker::run(const QString &userText, const QString &docMarkdown,
 
     ChatMessage u;
     u.role = QStringLiteral("user");
-    u.text = userText;
+    u.text = prompt;
     u.images = images;
     history_.push_back(u);
 
@@ -276,9 +299,11 @@ void AiWorker::run(const QString &userText, const QString &docMarkdown,
             break;
         }
         if (!resp.error.isEmpty()) {
-            // 网络/服务端类错误自动重试一次(4xx 客户端错误不重试)
-            const bool retryable = resp.httpStatus == 0   // 超时/断连
-                                 || resp.httpStatus >= 500; // 网关故障
+            // 网络/服务端类错误自动重试一次(4xx 客户端错误不重试);
+            // 本轮已经流出过正文则不重试 —— 重试会把两段正文拼进同一气泡
+            const bool retryable = (resp.httpStatus == 0   // 超时/断连
+                                 || resp.httpStatus >= 500) // 网关故障
+                                && streamedTurnText.isEmpty();
             if (retryable && turn == 1 && !retried) {
                 retried = true;
                 emit thinkingDelta(QStringLiteral("网络波动,自动重试…"));

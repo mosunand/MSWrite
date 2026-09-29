@@ -19,8 +19,9 @@ struct HttpResult {
 };
 
 namespace HttpAbort {
-void request();   // UI:停止按钮
-bool consume();   // 轮询:置位后恰好返回一次 true
+void request();        // UI:停止按钮 —— 令"中止代次"+1
+int generation();     // 请求发起时取当前代次
+bool abortedSince(int generation);  // 轮询:发起后代次变化过即应中止
 }
 
 namespace Http {

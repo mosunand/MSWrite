@@ -4,7 +4,7 @@
  */
 (function () {
     'use strict';
-    var MSW_BRIDGE_VERSION = 143;
+    var MSW_BRIDGE_VERSION = 144;
     window.msbridgeVer = MSW_BRIDGE_VERSION;
     window.mswValue = function () { return vd ? vd.getValue() : ''; }; // 启动校验(C++ 读日志) // 缓存排查:每次改动必须递增
 
@@ -93,7 +93,8 @@
         return document.querySelector('.vditor-ir pre.vditor-reset')
             || document.querySelector('.vditor-wysiwyg pre.vditor-reset')
             || document.querySelector('.vditor-wysiwyg')
-            || document.querySelector('.vditor-sv textarea');
+            || document.querySelector('.vditor-sv pre.vditor-reset')
+            || document.querySelector('.vditor-sv');
     }
 
     // ------------------------------------------------------------------
@@ -816,6 +817,12 @@
             return s;
         return s;
     }
+    // 围栏语言名等用户可控文本进 innerHTML 前必须转义(未知语言原样透传)
+    function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+        });
+    }
     function langMeta(id) {
         for (var i = 0; i < LANG_CATALOG.length; i++) {
             if (LANG_CATALOG[i][0] === id) return LANG_CATALOG[i];
@@ -1291,7 +1298,7 @@
         ensureLangIcons();
         var label = lang ? meta[1] : '代码语言';
         codeLangBtn.innerHTML = (lang ? langBadgeHtml(meta) : '')
-            + '<span>' + label + '</span>';
+            + '<span>' + escapeHtml(label) + '</span>';
         codeLangBtn.style.display = 'flex';
         var rect = block.getBoundingClientRect();
         var w = codeLangBtn.offsetWidth || 88;
@@ -1402,16 +1409,16 @@
         for (var i = 0; i < hits.length; i++) {
             var row = hits[i];
             html += '<div class="ms-lang-item' + (i === langSuggestIdx ? ' is-active' : '')
-                + '" data-lang="' + row[0] + '">'
+                + '" data-lang="' + escapeHtml(row[0]) + '">'
                 + langBadgeHtml(row)
-                + '<span>' + row[1] + '</span></div>';
+                + '<span>' + escapeHtml(row[1]) + '</span></div>';
         }
         // 底部:本文档默认语言(每文档独立,按路径持久化,不写进 md)
         if (docLang) {
             var cur = langMeta(resolveLang(docLang));
             html += '<div class="ms-lang-foot" data-role="cleardoc">'
                  + langBadgeHtml(cur)
-                 + '<span>★ 本文档默认:' + cur[1] + '(点击取消)</span></div>';
+                 + '<span>★ 本文档默认:' + escapeHtml(cur[1]) + '(点击取消)</span></div>';
         } else if (langSuggestHits[langSuggestIdx]) {
             html += '<div class="ms-lang-foot" data-role="setdoc">'
                  + '<span>★ 设为本文档默认:' + langSuggestHits[langSuggestIdx][1] + '</span></div>';
@@ -1563,7 +1570,8 @@
         try {
             var rng = document.createRange();
             rng.selectNodeContents(sib);
-            rng.collapse(!block.nextElementSibling);
+            // collapse(toStart):下一个块 → 块首(true);只有上一块 → 块尾(false)
+            rng.collapse(!!block.nextElementSibling);
             var s = window.getSelection();
             s.removeAllRanges();
             s.addRange(rng);
@@ -1612,7 +1620,17 @@
         if (start < 0) return false;
         if (end < start) end = start;
         lines.splice(start, end - start + 1);
-        var md = lines.join('\n').replace(/\n{3,}/g, '\n\n');
+        // 只收敛删除点(而非全篇)的空行:块删除后两侧空行相邻,压回一个;
+        // 文档其他位置用户保留的连续空行不受影响
+        if (start > 0 && start < lines.length
+            && lines[start - 1] === '' && lines[start] === '') {
+            var extraBlank = 0;
+            while (start + extraBlank < lines.length && lines[start + extraBlank] === '')
+                extraBlank++;
+            if (extraBlank > 1)
+                lines.splice(start, extraBlank - 1);
+        }
+        var md = lines.join('\n');
         try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e) {}
         vd.setValue(md, false);
         return true;
@@ -2192,13 +2210,19 @@
         var ok = false;
         try { ok = document.execCommand('insertText', false, marker + txt + marker); } catch (e) {}
         if (!ok) {
+            var before = null;
+            try { before = r.toString(); } catch (e0) {}
             try {
                 r.deleteContents();
                 r.collapse(true);
                 sel.removeAllRanges();
                 sel.addRange(r);
                 vd.insertValue(marker + txt + marker, true);
-            } catch (e2) {}
+            } catch (e2) {
+                // 插入失败时把刚删掉的选中文本补回来,避免静默丢字
+                if (before) { try { vd.insertValue(before, true); } catch (e3) {} }
+                notice('操作失败，请重试');
+            }
         }
         rerender();
         vd.focus();
@@ -2222,15 +2246,31 @@
         var fence = '\n```' + autoLang + '\n' + (selTxt || '') + '\n```\n';
 
         if (currentMode === 'sv') {
-            var ta = document.querySelector('.vditor-sv textarea');
-            var v = ta ? ta.value : vd.getValue();
-            var start = ta ? ta.selectionStart : v.length;
-            var end = ta ? ta.selectionEnd : v.length;
-            var picked = (ta ? v.slice(start, end) : selTxt) || '';
+            // 本版 vditor 的 sv 是 contenteditable 的 pre,没有 textarea ——
+            // 旧代码据此外的 querySelector 误判光标,围栏永远落到文末。
+            // 改为:按光标所在块的全文在 md 里定位,定位失败保持旧兜底(文末)。
+            // 选中文本不带入 sv 围栏:精确替换需要字符级 DOM↔md 映射,风险大于收益。
+            var v = vd.getValue();
+            var at = v.length;
+            try {
+                var svRoot = editorRoot();
+                var node = sel && sel.rangeCount ? sel.getRangeAt(0).startContainer : null;
+                var el = node ? (node.nodeType === 1 ? node : node.parentNode) : null;
+                while (el && el !== svRoot && el !== document.body && el.parentElement)
+                    el = el.parentElement;
+                if (el && el !== document.body && svRoot
+                    && (el === svRoot || svRoot.contains(el))) {
+                    var bt = (el.innerText || el.textContent || '')
+                        .replace(/\u200b/g, '').replace(/\n+$/, '');
+                    var pos = bt ? v.indexOf(bt) : -1;
+                    if (pos >= 0) at = pos + bt.length;
+                }
+            } catch (e) {}
             // 文档默认语言同样作用于源码模式(此前只有 IR 分支带上,行为不一致)
-            var svLang = (!picked && docLang) ? docLang : '';
+            var svLang = (!selTxt && docLang) ? docLang : '';
             try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e) {}
-            vd.setValue(v.slice(0, start) + '\n```' + svLang + '\n' + picked + '\n```\n' + v.slice(end), false);
+            vd.setValue(v.slice(0, at) + '\n```' + svLang + '\n```\n'
+                        + v.slice(at).replace(/^\n+/, ''), false);
             return;
         }
 
@@ -2238,6 +2278,22 @@
         var block = caretBlock();
         if (!block && root && root.children.length)
             block = root.children[root.children.length - 1];
+
+        // 选中文本要"移进"代码块:从正文里删掉再克隆。此前 IR 分支漏了这步,
+        // 围栏里带上选中文本、原位也还留着,一份变两份。先压撤销快照再删,
+        // Ctrl+Z 一步还原到删除前(后面的常规入栈跳过,避免双份快照)。
+        var deletedSel = false;
+        if (selTxt && sel && sel.rangeCount) {
+            try {
+                var rs = sel.getRangeAt(0);
+                if (root && root.contains(rs.commonAncestorContainer)) {
+                    try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (eu) {}
+                    rs.deleteContents();
+                    rs.collapse(true);
+                    deletedSel = true;
+                }
+            } catch (e) {}
+        }
 
         var lute = vd.vditor && vd.vditor.lute;
         var token = '@@MSWCB' + Date.now().toString(36)
@@ -2299,7 +2355,7 @@
             md = (vd.getValue() || '').replace(/\s*$/, '') + fence;
         }
 
-        try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e) {}
+        if (!deletedSel) { try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e) {} }
         vd.setValue(md, false);
         scheduleGutters();
         decorateAllCodeBlocks();
@@ -2550,13 +2606,18 @@
         var ok = false;
         try { ok = document.execCommand('insertText', false, marked); } catch (eu) {}
         if (!ok) {
+            var before = null;
+            try { before = r.toString(); } catch (eu0) {}
             try {
                 r.deleteContents();
                 r.collapse(true);
                 sel.removeAllRanges();
                 sel.addRange(r);
                 vd.insertValue(marked, true);
-            } catch (eu2) {}
+            } catch (eu2) {
+                if (before) { try { vd.insertValue(before, true); } catch (eu3) {} }
+                notice('操作失败，请重试');
+            }
         }
         rerender();
         setTimeout(renderColorTags, 150);
@@ -3884,12 +3945,13 @@
         imageSaved: function (rid, rel) {
             if (!vd) return;
             var pending = pendingImages[rid];
-            if (rid && !pending) return; // Ignore stale/duplicate replies.
+            if (rid && !pending) return; // 页面粘贴的过期/重复应答:忽略(rid=0 的原生粘贴无快照时落到当前光标)
             delete pendingImages[rid];
             if (pending && pending.blocked) { notice('请先将光标放到文档中，再粘贴图片'); return; }
-            if (pending && pending.root !== editorRoot()) {
-                notice('编辑视图已切换，请重新粘贴图片'); return;
-            }
+            // 保存期间视图可能被重建(模式切换/新标签加载窗口):旧快照不再可信,
+            // 但图片已落盘,丢弃等于丢掉这次粘贴 —— 改为落到当前光标处
+            if (pending && pending.root !== editorRoot())
+                pending.range = null;
             vd.focus();
             if (pending && pending.range && pending.range.startContainer.isConnected && pending.range.endContainer.isConnected) {
                 var selection = window.getSelection();
@@ -3924,20 +3986,35 @@
                 }
             }
             if (currentMode === 'sv') {
+                // 索引与 pushOutline sv 分支同源:完全相同的行扫描正则取标题文本,
+                // 再按文本在 sv 的标题元素里对齐滚动。旧实现滚"textarea 行号",
+                // 而本版 vditor 的 sv 没有 textarea —— 滚动从未生效过。
                 var lines = vd.getValue().split('\n');
-                var fence = false, seen = 0, lineNo = 0;
+                var fence = false, seen = 0, wantText = '', lineNo = 0;
                 for (var i = 0; i < lines.length; i++) {
                     if (/^\s*(```|~~~)/.test(lines[i])) { fence = !fence; continue; }
                     if (fence) continue;
-                    if (/^#{1,6}\s+/.test(lines[i])) {
-                        if (seen === index) { lineNo = i; break; }
+                    var m = /^(#{1,6})\s+(.+?)\s*#*$/.exec(lines[i]);
+                    if (m) {
+                        if (seen === index) { wantText = m[2]; lineNo = i; break; }
                         seen++;
                     }
                 }
-                var ta = document.querySelector('.vditor-sv textarea');
-                if (ta && lineNo > 0) {
-                    var lh = parseFloat(getComputedStyle(ta).lineHeight) || 22;
-                    ta.scrollTop = Math.max(0, (lineNo - 1) * lh);
+                if (wantText) {
+                    var svHeads = document.querySelectorAll(
+                        '.vditor-sv h1,.vditor-sv h2,.vditor-sv h3,.vditor-sv h4,.vditor-sv h5,.vditor-sv h6');
+                    for (var k = 0; k < svHeads.length; k++) {
+                        if ((svHeads[k].textContent || '').replace(/\u200b/g, '').trim() === wantText.trim()) {
+                            svHeads[k].scrollIntoView({ behavior: 'smooth', block: 'start' });
+                            return;
+                        }
+                    }
+                }
+                // 兜底:DOM 里找不到(如 setext 标题)时按行高估算滚 sv 根
+                var svRootEl = editorRoot();
+                if (svRootEl && lineNo > 0) {
+                    var lh = parseFloat(getComputedStyle(svRootEl).lineHeight) || 22;
+                    svRootEl.scrollTop = Math.max(0, lineNo * lh);
                 }
             }
         },
@@ -4179,13 +4256,18 @@
             var ok = false;
             try { ok = document.execCommand('insertText', false, marked); } catch (e) {}
             if (!ok) {
+                var before = null;
+                try { before = r.toString(); } catch (e0) {}
                 try {
                     r.deleteContents();
                     r.collapse(true);
                     sel.removeAllRanges();
                     sel.addRange(r);
                     vd.insertValue(marked, true);
-                } catch (e2) {}
+                } catch (e2) {
+                    if (before) { try { vd.insertValue(before, true); } catch (e3) {} }
+                    notice('操作失败，请重试');
+                }
             }
             rerender();
             setTimeout(renderColorTags, 150);
@@ -4264,7 +4346,8 @@
     createEditor('ir', lastValue);
     window.msbridge.setTheme(themePending);
     window.msbridge.setFontSize(fontSize);
-    ensureLangIcons();
+    // 语言图标懒加载:syncCodeLangBtn/renderLangSuggest 在用到时各自 ensure,
+    // 启动时不再预取 45 个 svg(其中 9 个目录里根本没有,注定 404)
     // 行号默认态的 CSS 类要在启动就挂上:宿主指令到达前(或独立打开页面时)
     // 左槽宽度才会按默认"无行号"模式排版,否则首帧是 40px 再跳 16px
     document.body.classList.toggle('ms-no-lineno', !showLineNumbers);

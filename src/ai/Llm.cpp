@@ -63,6 +63,10 @@ ChatResponse Llm::complete(const QString &system,
         return streamed;
     if (!streamed.error.isEmpty() && streamed.httpStatus >= 400 && !looksLikeUnknownField(streamed))
         return streamed;
+    // 用户点了停止(HTTP 已中断):中断是意图不是失败,绝不能回退成
+    // 非流式把完整请求再发一遍 —— 那样"停止"最长要 120 秒后才生效
+    if (streamed.error == QLatin1String("已中断"))
+        return streamed;
 
     // 流式完全没起来:回退非流式
     const QByteArray body = LlmCodec::requestBody(cfg_.protocol, model, system, history, tools, false, cfg_.maxTokens, cfg_.thinkLevel);

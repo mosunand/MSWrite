@@ -386,6 +386,7 @@ struct Parser {
     const QString &s;
     int i = 0;
     bool upright = false;
+    int depth = 0;   // 递归深度:readAtoms↔readGroup 互递归无上限会被病态 {{{{ 打爆栈
 
     Parser(const QString &src) : s(src) {}
 
@@ -411,9 +412,14 @@ struct Parser {
     // 读一个 {...} 组(已位于 '{')
     BoxVec readGroup()
     {
-        ++i; // '{'
+        ++i; // '{'(无论是否触上限都先吃掉,保证解析前进,不留死循环)
+        // 超深嵌套按空组处理:单条病态公式不该崩掉整个进程
+        if (depth >= 200)
+            return {};
         // 组内也要合并上下标,否则分子/根号中的 x^2 会退化为 x2。
+        ++depth;
         BoxVec out = readAtoms();
+        --depth;
         if (peek() == QLatin1Char('}'))
             ++i;
         return out;

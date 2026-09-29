@@ -75,7 +75,7 @@ QString pageUrl()
 {
     // ?v= 与 bridge.js 版本同步递增:editor.html 本体也绕过缓存
     QString url = QStringLiteral("https://") + QLatin1String(kVirtualHost)
-                + QStringLiteral("/editor.html?v=143");
+                + QStringLiteral("/editor.html?v=144");
     // 开发态才把排障开关传给页面(按键记录器等),生产环境不启用
     if (qEnvironmentVariableIsSet("MSWRITE_DEV"))
         url += QStringLiteral("&dev=1");
@@ -151,6 +151,34 @@ QString imageExtForMime(const QString &mime)
     if (m.contains(QLatin1String("svg")))  return QStringLiteral("svg");
     if (m.contains(QLatin1String("avif"))) return QStringLiteral("avif");
     return QStringLiteral("png");
+}
+
+// 剪贴板是否带 "PNG" 注册格式(截图工具几乎都会放,Qt 不认识这个自定义格式)
+bool clipboardHasPngStream()
+{
+    const UINT png = RegisterClipboardFormatW(L"PNG");
+    return png && IsClipboardFormatAvailable(png);
+}
+
+// 直接读 "PNG" 注册格式的字节流:Qt 图片转换(CF_BITMAP/DIB)拿不到时的兜底,
+// 覆盖"剪贴板只有 PNG 流"的截图工具与部分浏览器复制
+QImage imageFromPngStream()
+{
+    const UINT png = RegisterClipboardFormatW(L"PNG");
+    if (!png || !OpenClipboard(nullptr))
+        return {};
+    const auto close = qScopeGuard([] { CloseClipboard(); });
+    if (!IsClipboardFormatAvailable(png))
+        return {};
+    const HANDLE h = GetClipboardData(png);
+    if (!h)
+        return {};
+    const void *mem = GlobalLock(h);
+    if (!mem)
+        return {};
+    const auto unlock = qScopeGuard([h] { GlobalUnlock(h); });
+    const QByteArray bytes(static_cast<const char *>(mem), int(GlobalSize(h)));
+    return QImage::fromData(bytes);
 }
 
 // ExecuteScript 的结果是 JSON 序列化文本:字符串带引号与转义,包一层数组解析
@@ -596,7 +624,9 @@ bool MainWindow::openPath(const QString &path)
     bool crlf = false;
     const QString content = FileService::readFile(path, &ok, &enc, &crlf);
     if (!ok) {
-        QMessageBox::warning(this, tr("打开失败"), tr("无法读取文件:\n%1").arg(path));
+        QMessageBox::warning(this, tr("打开失败"),
+            tr("无法读取文件(可能被占用、读取中断或编码无法识别,原文件未做任何修改):\n%1")
+                .arg(path));
         return false;
     }
     addTab(path, content, enc, crlf);
@@ -612,9 +642,11 @@ int MainWindow::addPdfTab(const QString &path)
     auto *view = new PdfViewWidget(this);
     view->setTheme(m_theme);
     if (!view->load(path)) {
+        const QString reason = view->lastLoadError();
         delete view;
         QMessageBox::warning(this, tr("打开失败"),
-            tr("无法读取 PDF 文件:\n%1").arg(path));
+            tr("无法读取 PDF 文件:\n%1\n\n%2").arg(path,
+                reason.isEmpty() ? tr("请确认文件存在且未损坏。") : reason));
         return -1;
     }
     Tab t;
@@ -2181,8 +2213,12 @@ void MainWindow::handlePickImage()
 void MainWindow::pasteFromClipboard()
 {
     Tab *t = currentTab();
-    if (!t || !t->host)
+    if (!t || !t->host) {
+        // PDF 等无编辑器宿主的标签:不再静默返回,让用户知道为什么没反应
+        if (t && t->pdf)
+            statusBar()->showMessage(tr("当前是 PDF 阅读标签,图片只能粘贴进 Markdown 文档"), 3000);
         return;
+    }
     const QMimeData *mime = QApplication::clipboard()->mimeData();
     if (!mime)
         return;
@@ -2201,10 +2237,21 @@ void MainWindow::pasteFromClipboard()
         statusBar()->showMessage(tr("已插入 %1").arg(rel), 3000);
     };
 
-    // 1) 位图(截图/复制图片):统一转 PNG 落盘
-    if (mime->hasImage()) {
-        QImage img = QApplication::clipboard()->image();
-        if (img.isNull()) img = QApplication::clipboard()->pixmap().toImage();
+    // 1) 位图(截图/复制图片):统一转 PNG 落盘。
+    //    截图工具刚释放剪贴板时,Qt 可能瞬间读到空图(剪贴板仍被占用或
+    //    延迟渲染未完成)——短暂重试;仍拿不到就直接读原生 "PNG" 注册流。
+    const bool pngStream = clipboardHasPngStream();
+    if (mime->hasImage() || pngStream) {
+        QImage img;
+        for (int attempt = 0; attempt < 6 && img.isNull(); ++attempt) {
+            img = QApplication::clipboard()->image();
+            if (img.isNull())
+                img = QApplication::clipboard()->pixmap().toImage();
+            if (img.isNull())
+                Sleep(60);
+        }
+        if (img.isNull() && pngStream)
+            img = imageFromPngStream();
         if (!img.isNull()) {
             QByteArray bytes;
             QBuffer buf(&bytes);
