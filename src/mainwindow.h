@@ -46,6 +46,8 @@ private slots:
     void newWindow();               // Ctrl+Shift+N
     void reopenClosedFile();        // Ctrl+Shift+T
     void showPrefs();               // Ctrl+,
+    void showWelcome();             // 首次启动欢迎页
+    QString modeLabelText(bool sourceMode) const;  // 状态栏模式位(座右铭优先)
     void toggleOutlinePanel();      // Ctrl+Shift+1
     void globalSearch();            // Ctrl+Shift+F
     void toggleSourceMode();        // Ctrl+/(源码/所见即所得切换)
@@ -128,7 +130,7 @@ private:
     void refreshTitleHint(Tab &tab);
 
     void applyTheme(const QString &theme, bool persist = true);
-    void broadcastTheme() const;
+    void broadcastTheme();
     void updateSaveIndicator(bool dirty);    // 状态栏:未保存红/已保存白(加粗)
     void updateZoomLabel(double factor);     // 状态栏:缩放百分比胶囊
     void applyZoom(Tab &tab, double factor); // 整页缩放:同步 host/状态栏/持久化
@@ -201,6 +203,7 @@ private:
     QLabel *m_themeLabel = nullptr;
 
     QString m_theme = QStringLiteral("light");
+    QString m_motto;                     // 座右铭(空 = 状态栏显示「所见即所得」)
     int m_fontSize = 16;
     bool m_lineNumbers = false;          // 代码块行号(默认关:MarkText 式无行号卡片)
     int m_docHostSeq = 0;

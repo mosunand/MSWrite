@@ -14,8 +14,13 @@
 #include <QLineEdit>
 #include <QPushButton>
 #include <QSettings>
+#include <QDate>
 #include <QTabWidget>
+#include <QTimer>
 #include <QTreeWidget>
+#include <QDoubleSpinBox>
+#include <QFrame>
+#include <QValidator>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QStyleFactory>
@@ -73,6 +78,7 @@ UiDialogs::SaveChoice UiDialogs::confirmSave(QWidget *parent, const QString &the
     d.setWindowFlag(Qt::WindowContextHelpButtonHint, false);
     d.setWindowModality(Qt::WindowModal);
     auto *style=QStyleFactory::create(QStringLiteral("Fusion"));
+    if (!style) style = d.style(); // 防御性:万一创建失败,回退到平台样式
     style->setParent(&d); d.setStyle(style);
     const bool dark=theme==QLatin1String("dark");
     const QString base=dark ? "#1c2028" : theme==QLatin1String("paper") ? "#fffdf8" : "#ffffff";
@@ -195,7 +201,18 @@ void UiDialogs::showAbout(QWidget *parent,const QString &theme)
     layout->addWidget(label(QObject::tr("Markdown 即时预览 · LaTeX 数学公式 · 代码高亮 · 表格与图表\n多标签、自动保存，以及 HTML、PDF、Word 导出。"),d,true));
     layout->addWidget(label(QObject::tr("阅读与 AI"),d));
     layout->addWidget(label(QObject::tr("PDF 文字选择、搜索与目录导航。AI 可按需读取当前文档，支持选区翻译、分析，以及自定义技能。"),d,true));
+    layout->addWidget(label(QObject::tr("致谢"),d));
+    layout->addWidget(label(QObject::tr("特别感谢智谱（Zhipu AI）的 GLM-5.3 与 GLM-5.3-Flash 大模型。\n本应用的开发过程与 AI 能力均由 GLM 驱动。"),d,true));
     layout->addStretch();
+    // 陪伴天数:自首次完成欢迎仪式(welcomeFirstAt)起算,不足一天按 1 天
+    const QString firstStr = QSettings().value(QStringLiteral("welcomeFirstAt")).toString();
+    if (!firstStr.isEmpty()) {
+        const QDate first = QDate::fromString(firstStr, Qt::ISODate);
+        if (first.isValid()) {
+            const qint64 days = first.daysTo(QDate::currentDate()) + 1;
+            layout->addWidget(label(QObject::tr("Mswrite 已经陪伴您 %1 天了").arg(days),d));
+        }
+    }
     layout->addWidget(label(QObject::tr("版本 %1  ·  Qt %2  ·  Windows\n编辑内核：WebView2 / Vditor / Lute / KaTeX\n文档保存在本机；AI 请求使用你配置的服务。致敬 Typora。")
         .arg(QCoreApplication::applicationVersion(),QStringLiteral(QT_VERSION_STR)),d,true));
     auto *folder=new QPushButton(QObject::tr("打开程序目录"),d);
@@ -216,12 +233,15 @@ void UiDialogs::showSkills(QWidget *parent,const QString &theme)
     tree->setRootIsDecorated(false);tree->header()->setSectionResizeMode(0,QHeaderView::Stretch);
     layout->addWidget(tree,1);
     auto *status=label(QString(),d,true);layout->addWidget(status);
+    // 防抖:逐字符输入路径时不必每键同步递归扫目录(QDirIterator 子目录遍历)
+    auto *debounce=new QTimer(d);debounce->setSingleShot(true);debounce->setInterval(300);
     auto refresh=[path,tree,status]{
         tree->clear();const auto files=MswriteSkill::files(path->text());
         for(const auto &file:files) new QTreeWidgetItem(tree,{QDir(path->text()).relativeFilePath(file),QStringLiteral("%1 KB").arg(QFileInfo(file).size()/1024.0,0,'f',1)});
         status->setText(QDir(path->text()).exists() ? QObject::tr("%1 个可用技能 · 下次提问生效").arg(files.size()) : QObject::tr("目录不存在"));
     };
-    QObject::connect(path,&QLineEdit::textChanged,d,refresh);
+    QObject::connect(debounce,&QTimer::timeout,d,refresh);
+    QObject::connect(path,&QLineEdit::textChanged,d,[debounce]{debounce->start();});
     QObject::connect(browse,&QPushButton::clicked,d,[d,path]{const auto dir=QFileDialog::getExistingDirectory(d,QObject::tr("选择技能目录"),path->text());if(!dir.isEmpty())path->setText(dir);});
     auto *buttons=new QDialogButtonBox(QDialogButtonBox::Save|QDialogButtonBox::Cancel,d);
     buttons->button(QDialogButtonBox::Save)->setText(QObject::tr("保存"));
@@ -233,4 +253,166 @@ void UiDialogs::showSkills(QWidget *parent,const QString &theme)
     });
     QObject::connect(buttons,&QDialogButtonBox::rejected,d,&QDialog::close);
     layout->addWidget(buttons);refresh();d->show();
+}
+
+// ───────────────────────── 偏好设置 ─────────────────────────
+// 座右铭宽度:1 个汉字(≥0x2E80,含全角/emoji)记 1,半角字母/数字记 0.5,
+// 上限 19 —— "1个汉字、2位数字、2个字母的英文单词都算一个字符"
+double UiDialogs::mottoWidth(const QString &text)
+{
+    double w = 0;
+    for (const QChar ch : text)
+        w += ch.unicode() >= 0x2E80 ? 1.0 : 0.5;
+    return w;
+}
+
+namespace {
+class MottoValidator : public QValidator {
+public:
+    explicit MottoValidator(QObject *parent) : QValidator(parent) {}
+    State validate(QString &input, int &) const override
+    {
+        return UiDialogs::mottoWidth(input) <= 19.0 ? Acceptable : Invalid;
+    }
+};
+}
+
+QValidator *UiDialogs::makeMottoValidator(QObject *parent)
+{
+    return new MottoValidator(parent);
+}
+
+bool UiDialogs::showPrefs(QWidget *parent,const QString &theme)
+{
+    QDialog d(parent);
+    d.setObjectName(QStringLiteral("prefsDialog"));
+    d.setWindowTitle(QObject::tr("偏好设置"));
+    d.setModal(true);
+    d.setWindowFlag(Qt::WindowContextHelpButtonHint, false);
+    const bool dark = theme == QLatin1String("dark");
+    const QString window = dark ? QStringLiteral("#1d2026") : QStringLiteral("#f5f7fb");
+    const QString surface = dark ? QStringLiteral("#252a33") : QStringLiteral("#ffffff");
+    const QString ink = dark ? QStringLiteral("#edf0f5") : QStringLiteral("#1d2635");
+    const QString muted = dark ? QStringLiteral("#a7b2c5") : QStringLiteral("#65738a");
+    const QString line = dark ? QStringLiteral("#3a4352") : QStringLiteral("#dfe5ee");
+    const QString focus = dark ? QStringLiteral("#8bbcff") : QStringLiteral("#315ec7");
+    d.setStyleSheet(QStringLiteral(R"(
+QDialog#prefsDialog { background:%1; }
+QLabel { color:%2; background:transparent; }
+QLabel#prefsTitle { font-size:24px; font-weight:600; }
+QLabel#prefsSubtitle { color:%3; font-size:13px; }
+QLabel#sectionTitle { color:%2; font-size:15px; font-weight:600; }
+QLabel#fieldLabel { color:%2; font-size:13px; }
+QLabel#hint { color:%3; font-size:12px; }
+QFrame#prefsCard { background:%4; border:1px solid %5; border-radius:12px; }
+QLineEdit, QDoubleSpinBox {
+    background:%4; color:%2; border:1px solid %5; border-radius:8px;
+    padding:9px 12px; font-size:13px; selection-background-color:%6;
+}
+QLineEdit:focus, QDoubleSpinBox:focus { border-color:%6; }
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+    width:0; border:none; background:transparent;
+}
+QPushButton {
+    background:transparent; color:%2; border:1px solid %5;
+    border-radius:8px; padding:9px 20px; font-size:13px;
+}
+QPushButton:hover { background:%7; border-color:%6; }
+QPushButton#primary { background:%6; border-color:%6; color:white; font-weight:600; }
+QPushButton#primary:hover { background:%8; border-color:%8; }
+QFrame#separator { background:%5; max-height:1px; border:none; }
+)").arg(window, ink, muted, surface, line, focus,
+       dark ? QStringLiteral("#303846") : QStringLiteral("#eef3fb"),
+       dark ? QStringLiteral("#6fa7ef") : QStringLiteral("#264da9")));
+    d.setFont(QFont(QStringLiteral("Microsoft YaHei UI"), 10));
+    d.resize(640, 480);
+    d.setMinimumSize(560, 440);
+
+    auto *root = new QVBoxLayout(&d);
+    root->setContentsMargins(30, 26, 30, 22);
+    root->setSpacing(8);
+
+    auto *title = new QLabel(QObject::tr("偏好设置"), &d);
+    title->setObjectName(QStringLiteral("prefsTitle"));
+    root->addWidget(title);
+    auto *subtitle = new QLabel(QObject::tr("调整编辑器的显示方式。设置会立即应用到当前文档。"), &d);
+    subtitle->setObjectName(QStringLiteral("prefsSubtitle"));
+    root->addWidget(subtitle);
+    root->addSpacing(10);
+
+    auto *card = new QFrame(&d);
+    card->setObjectName(QStringLiteral("prefsCard"));
+    auto *cardLay = new QVBoxLayout(card);
+    cardLay->setContentsMargins(20, 18, 20, 18);
+    cardLay->setSpacing(12);
+
+    auto *section = new QLabel(QObject::tr("编辑器"), card);
+    section->setObjectName(QStringLiteral("sectionTitle"));
+    cardLay->addWidget(section);
+    auto *separator = new QFrame(card);
+    separator->setObjectName(QStringLiteral("separator"));
+    cardLay->addWidget(separator);
+
+    auto *lineRow = new QHBoxLayout;
+    lineRow->setSpacing(16);
+    auto *lineLabels = new QVBoxLayout;
+    lineLabels->setSpacing(3);
+    auto *lineLabel = new QLabel(QObject::tr("正文行距"), card);
+    lineLabel->setObjectName(QStringLiteral("fieldLabel"));
+    auto *lineHint = new QLabel(QObject::tr("只影响正文，代码块和公式保持独立行距。"), card);
+    lineHint->setObjectName(QStringLiteral("hint"));
+    lineHint->setWordWrap(true);
+    lineLabels->addWidget(lineLabel);
+    lineLabels->addWidget(lineHint);
+    lineRow->addLayout(lineLabels, 1);
+    auto *lh = new QDoubleSpinBox(card);
+    lh->setRange(1.0, 2.2);
+    lh->setSingleStep(0.05);
+    lh->setDecimals(2);
+    lh->setFixedWidth(150);
+    lh->setAlignment(Qt::AlignLeft);
+    lh->setValue(QSettings().value(QStringLiteral("lineHeight"), 1.0).toDouble());
+    lh->setToolTip(QObject::tr("范围 1.00 到 2.20"));
+    lineRow->addWidget(lh, 0, Qt::AlignTop);
+    cardLay->addLayout(lineRow);
+
+    auto *mottoRow = new QHBoxLayout;
+    mottoRow->setSpacing(16);
+    auto *mottoLabels = new QVBoxLayout;
+    mottoLabels->setSpacing(3);
+    auto *mottoLabel = new QLabel(QObject::tr("座右铭"), card);
+    mottoLabel->setObjectName(QStringLiteral("fieldLabel"));
+    auto *mottoHint = new QLabel(QObject::tr("显示在状态栏；留空则显示“所见即所得”。"), card);
+    mottoHint->setObjectName(QStringLiteral("hint"));
+    mottoHint->setWordWrap(true);
+    mottoLabels->addWidget(mottoLabel);
+    mottoLabels->addWidget(mottoHint);
+    mottoRow->addLayout(mottoLabels, 1);
+    auto *motto = new QLineEdit(card);
+    motto->setObjectName(QStringLiteral("mottoEdit"));
+    motto->setValidator(makeMottoValidator(&d));
+    motto->setPlaceholderText(QObject::tr("例如：专注写作"));
+    motto->setText(QSettings().value(QStringLiteral("motto")).toString());
+    mottoRow->addWidget(motto, 0);
+    motto->setMinimumWidth(260);
+    cardLay->addLayout(mottoRow);
+    root->addWidget(card);
+    root->addStretch(1);
+
+    auto *buttons = new QHBoxLayout;
+    buttons->addStretch(1);
+    auto *cancel = new QPushButton(QObject::tr("取消"), &d);
+    auto *ok = new QPushButton(QObject::tr("确定"), &d);
+    ok->setObjectName(QStringLiteral("primary"));
+    buttons->addWidget(cancel);
+    buttons->addWidget(ok);
+    root->addLayout(buttons);
+
+    QObject::connect(cancel, &QPushButton::clicked, &d, &QDialog::reject);
+    QObject::connect(ok, &QPushButton::clicked, &d, &QDialog::accept);
+    if (d.exec() != QDialog::Accepted)
+        return false;
+    QSettings().setValue(QStringLiteral("lineHeight"), lh->value());
+    QSettings().setValue(QStringLiteral("motto"), motto->text().trimmed());
+    return true;
 }

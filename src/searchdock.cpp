@@ -52,8 +52,14 @@ SearchDock::SearchDock(QWidget *parent)
         if (m_scopeValue.isEmpty())
             m_scopeValue = QStringLiteral("workspace");
     });
+    // connect 发生在 addItem 之后,上面的信号那时已经发过了 —— 必须在此显式
+    // 取一次当前值,否则用户不动下拉框直接回车,scope() 会返回空串。
+    m_scopeValue = m_scope->currentData().toString();
+    if (m_scopeValue.isEmpty())
+        m_scopeValue = QStringLiteral("workspace");
+    // 只连 itemActivated:Windows 上双击会同时发 itemActivated 和
+    // itemDoubleClicked,两个都连会把同一个结果激活两次(重复开标签/重复滚动)。
     connect(m_results, &QListWidget::itemActivated, this, &SearchDock::onResultActivated);
-    connect(m_results, &QListWidget::itemDoubleClicked, this, &SearchDock::onResultActivated);
 }
 
 QString SearchDock::scope() const

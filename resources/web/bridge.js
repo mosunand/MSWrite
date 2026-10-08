@@ -4,7 +4,7 @@
  */
 (function () {
     'use strict';
-    var MSW_BRIDGE_VERSION = 144;
+    var MSW_BRIDGE_VERSION = 161;
     window.msbridgeVer = MSW_BRIDGE_VERSION;
     window.mswValue = function () { return vd ? vd.getValue() : ''; }; // 启动校验(C++ 读日志) // 缓存排查:每次改动必须递增
 
@@ -23,6 +23,8 @@
     var lastValue = typeof initial.content === 'string' ? initial.content : '';
     var themePending = initial.theme || 'light';
     var fontSize = initial.fontSize || 16;
+    var lineHeight = typeof initial.lineHeight === 'number' && initial.lineHeight >= 1.0
+        ? Math.min(initial.lineHeight, 2.2) : 1.0;   // 正文行距(代码块/公式固定,不随动)
     var showLineNumbers = !!initial.lineNumbers;
     var preferLatex = !!initial.preferLatex;
     var latexBefore = null, latexTimer = null, applyingLatex = false;
@@ -93,8 +95,7 @@
         return document.querySelector('.vditor-ir pre.vditor-reset')
             || document.querySelector('.vditor-wysiwyg pre.vditor-reset')
             || document.querySelector('.vditor-wysiwyg')
-            || document.querySelector('.vditor-sv pre.vditor-reset')
-            || document.querySelector('.vditor-sv');
+            || document.querySelector('.vditor-sv textarea');
     }
 
     // ------------------------------------------------------------------
@@ -166,10 +167,33 @@
     function preferredText(text) {
         return preferLatex && window.msLatexPreference ? window.msLatexPreference.normalize(text) : text;
     }
+    document.addEventListener('beforeinput', function (event) {
+        if (!vd || currentMode !== 'ir' || event.isComposing || !event.cancelable ||
+            event.inputType !== 'insertText' || event.data !== '$') return;
+        if (!editorRoot().contains(event.target) || /^(INPUT|TEXTAREA|SELECT)$/.test(event.target.tagName)) return;
+        var block = caretBlock(), selection = getSelection();
+        if (!block || block.tagName !== 'P' || block.querySelector('[data-type]') ||
+            !/^\${1,2}$/.test(block.textContent) || !selection.rangeCount || !selection.isCollapsed) return;
+        var range = selection.getRangeAt(0);
+        if (!block.contains(range.startContainer)) return;
+        var tail = range.cloneRange(); tail.selectNodeContents(block);
+        tail.setStart(range.startContainer, range.startOffset);
+        if (tail.toString()) return;
+        // Keep an empty inline pair editable; Lute treats bare $$ as a block.
+        // The fourth dollar and subsequent formula content use the normal parser.
+        event.preventDefault(); event.stopImmediatePropagation();
+        clearStaleCaretBookmarks();
+        recordMathUndo();
+        var dollar = document.createTextNode('$');
+        range.insertNode(dollar); range.setStartAfter(dollar); range.collapse(true);
+        selection.removeAllRanges(); selection.addRange(range);
+        suppressUntil = 0;
+        recordMathUndo(); onInput(vd.getValue());
+    }, true);
     function blockMarkdown(block) {
         return vd.vditor.lute.VditorIRDOM2Md(block.outerHTML);
     }
-    function convertEditedLatexBlock(previous, target) {
+    function convertEditedLatexBlock(previous, target, mergeUndo) {
         if (!preferLatex || applyingLatex) return;
         if (currentMode === 'sv') { convertSourceLatex(previous); return; }
         if (currentMode !== 'ir') return;
@@ -185,7 +209,7 @@
         var marker = document.createTextNode(' ' + markerText);
         applyingLatex = true;
         try {
-            recordMathUndo();
+            if (!mergeUndo) recordMathUndo();
             var isCode = block.getAttribute('data-type') === 'code-block';
             if (isCode) converted += '\n\n' + markerText;
             else {
@@ -354,6 +378,7 @@
         if (!root || e.target !== root || !root.children || !root.children.length) return;
         var y = e.clientY;
         var kids = root.children;
+        var handled = false;
         for (var i = 0; i < kids.length; i++) {
             var cur = kids[i];
             var prev = i > 0 ? kids[i - 1] : null;
@@ -373,6 +398,66 @@
             }
             return;
         }
+        // 最后一个块【下方】的空白:末尾代码块是困局 —— Enter 只在块内加行,
+        // 点下方又落不进任何元素(用户只能点上方逃逸)。这里在末尾代码块后
+        // 补一个空段并落光标,给一条确定性的出路
+        var last = kids[kids.length - 1];
+        if (last && last.getAttribute && last.getAttribute('data-type') === 'code-block'
+            && y >= last.getBoundingClientRect().bottom) {
+            e.preventDefault();
+            e.stopPropagation();
+            var pad = document.createElement('p');
+            pad.setAttribute('data-block', '0');
+            last.after(pad);
+            try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e9) {}
+            var sel2 = window.getSelection();
+            var rg2 = document.createRange();
+            rg2.selectNodeContents(pad);
+            rg2.collapse(false);
+            sel2.removeAllRanges();
+            sel2.addRange(rg2);
+            if (vd) vd.focus();
+            try { onInput(vd.getValue()); } catch (eA) {}
+            document.dispatchEvent(new Event('selectionchange'));
+            handled = true;
+        }
+        if (handled) return;
+    }, true);
+
+    // 点击分隔线(hr):光标会落进不可编辑的 <hr> 本体,"横线上有个光标"
+    // 却什么都输不了。不拦点击(v96 教训),只在事后把落在 hr 上的光标
+    // 规整到相邻的普通段落:优先下一行,没有就上一行
+    document.addEventListener('mousedown', function (e) {
+        if (e.button !== 0 || currentMode !== 'ir') return;
+        var root = editorRoot();
+        if (!root || !root.contains(e.target)) return;
+        setTimeout(function () {
+            try {
+                var sel = window.getSelection();
+                if (!sel || !sel.rangeCount) return;
+                var anc = sel.anchorNode;
+                if (!anc) return;
+                var node = anc.nodeType === 1 ? anc : anc.parentElement;
+                if (!node) return;
+                var hr = node.closest ? node.closest('hr[data-block], .vditor-reset > hr') : null;
+                if (!hr || !root.contains(hr)) return;
+                var root2 = editorRoot();
+                var next = hr.nextElementSibling;
+                var prev = hr.previousElementSibling;
+                var isPara = function (el) { return el && el.tagName === 'P'; };
+                var target = null, atEnd = false;
+                if (isPara(next)) { target = next; atEnd = false; }
+                else if (isPara(prev)) { target = prev; atEnd = true; }
+                if (!target) return;
+                var rg = document.createRange();
+                rg.selectNodeContents(target);
+                rg.collapse(!atEnd);
+                sel.removeAllRanges();
+                sel.addRange(rg);
+                if (vd) vd.focus();
+                document.dispatchEvent(new Event('selectionchange'));
+            } catch (e2) {}
+        }, 0);
     }, true);
 
     // 选区纯文本:必须剥掉 .vditor-ir__preview —— 行内公式的 KaTeX 渲染
@@ -495,10 +580,89 @@
     }
     var lastOutlineSig = '';
 
+    // --- 打字触发的 YAML front matter 回退 ------------------------------
+    // 行首敲第三个 '-',Lute 可能把 '---' 变成 front matter 并自动补闭合标记,
+    // 后续输入全进了元数据区(用户:"输入---再按=,出现的是什么鬼")。
+    // 触发用 MutationObserver 直盯 DOM:输入法的合成事件绕得开 input 监听,
+    // 绕不开 DOM 变化。
+    // 规则:文档加载时不带 front matter → 出现的 front matter 一律视为误触发,
+    // 连同里面已敲的字符一起还原成正文;粘贴/加载自带的原样保留。
+    // 注意:第二行及以后打 --- 也会触发(Lute 对中部 --- 一样造 fm 块,
+    // 实测 kids: ['P','yaml-front-matter']),必须扫全篇,不能只看首块。
+    var fmHadBefore = false;      // 加载时文档自带 front matter(setContent/初始渲染置位)
+    var fmExisted = false;        // 已认可的 front matter(粘贴产生后置位,不再回退)
+    var fmPasteGuardUntil = 0;    // 粘贴/拖放后的短窗:期间出现的 fm 属用户粘贴,保留
+    document.addEventListener('paste', function () { fmPasteGuardUntil = Date.now() + 800; }, true);
+    document.addEventListener('drop', function () { fmPasteGuardUntil = Date.now() + 800; }, true);
+    // 同拍兜底:非合成输入时第一时间处理(Vditor 的 input 回调要等 undoDelay)
+    document.addEventListener('input', function () {
+        if (currentMode !== 'ir') return;
+        setTimeout(revertTypingFrontMatter, 0);
+    }, true);
+    var fmObserver = new MutationObserver(function () {
+        if (currentMode !== 'ir') return;
+        setTimeout(revertTypingFrontMatter, 0);
+    });
+    function observeFrontMatter() {
+        var root = editorRoot();
+        if (!root) { setTimeout(observeFrontMatter, 300); return; }
+        fmObserver.disconnect();
+        fmObserver.observe(root.parentElement || root, { childList: true, subtree: true });
+    }
+    function syncFrontMatterFlag() {
+        var root = editorRoot();
+        if (!root || !root.firstElementChild
+            || root.firstElementChild.getAttribute('data-type') !== 'yaml-front-matter') {
+            fmHadBefore = false;
+            return;
+        }
+        // 加载时文档就带 front matter:视为合法,输入路径不回退
+        fmHadBefore = true;
+        fmExisted = true;
+    }
+    function revertTypingFrontMatter() {
+        var root = editorRoot();
+        if (!root) return;
+        // 扫描全部直接子块里的 front matter(首块/中部都要)
+        var kids = root.children, i, first = null;
+        for (i = 0; i < kids.length; i++) {
+            if (kids[i].getAttribute && kids[i].getAttribute('data-type') === 'yaml-front-matter') {
+                first = kids[i];
+                break;
+            }
+        }
+        if (!first) { fmExisted = false; return; }
+        if (fmHadBefore || fmExisted) return;
+        if (Date.now() < fmPasteGuardUntil) { fmExisted = true; return; }   // 粘贴产生:保留
+        var code = first.querySelector('code[data-type="yaml-front-matter"]');
+        var content = ((code ? code.textContent : '') || '').replace(/\u200b/g, '');
+        content = content.replace(/\n+/g, '');   // 还原为正文段落,不保留换行
+        try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e0) {}
+        var p = document.createElement('p');
+        p.setAttribute('data-block', '0');
+        p.textContent = '---' + content;
+        first.replaceWith(p);
+        fmExisted = false;
+        var sel = window.getSelection();
+        var rg = document.createRange();
+        rg.selectNodeContents(p);
+        rg.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(rg);
+        try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e1) {}
+        if (vd) vd.focus();
+        document.dispatchEvent(new Event('selectionchange'));
+        try { onInput(vd.getValue()); } catch (e2) {}
+        scheduleGutters();
+    }
+
     function onInput(value) {
         rev++;                      // 内容变了,修订号自增(保存快照靠它判新旧)
         if (typeof value === 'string')
             lastValue = value;      // 缓存全文,统计/大纲用它,不再调 getValue
+        revertTypingFrontMatter();  // 打字误触发的空 front matter 还原成 '---' 段落
+        // Vditor 的 IR 变换若在本回调之后才跑,这里补一拍延迟重试(幂等)
+        setTimeout(revertTypingFrontMatter, 0);
         // 装饰(行号/高亮/统计)不受 suppress 影响:setValue 之后内容全新,
         // 旧代码在抑制窗口里直接 return,导致整篇代码块行号消失
         scheduleGutters();
@@ -816,12 +980,6 @@
         if (window.hljs && window.hljs.getLanguage && window.hljs.getLanguage(s))
             return s;
         return s;
-    }
-    // 围栏语言名等用户可控文本进 innerHTML 前必须转义(未知语言原样透传)
-    function escapeHtml(s) {
-        return String(s).replace(/[&<>"']/g, function (c) {
-            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-        });
     }
     function langMeta(id) {
         for (var i = 0; i < LANG_CATALOG.length; i++) {
@@ -1250,8 +1408,17 @@
             return;
         }
         hideLangSuggest();
-        if (block && block.classList)
+        if (block && block.classList) {
             block.classList.remove('ms-lang-editing');
+            block.classList.add('vditor-ir__node--expand');
+            var source = block.querySelector('pre.vditor-ir__marker--pre > code');
+            if (source) {
+                var range = document.createRange();
+                range.selectNodeContents(source); range.collapse(true);
+                var selection = getSelection(); selection.removeAllRanges(); selection.addRange(range);
+                editorRoot().focus({ preventScroll: true });
+            }
+        }
         scheduleGutters();
         decorateAllCodeBlocks();
         syncCbEditState();   // 按钮与编辑态类立即复位,不等下一帧
@@ -1298,7 +1465,7 @@
         ensureLangIcons();
         var label = lang ? meta[1] : '代码语言';
         codeLangBtn.innerHTML = (lang ? langBadgeHtml(meta) : '')
-            + '<span>' + escapeHtml(label) + '</span>';
+            + '<span>' + label + '</span>';
         codeLangBtn.style.display = 'flex';
         var rect = block.getBoundingClientRect();
         var w = codeLangBtn.offsetWidth || 88;
@@ -1409,38 +1576,38 @@
         for (var i = 0; i < hits.length; i++) {
             var row = hits[i];
             html += '<div class="ms-lang-item' + (i === langSuggestIdx ? ' is-active' : '')
-                + '" data-lang="' + escapeHtml(row[0]) + '">'
+                + '" data-lang="' + row[0] + '">'
                 + langBadgeHtml(row)
-                + '<span>' + escapeHtml(row[1]) + '</span></div>';
+                + '<span>' + row[1] + '</span></div>';
         }
         // 底部:本文档默认语言(每文档独立,按路径持久化,不写进 md)
         if (docLang) {
             var cur = langMeta(resolveLang(docLang));
             html += '<div class="ms-lang-foot" data-role="cleardoc">'
                  + langBadgeHtml(cur)
-                 + '<span>★ 本文档默认:' + escapeHtml(cur[1]) + '(点击取消)</span></div>';
+                 + '<span>★ 本文档默认:' + cur[1] + '(点击取消)</span></div>';
         } else if (langSuggestHits[langSuggestIdx]) {
             html += '<div class="ms-lang-foot" data-role="setdoc">'
                  + '<span>★ 设为本文档默认:' + langSuggestHits[langSuggestIdx][1] + '</span></div>';
         }
         el.innerHTML = html;
         el.hidden = false;
-        var block = window._msCbEdit || codeLangBlock;
-        var info = block && block.querySelector('.vditor-ir__marker--info');
-        var anchor = info && info.offsetParent ? info : (codeLangBtn || block);
-        if (!anchor) return;
-        var rect = anchor.getBoundingClientRect();
-        var top = rect.bottom + 6;
-        var left = rect.left;
-        el.style.left = Math.max(8, left) + 'px';
-        el.style.top = top + 'px';
-        requestAnimationFrame(function () {
-            var box = el.getBoundingClientRect();
-            if (box.bottom > window.innerHeight - 8)
-                el.style.top = Math.max(8, rect.top - box.height - 6) + 'px';
-            if (box.right > window.innerWidth - 8)
-                el.style.left = Math.max(8, window.innerWidth - box.width - 8) + 'px';
-        });
+        // 候选锚在【代码块右下角】(与"代码语言"按钮同位)。旧实现锚在
+        // ```lang 语言标记上,块一高候选就飘到块顶左上角,和用户点击的
+        // 位置完全脱节;块滚出视口后更会落在无关内容上
+        var anchorBlock = (langPickerBlock && langPickerBlock.isConnected)
+            ? langPickerBlock
+            : (window._msCbEdit && window._msCbEdit.isConnected ? window._msCbEdit : codeLangBlock);
+        if (!anchorBlock || !anchorBlock.isConnected) return;
+        var rect = anchorBlock.getBoundingClientRect();
+        var box = el.getBoundingClientRect();
+        var w = box.width, h = box.height;
+        var left = rect.right - w - 10;   // 右缘与代码块对齐(按钮同款 10px 内缩)
+        var top = rect.bottom + 6;        // 默认挂块下方
+        if (top + h > window.innerHeight - 8 && rect.top - h - 6 > 8)
+            top = rect.top - h - 6;       // 下方放不下且上方有空间 → 挂块上方
+        el.style.left = Math.max(8, Math.min(left, window.innerWidth - w - 8)) + 'px';
+        el.style.top = Math.max(8, Math.min(top, window.innerHeight - h - 8)) + 'px';
     }
     function scheduleLangSuggest() {
         if (langSuggestTimer) clearTimeout(langSuggestTimer);
@@ -1540,7 +1707,7 @@
                 applyLangChoice(langSuggestHits[langSuggestIdx][0]);
             }
         } else if (e.key === 'Escape') {
-            e.preventDefault(); e.stopPropagation();
+            e.preventDefault(); e.stopImmediatePropagation();
             closeLangPicker(false);
         } else if (langPickerOpen && !e.ctrlKey && !e.altKey && !e.metaKey) {
             // Vditor 会把焦点抢回代码正文:语言选择期间字母/退格一律写进 info
@@ -1561,6 +1728,27 @@
             }
         }
     }, true);
+    // 点外部关闭语言候选:langPickerOpen 期间旧实现没有任何"点空白退出"
+    // 的路径,反而由 syncLangSuggest 把光标一次次拽回语言标记 —— 用户看到
+    // 的就是"怎么点都在、像卡死"。Esc/Enter/点候选项仍然有效;这里补上
+    // 鼠标路径:点击候选面板、语言标记、"代码语言"按钮之外任意处即关闭。
+    // 在 mousedown 捕获阶段关(早于浏览器放光标),关闭本身不动光标,
+    // 点击落点交给浏览器默认行为,不打架
+    document.addEventListener('mousedown', function (e) {
+        if (!langPickerOpen || e.button !== 0) return;
+        var t = e.target;
+        if (langSuggestEl && !langSuggestEl.hidden && langSuggestEl.contains(t)) return;
+        if (codeLangBtn && codeLangBtn.contains(t)) return; // 按钮自己有 open 逻辑
+        var block = langPickerBlock;
+        var info = block ? langInfoEl(block) : null;
+        if (info && info.contains(t)) return;               // 继续编辑语言文本
+        langPickerOpen = false;
+        langPickerBlock = null;
+        hideLangSuggest();
+        if (block && block.classList)
+            block.classList.remove('ms-lang-editing');
+        syncCbEditState();                                  // 按钮与编辑态类立即复位
+    }, true);
     // 退出代码编辑态:把光标移到相邻块(下一个块落到块首,否则上一个块落到块尾)。
     // 用 Esc 触发 —— 点空白退出的方案会把"点空白放光标"的正常操作吃掉,
     // 长块铺满屏幕时 Esc 是最明确、不冲突的退出方式
@@ -1570,8 +1758,7 @@
         try {
             var rng = document.createRange();
             rng.selectNodeContents(sib);
-            // collapse(toStart):下一个块 → 块首(true);只有上一块 → 块尾(false)
-            rng.collapse(!!block.nextElementSibling);
+            rng.collapse(!block.nextElementSibling);
             var s = window.getSelection();
             s.removeAllRanges();
             s.addRange(rng);
@@ -1620,17 +1807,7 @@
         if (start < 0) return false;
         if (end < start) end = start;
         lines.splice(start, end - start + 1);
-        // 只收敛删除点(而非全篇)的空行:块删除后两侧空行相邻,压回一个;
-        // 文档其他位置用户保留的连续空行不受影响
-        if (start > 0 && start < lines.length
-            && lines[start - 1] === '' && lines[start] === '') {
-            var extraBlank = 0;
-            while (start + extraBlank < lines.length && lines[start + extraBlank] === '')
-                extraBlank++;
-            if (extraBlank > 1)
-                lines.splice(start, extraBlank - 1);
-        }
-        var md = lines.join('\n');
+        var md = lines.join('\n').replace(/\n{3,}/g, '\n\n');
         try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e) {}
         vd.setValue(md, false);
         return true;
@@ -1744,6 +1921,214 @@
                 } catch (e2) {}
             }, 80);
         } catch (err) {}
+    }, true);
+
+    // 光标是否在本块"内容行首":块首到光标之间只剩标记元素(标题 # 、
+    // 引用 > 、列表符、<font> 这类行内标签)和零宽空格才算。标题 Backspace
+    // 与 Enter 两个处理器共用
+    function caretAtContentStart(block) {
+        var sel = window.getSelection();
+        if (!sel || !sel.rangeCount || !sel.isCollapsed) return false;
+        var r = sel.getRangeAt(0);
+        if (!block.contains(r.startContainer)) return false;
+        var probe = document.createRange();
+        probe.selectNodeContents(block);
+        try { probe.setEnd(r.startContainer, r.startOffset); } catch (e) { return false; }
+        var holder = document.createElement('div');
+        holder.appendChild(probe.cloneContents());
+        holder.querySelectorAll('.vditor-ir__marker, [data-type="heading-marker"], span.vditor-ir__node')
+            .forEach(function (n) {
+                var t = (n.textContent || '').trim();
+                if (/^<[^>]+>$/.test(t) || /^[#>`~\-+*.\d\s]*$/.test(t))
+                    n.remove();
+            });
+        return holder.textContent.replace(/\u200b/g, '').trim() === '';
+    }
+
+    // 光标是否在本块"内容行尾"(行首判定的镜像,Delete 处理器用)
+    function caretAtContentEnd(block) {
+        var sel = window.getSelection();
+        if (!sel || !sel.rangeCount || !sel.isCollapsed) return false;
+        var r = sel.getRangeAt(0);
+        if (!block.contains(r.startContainer)) return false;
+        var probe = document.createRange();
+        probe.selectNodeContents(block);
+        try { probe.setStart(r.startContainer, r.startOffset); } catch (e) { return false; }
+        var holder = document.createElement('div');
+        holder.appendChild(probe.cloneContents());
+        holder.querySelectorAll('.vditor-ir__marker, [data-type="heading-marker"], span.vditor-ir__node')
+            .forEach(function (n) {
+                var t = (n.textContent || '').trim();
+                if (/^<[^>]+>$/.test(t) || /^[#>`~\-+*.\d\s]*$/.test(t))
+                    n.remove();
+            });
+        return holder.textContent.replace(/\u200b/g, '').trim() === '';
+    }
+
+    // 行首 Backspace 且上一兄弟是空段:删掉空段,保住本块格式。
+    // Vditor 原生是把本块并进空段 —— 标题级别、<font> 颜色在合并里全丢,
+    // 用户看到的就是"删掉空行后标题变普通文本、颜色没了"。
+    // 判定"行首"用 DOM 剥标记:块首到光标之间只剩标记元素(标题的 # 、
+    // 引用 > 、列表符、<font> 标签等)和零宽空格,才算内容行首
+    document.addEventListener('keydown', function (e) {
+        if (e.key !== 'Backspace' || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+        if (!vd || currentMode !== 'ir') return;
+        if (currentCodeBlock()) return;             // 代码块有自己的删除语义
+        var sel = window.getSelection();
+        if (!sel || !sel.rangeCount || !sel.isCollapsed) return;
+        var block = caretBlock();
+        if (!block) return;
+        var prev = block.previousElementSibling;
+        // 空行不限于 P:标题上方的空行是空 H1-H6(Vditor 让空行继承标题级),
+        // 引用里的空行是空 BLOCKQUOTE。列表/表格结构不碰
+        if (!prev || !/^(P|H[1-6]|BLOCKQUOTE)$/.test(prev.tagName)) return;
+        if ((prev.textContent || '').replace(/\u200b/g, '').trim()) return;  // 上一段非空
+        if (prev.querySelector('img')) return;
+        if (!caretAtContentStart(block)) return; // 光标不在内容行首
+        e.preventDefault();
+        e.stopPropagation();
+        try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e3) {}
+        // 删掉空段后整篇序列化往返:只 prev.remove()+rerender() 的话,Vditor
+        // 就地重解析会把段首 <font ...> 这类行内 HTML 标记拆坏(实测丢 '>' 变纯文本)
+        // 纯 DOM 删除,不走 getValue/setValue 整篇往返:往返会让 Lute 把
+        // 连续空行折叠掉 —— 多行空行上按一下就全没了("跳到上一行有内容
+        // 的位置"的根源)。也不 rerender:就地重解析会拆坏段首 <font> 标记。
+        // 只同步标脏(onInput),DOM 与光标原样保留,一次只删一个空段
+        prev.remove();
+        try { onInput(vd.getValue()); } catch (e4) {}
+        scheduleGutters();
+    }, true);
+
+    // 块末尾 Delete 且下一兄弟是空块:只删掉那个空块。
+    // Vditor 原生会"穿透空行"把下一个内容块也合并进来(实测
+    // "甲甲/空/乙乙"一键变"甲甲乙乙"同段) —— 静默合并后用户再按
+    // Ctrl+1,两行字一起变标题;再连续按,内容一片片消失
+    document.addEventListener('keydown', function (e) {
+        if (e.key !== 'Delete' || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+        if (!vd || currentMode !== 'ir') return;
+        if (currentCodeBlock()) return;             // 代码块有自己的删除语义
+        var sel = window.getSelection();
+        if (!sel || !sel.rangeCount || !sel.isCollapsed) return;
+        var block = caretBlock();
+        if (!block) return;
+        // 标题内容行首的 Delete:只删第一个可见字符,标题级别不动。
+        // Vditor 原生会把标题级别一起删掉("按一下删除,标题没了")
+        if (/^H[1-6]$/.test(block.tagName) && caretAtContentStart(block)) {
+            var walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+            var n, target = null;
+            while ((n = walker.nextNode())) {
+                var pn = n.parentElement;
+                if (pn && pn.closest && pn.closest('.vditor-ir__marker, [data-type="heading-marker"]'))
+                    continue;
+                if (n.textContent.replace(/\u200b/g, '')) { target = n; break; }
+            }
+            if (target) {
+                e.preventDefault();
+                e.stopPropagation();
+                try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e5) {}
+                var before = target.textContent;
+                target.textContent = before.replace(/^(\u200b)?./, '');
+                var dr = document.createRange();
+                dr.setStart(target, 0);
+                dr.collapse(true);
+                var ds = window.getSelection();
+                ds.removeAllRanges();
+                ds.addRange(dr);
+                editorRoot().focus({ preventScroll: true });
+                // 不 rerender(避免整篇重解析折叠连续空行/拆坏行内标记),
+                // 只同步标脏
+                try { onInput(vd.getValue()); } catch (e6) {}
+                scheduleGutters();
+                return;
+            }
+        }
+        var next = block.nextElementSibling;
+        if (!next || !/^(P|H[1-6]|BLOCKQUOTE)$/.test(next.tagName)) return;
+        if ((next.textContent || '').replace(/\u200b/g, '').trim()) return; // 非空块:交给原生合并
+        if (next.querySelector('img')) return;
+        if (!caretAtContentEnd(block)) return;      // 光标不在内容行尾
+        e.preventDefault();
+        e.stopPropagation();
+        try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e3) {}
+        // 纯 DOM 删除(理由同 Backspace 处理器):一次只删一个空块
+        next.remove();
+        try { onInput(vd.getValue()); } catch (e4) {}
+        scheduleGutters();
+    }, true);
+
+    // 内容行首 Enter 的两处后置矫正:
+    // ① 标题:Vditor 会在上面插一个【空标题】(隐形细线,点进去打字秒变
+    //   标题)→ 降级成普通空段(Typora 语义);
+    // ② 行内 HTML 开标签(<font ...>)开头的块:Vditor 的 Enter 会把开标签
+    //   切进上一段,标签对跨块断裂 → 挪回本段开头,上一段清空
+    document.addEventListener('keydown', function (e) {
+        if (e.key !== 'Enter' || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+        if (!vd || currentMode !== 'ir') return;
+        if (currentCodeBlock()) return;
+        var hb = caretBlock();
+        if (!hb) return;
+        var isHeading = /^H[1-6]$/.test(hb.tagName);
+        var hasInlineTag = !!(hb.firstElementChild
+            && hb.firstElementChild.getAttribute
+            && hb.firstElementChild.getAttribute('data-type') === 'html-inline');
+        if (!isHeading && !hasInlineTag) return;
+        if (!caretAtContentStart(hb)) return;   // 只在内容行首才管
+        // 行内 HTML 开标签(<font ...>)开头的块:Vditor 的 Enter 会把标签对
+        // 拆散(上一段变裸标签文本/垃圾 DIV,实测不可修复) —— capture 阶段
+        // 直接拦截,自己上面插一个空段(Typora 语义),本块与光标都不动
+        if (hasInlineTag && !isHeading) {
+            e.preventDefault();
+            e.stopPropagation();
+            try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (eT) {}
+            var empty = document.createElement('p');
+            empty.setAttribute('data-block', '0');
+            hb.parentNode.insertBefore(empty, hb);
+            try { onInput(vd.getValue()); } catch (eE) {}
+            scheduleGutters();
+            return;
+        }
+        setTimeout(function () {
+            try {
+                var cur = caretBlock();
+                if (!cur) return;
+                var demote = null;
+                if (/^H[1-6]$/.test(cur.tagName)
+                    && !(cur.textContent || '').replace(/\u200b/g, '').trim()) {
+                    demote = cur;                       // 光标自己落进空标题
+                } else if (/^H[1-6]$/.test(cur.tagName)) {
+                    var prev = cur.previousElementSibling;
+                    if (prev && /^H[1-6]$/.test(prev.tagName)
+                        && !(prev.textContent || '').replace(/\u200b/g, '').trim())
+                        demote = prev;                  // 上方空标题
+                }
+                if (demote) {
+                    var p = document.createElement('p');
+                    p.setAttribute('data-block', '0');
+                    demote.replaceWith(p);
+                    try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e2) {}
+                    // 纯 DOM 替换,不 rerender(避免整篇重解析的连锁副作用)
+                    try { onInput(vd.getValue()); } catch (e5) {}
+                    scheduleGutters();
+                    return;
+                }
+                // 开标签被切进上一段:挪回本段开头,上一段换成正规空段。
+                // 上一段可能是 Vditor 临时造的 DIV(垃圾块),一并替换
+                var pv = cur.previousElementSibling;
+                if (!pv || !/^(P|H[1-6]|DIV)$/.test(pv.tagName)) return;
+                var stray = pv.querySelectorAll('span[data-type="html-inline"]');
+                if (stray.length !== 1) return;
+                var rest = (pv.textContent || '').replace(stray[0].textContent, '')
+                    .replace(/\u200b/g, '').trim();
+                if (rest) return;                       // 上一段还有别的内容:不动
+                cur.insertBefore(stray[0], cur.firstChild);
+                var rep = document.createElement('p');
+                rep.setAttribute('data-block', '0');
+                pv.replaceWith(rep);
+                try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e6) {}
+                try { onInput(vd.getValue()); } catch (e7) {}
+                scheduleGutters();
+            } catch (e3) {}
+        }, 0);
     }, true);
 
     document.addEventListener('keydown', function (e) {
@@ -2018,6 +2403,43 @@
         return true;
     }
 
+    function insertCodeSource(text) {
+        if (!vd || currentMode !== 'ir') return false;
+        var sel = window.getSelection();
+        if (!sel || !sel.rangeCount) return false;
+        var range = sel.getRangeAt(0);
+        var block = currentCodeBlock();
+        var source = block && block.querySelector('pre.vditor-ir__marker--pre > code');
+        if (!source) return false;
+        var pre = source.parentElement;
+        if (!(source.contains(range.startContainer) || range.startContainer === pre)
+            || !(source.contains(range.endContainer) || range.endContainer === pre)) return false;
+        var beforeMarkdown = preferLatex ? blockMarkdown(block) : null;
+        var before = range.cloneRange();
+        before.selectNodeContents(source);
+        before.setEnd(range.startContainer, range.startOffset);
+        var start = before.toString().length;
+        var end = start + range.toString().length;
+        text = String(text).replace(/\r\n?/g, '\n');
+        suppressUntil = 0;
+        clearStaleCaretBookmarks();
+        vd.vditor.undo.recordFirstPosition(vd.vditor, { key: 'v' });
+        recordMathUndo();
+        // Empty code lines can leave the selection on PRE instead of CODE.
+        // Insert literal text using the source range, independent of paste.target.
+        var node = document.createTextNode(source.textContent.slice(0, start)
+            + text + source.textContent.slice(end));
+        source.replaceChildren(node);
+        range = document.createRange();
+        range.setStart(node, start + text.length); range.collapse(true);
+        sel.removeAllRanges(); sel.addRange(range);
+        rerender();
+        if (preferLatex && convertEditedLatexBlock(beforeMarkdown, null, true)) return true;
+        recordMathUndo();
+        onInput(vd.getValue());
+        return true;
+    }
+
     document.addEventListener('beforeinput', function (event) {
         if (event.isComposing || !event.cancelable || !event.data || !/[\r\n]/.test(event.data)) return;
         if (insertMathSource(event.data)) {
@@ -2191,7 +2613,7 @@
             var b = caretBlock();
             if (!b) { notice('光标不在文本中'); return; }
             if (b.tagName !== 'P') { notice('请先用鼠标选中要加粗的范围'); return; }
-            txt = (b.textContent || '').replace(/​/g, '').trim();
+            txt = (b.textContent || '').replace(/\u200b/g, '').trim();
             if (!txt) {
                 // 空块:插入空标记,光标居中
                 vd.insertValue(marker + marker, true);
@@ -2210,19 +2632,13 @@
         var ok = false;
         try { ok = document.execCommand('insertText', false, marker + txt + marker); } catch (e) {}
         if (!ok) {
-            var before = null;
-            try { before = r.toString(); } catch (e0) {}
             try {
                 r.deleteContents();
                 r.collapse(true);
                 sel.removeAllRanges();
                 sel.addRange(r);
                 vd.insertValue(marker + txt + marker, true);
-            } catch (e2) {
-                // 插入失败时把刚删掉的选中文本补回来,避免静默丢字
-                if (before) { try { vd.insertValue(before, true); } catch (e3) {} }
-                notice('操作失败，请重试');
-            }
+            } catch (e2) {}
         }
         rerender();
         vd.focus();
@@ -2235,8 +2651,8 @@
     // Ctrl+Shift+K:在光标所在块【后面】插入代码块。
     // 旧实现拿当前块文本去 getValue() 里搜,空行/重复段落/匹配失败一律
     // insertAfter = 文末 —— 这就是"总在最后创建"的根因。
-    // 现在:克隆 DOM,在目标块后插入唯一占位段落,整篇走 Lute,再把占位符
-    // 换成围栏。定位只认 DOM 顺序,不再搜文本。
+    // Insert Lute's native code DOM beside the current block. Serializing the
+    // whole document through setValue drops empty paragraphs between blocks.
     function insertCodeBlock() {
         if (!vd) return;
         var sel = window.getSelection();
@@ -2246,31 +2662,15 @@
         var fence = '\n```' + autoLang + '\n' + (selTxt || '') + '\n```\n';
 
         if (currentMode === 'sv') {
-            // 本版 vditor 的 sv 是 contenteditable 的 pre,没有 textarea ——
-            // 旧代码据此外的 querySelector 误判光标,围栏永远落到文末。
-            // 改为:按光标所在块的全文在 md 里定位,定位失败保持旧兜底(文末)。
-            // 选中文本不带入 sv 围栏:精确替换需要字符级 DOM↔md 映射,风险大于收益。
-            var v = vd.getValue();
-            var at = v.length;
-            try {
-                var svRoot = editorRoot();
-                var node = sel && sel.rangeCount ? sel.getRangeAt(0).startContainer : null;
-                var el = node ? (node.nodeType === 1 ? node : node.parentNode) : null;
-                while (el && el !== svRoot && el !== document.body && el.parentElement)
-                    el = el.parentElement;
-                if (el && el !== document.body && svRoot
-                    && (el === svRoot || svRoot.contains(el))) {
-                    var bt = (el.innerText || el.textContent || '')
-                        .replace(/\u200b/g, '').replace(/\n+$/, '');
-                    var pos = bt ? v.indexOf(bt) : -1;
-                    if (pos >= 0) at = pos + bt.length;
-                }
-            } catch (e) {}
+            var ta = document.querySelector('.vditor-sv textarea');
+            var v = ta ? ta.value : vd.getValue();
+            var start = ta ? ta.selectionStart : v.length;
+            var end = ta ? ta.selectionEnd : v.length;
+            var picked = (ta ? v.slice(start, end) : selTxt) || '';
             // 文档默认语言同样作用于源码模式(此前只有 IR 分支带上,行为不一致)
-            var svLang = (!selTxt && docLang) ? docLang : '';
+            var svLang = (!picked && docLang) ? docLang : '';
             try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e) {}
-            vd.setValue(v.slice(0, at) + '\n```' + svLang + '\n```\n'
-                        + v.slice(at).replace(/^\n+/, ''), false);
+            vd.setValue(v.slice(0, start) + '\n```' + svLang + '\n' + picked + '\n```\n' + v.slice(end), false);
             return;
         }
 
@@ -2279,84 +2679,65 @@
         if (!block && root && root.children.length)
             block = root.children[root.children.length - 1];
 
-        // 选中文本要"移进"代码块:从正文里删掉再克隆。此前 IR 分支漏了这步,
-        // 围栏里带上选中文本、原位也还留着,一份变两份。先压撤销快照再删,
-        // Ctrl+Z 一步还原到删除前(后面的常规入栈跳过,避免双份快照)。
-        var deletedSel = false;
-        if (selTxt && sel && sel.rangeCount) {
-            try {
-                var rs = sel.getRangeAt(0);
-                if (root && root.contains(rs.commonAncestorContainer)) {
-                    try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (eu) {}
-                    rs.deleteContents();
-                    rs.collapse(true);
-                    deletedSel = true;
-                }
-            } catch (e) {}
-        }
-
         var lute = vd.vditor && vd.vditor.lute;
-        var token = '@@MSWCB' + Date.now().toString(36)
-                  + Math.random().toString(36).slice(2, 8) + '@@';
-        var md = '';
-        var newBlockIdx = 0;
-
-        if (root && lute && typeof lute.VditorIRDOM2Md === 'function') {
-            var clone = root.cloneNode(true);
-            var marker = document.createElement('p');
-            marker.setAttribute('data-block', '0');
-            marker.textContent = token;
-            if (block) {
-                var di = Array.prototype.indexOf.call(root.children, block);
-                var ref = di >= 0 ? clone.children[di] : null;
-                if (ref) {
-                    if (ref.nextSibling) clone.insertBefore(marker, ref.nextSibling);
-                    else clone.appendChild(marker);
-                } else {
-                    clone.appendChild(marker);
-                }
-                var sib = root.firstElementChild;
-                while (sib) {
-                    if (sib.getAttribute && sib.getAttribute('data-type') === 'code-block')
-                        newBlockIdx++;
-                    if (sib === block) break;
-                    sib = sib.nextElementSibling;
-                }
+        if (!root || !lute) return;
+        var template = document.createElement('template');
+        template.innerHTML = lute.Md2VditorIRDOM(fence);
+        var inserted = template.content.querySelector('div[data-type="code-block"]');
+        if (!inserted) return;
+        vd.vditor.undo.recordFirstPosition(vd.vditor, { key: 'k' });
+        recordMathUndo();
+        // 空段落上按 Ctrl+Shift+K:空段直接【变成】代码块。旧逻辑插到空段
+        // 后面,空段留在块上方 —— 就是"代码块前面多了空行"(空段还会被
+        // Lute 塞零宽空格,看着更像一行)
+        if (block && block.getAttribute && block.getAttribute('data-type') !== 'code-block'
+            && !(block.textContent || '').replace(/\u200b/g, '').trim()
+            && !block.querySelector('img')
+            && !/(UL|OL|BLOCKQUOTE|TABLE|HR)/.test(block.tagName)) {
+            // Vditor 从代码块向下出来时会插一个 ZWSP 占位段(landing pad)。
+            // 若空段上方恰好是"代码块 + 占位段",占位段一并吃掉 —— 否则它
+            // 留在新块上方,看着就是"又自动多了一行"
+            var prevPad = block.previousElementSibling;
+            if (prevPad && prevPad.tagName === 'P'
+                && (prevPad.textContent || '').charAt(0) === '\u200b'
+                && !(prevPad.textContent || '').replace(/\u200b/g, '').trim()) {
+                var prevCode = prevPad.previousElementSibling;
+                if (prevCode && prevCode.getAttribute
+                    && prevCode.getAttribute('data-type') === 'code-block')
+                    prevPad.remove();
+            }
+            block.replaceWith(inserted);
+            // 空段上方就是代码块:转换后两块相邻,补一个空段隔开
+            var prevCb2 = inserted.previousElementSibling;
+            if (prevCb2 && prevCb2.getAttribute
+                && prevCb2.getAttribute('data-type') === 'code-block') {
+                var gapP2 = document.createElement('p');
+                gapP2.setAttribute('data-block', '0');
+                inserted.parentNode.insertBefore(gapP2, inserted);
+            }
+        } else if (block) {
+            // 上一个兄弟是代码块时补一个空段:否则两块直接相邻,
+            // "代码块下面再做一个代码块,中间的空行没了"
+            var prevCb = block.getAttribute && block.getAttribute('data-type') === 'code-block'
+                ? block : null;
+            if (prevCb) {
+                var gapP = document.createElement('p');
+                gapP.setAttribute('data-block', '0');
+                prevCb.after(gapP);
+                gapP.after(inserted);
             } else {
-                clone.appendChild(marker);
-                newBlockIdx = root.querySelectorAll('[data-type="code-block"]').length;
+                block.after(inserted);
             }
-            md = String(lute.VditorIRDOM2Md(clone.innerHTML) || '').replace(/\u200b/g, '');
-        }
-
-        var at = md.indexOf(token);
-        if (at >= 0) {
-            md = md.slice(0, at).replace(/[ \t]*$/, '')
-               + fence
-               + md.slice(at + token.length).replace(/^[ \t]*\n?/, '');
-        } else if (root && lute && block && typeof lute.VditorIRDOM2Md === 'function') {
-            // 占位符被 Lute 吃掉时:把"到当前块为止"的 DOM 转成 md 当前缀,
-            // 在 getValue() 里按前缀长度切开(仍不搜重复文本)
-            var head = document.createElement('div');
-            var s2 = root.firstElementChild;
-            while (s2) {
-                head.appendChild(s2.cloneNode(true));
-                if (s2 === block) break;
-                s2 = s2.nextElementSibling;
-            }
-            var prefix = String(lute.VditorIRDOM2Md(head.innerHTML) || '')
-                             .replace(/\u200b/g, '').replace(/\n+$/, '');
-            var full = vd.getValue().replace(/\u200b/g, '');
-            if (prefix && full.indexOf(prefix) === 0)
-                md = prefix + fence + full.slice(prefix.length).replace(/^\n?/, '');
-            else
-                md = full.replace(/\s*$/, '') + fence;
         } else {
-            md = (vd.getValue() || '').replace(/\s*$/, '') + fence;
+            root.appendChild(inserted);
         }
-
-        if (!deletedSel) { try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (e) {} }
-        vd.setValue(md, false);
+        var newBlockIdx = Array.prototype.indexOf.call(root.querySelectorAll('div[data-type="code-block"]'), inserted);
+        var source = inserted.querySelector('pre.vditor-ir__marker--pre > code');
+        var range = document.createRange(); range.selectNodeContents(source); range.collapse(true);
+        sel.removeAllRanges(); sel.addRange(range);
+        suppressUntil = 0;
+        rerender();
+        recordMathUndo();
         scheduleGutters();
         decorateAllCodeBlocks();
         var focusNew = function () {
@@ -2387,8 +2768,7 @@
                 }
             } catch (e) {}
         };
-        setTimeout(focusNew, 60);
-        setTimeout(focusNew, 180);
+        focusNew();
     }
 
     // 段落内容恰好是 ``` / ```lang 时按回车:由我们直接把它变成真代码块。
@@ -2594,7 +2974,7 @@
         var txt = selectionTextClean(r).replace(/<\/?u>/gi, '');
         if (!txt) {
             if (b.tagName !== 'P') { notice('请先选中要加下划线的文字'); return; }
-            txt = (b.textContent || '').replace(/​/g, '').replace(/<\/?u>/gi, '').trim();
+            txt = (b.textContent || '').replace(/\u200b/g, '').replace(/<\/?u>/gi, '').trim();
             if (!txt) return;
             var wr = document.createRange();
             wr.selectNodeContents(b);
@@ -2606,18 +2986,13 @@
         var ok = false;
         try { ok = document.execCommand('insertText', false, marked); } catch (eu) {}
         if (!ok) {
-            var before = null;
-            try { before = r.toString(); } catch (eu0) {}
             try {
                 r.deleteContents();
                 r.collapse(true);
                 sel.removeAllRanges();
                 sel.addRange(r);
                 vd.insertValue(marked, true);
-            } catch (eu2) {
-                if (before) { try { vd.insertValue(before, true); } catch (eu3) {} }
-                notice('操作失败，请重试');
-            }
+            } catch (eu2) {}
         }
         rerender();
         setTimeout(renderColorTags, 150);
@@ -2667,9 +3042,103 @@
           isLink: true }
     ];
 
+    // 进入被装饰的块时还原原始结构:装饰出来的东西(display:none 标记 +
+    // 效果包裹 span)与 Vditor 的 Enter/Backspace 编辑处理冲突,实测会把
+    // 段落拆成垃圾结构(冒出 DIV 子块、内容断裂) —— 颜色/下划线/链接
+    // 各种"抽风"的总根源。光标在哪个块,哪个块就保持裸结构
+    function undecorateBlock(block) {
+        if (!block) return;
+        // 快检:块里没有任何装饰就不动(也避免无谓地重置选区 ——
+        // 每次 selectionchange 都 removeAllRanges/addRange 会干扰
+        // Vditor 的撤销快照,实测图片粘贴后的撤销被搞挂)
+        if (!block.querySelector('[data-ms-tag="1"], span[data-ms-color], span[data-ms-underline], span[data-ms-href]'))
+            return;
+        // 光标在本块内时,按【文本偏移】记住位置:还原装饰会移动节点,
+        // 浏览器会把光标重映射到段尾(实测 offset 跳到内容后),行首/行尾
+        // 判定与 Enter/删除处理全被带偏。文本偏移在装饰/还原前后不变
+        var savedTextOff = null;
+        try {
+            var selS = window.getSelection();
+            if (selS && selS.rangeCount && selS.isCollapsed) {
+                var rr = selS.getRangeAt(0);
+                if (block.contains(rr.startContainer)) {
+                    var twS = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+                    var offS = 0, nnS;
+                    while ((nnS = twS.nextNode())) {
+                        if (nnS === rr.startContainer) { offS += rr.startOffset; break; }
+                        offS += nnS.textContent.length;
+                    }
+                    savedTextOff = offS;
+                }
+            }
+        } catch (eS0) {}
+        try {
+            // 链接渲染的 [ 隐标记 / <span 蓝字> / ](url) 隐标记 -> 单节点原文
+            var links = [...block.querySelectorAll('span[data-ms-href]')];
+            for (var li = 0; li < links.length; li++) {
+                var link = links[li];
+                var pre = link.previousSibling, post = link.nextSibling;
+                var full = '[' + (link.textContent || '') + '](' + (link.getAttribute('data-ms-href') || '') + ')';
+                var node = document.createElement('span');
+                node.className = 'vditor-ir__node';
+                node.textContent = full;
+                if (pre && pre.getAttribute && pre.getAttribute('data-ms-tag') === '1') pre.remove();
+                if (post && post.getAttribute && post.getAttribute('data-ms-tag') === '1') post.remove();
+                link.parentNode.replaceChild(node, link);
+            }
+            // 颜色/下划线效果包裹 span -> 展开回平级
+            var wraps = [...block.querySelectorAll('span[data-ms-color], span[data-ms-underline]')];
+            for (var wi = 0; wi < wraps.length; wi++) {
+                var w = wraps[wi];
+                var parent = w.parentNode;
+                while (w.firstChild) parent.insertBefore(w.firstChild, w);
+                parent.removeChild(w);
+                if (parent.nodeType === 1 && !parent.childNodes.length)
+                    parent.appendChild(document.createTextNode('\u200b'));
+            }
+            // 恢复隐藏标记的显示
+            var marks = [...block.querySelectorAll('[data-ms-tag="1"]')];
+            for (var mi = 0; mi < marks.length; mi++) {
+                marks[mi].removeAttribute('data-ms-tag');
+                marks[mi].style.display = '';
+            }
+        } catch (e) {}
+        if (savedTextOff !== null) {
+            try {
+                var twR = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+                var accR = 0, nodeR = null, offR = 0, lastR = null, lastAccR = 0;
+                while ((nodeR = twR.nextNode())) {
+                    // 严格 >:偏移恰好落在某节点末尾(如标记文本结束处)时,
+                    // 要落到【下一个】文本节点开头,而不是停在标记里
+                    if (accR + nodeR.textContent.length > savedTextOff) {
+                        offR = savedTextOff - accR;
+                        break;
+                    }
+                    lastR = nodeR; lastAccR = accR;
+                    accR += nodeR.textContent.length;
+                }
+                if (!nodeR && lastR) {   // 光标在块末:停在最后一个节点结尾
+                    nodeR = lastR; offR = nodeR.textContent.length;
+                }
+                if (nodeR) {
+                    var nrR = document.createRange();
+                    nrR.setStart(nodeR, Math.min(offR, nodeR.textContent.length));
+                    nrR.collapse(true);
+                    var nsR = window.getSelection();
+                    nsR.removeAllRanges();
+                    nsR.addRange(nrR);
+                }
+            } catch (eR0) {}
+        }
+    }
+
     function renderColorTags() {
         var root = editorRoot();
         if (!root || !root.querySelectorAll) return;
+        // 光标所在的块:先还原裸结构,本帧也不再装饰
+        var caretBlk = null;
+        try { caretBlk = caretBlock(); } catch (e0) {}
+        if (caretBlk) undecorateBlock(caretBlk);
         var tags = root.querySelectorAll('span.vditor-ir__node');
         for (var i = 0; i < tags.length; i++) {
             var open = tags[i];
@@ -2696,8 +3165,9 @@
                     break;
                 if (rule.close.test((tags[j].textContent || '').trim())) { close = tags[j]; break; }
             }
-            if (!close || touchesSelection(open) || touchesSelection(close))
-                continue;
+            if (!close || touchesSelection(open) || touchesSelection(close)
+                || (caretBlk && open.parentNode && caretBlk.contains(open)))
+                continue;   // 光标所在块不装饰(裸结构才安全)
             // 内容包一层效果 span(颜色/下划线靠它);链接规则用 <a> 承载,
             // 点击可在浏览器打开。链接规则的 m[1] 是 href
             var wrap = document.createElement(rule.isLink ? 'a' : 'span');
@@ -2734,8 +3204,10 @@
     function renderLinkNode(open) {
         var full = (open.textContent || '').trim();
         var lm = /^\[([^\]]*)\]\(([^\s)]+)\)$/.exec(full);
-        if (!lm || touchesSelection(open))
-            return;
+        var linkBlk = null;
+        try { linkBlk = caretBlock(); } catch (eL) {}
+        if (!lm || touchesSelection(open) || (linkBlk && linkBlk.contains(open)))
+            return;   // 光标所在块不装饰(裸结构才安全)
         var text = lm[1], href = lm[2];
         // 三个节点:前标记(隐) / 链接样式 span(承载 data-ms-href) / 后标记(隐)
         // 注意不能用 <a>:Lute 的 DOM→md 会把 <a> 转回 [x](y),与行首的 "[" 
@@ -2838,11 +3310,45 @@
         }
         if (onlyUi) return;
         clearStaleCaretBookmarks();
+        restoreCodeBlockBlankLine(muts);
         decorateMathBlocks(true);
         restoreHeadingMarker();
         scheduleCbEditSync();   // 代码块被重渲染换元素后,补挂编辑态 class(合并到帧)
         scheduleGutters();      // 块被换掉后行号列也随之失效,统一重排
     });
+    // 两个代码块之间只剩一个空行时,Lute 把空行当纯分隔符吃掉(两个块直接
+    // 相邻,"中间预设的空行没了");隔两行才有空段。在【段落变代码块】的
+    // 精确时刻(同一 mutation 里移除 P + 新增 code-block)把空段还回去 ——
+    // 只挂新增时机:用户随后删掉空行(纯移除)不会触发,不会打架
+    function restoreCodeBlockBlankLine(muts) {
+        var root = editorRoot();
+        if (!root) return;
+        for (var i = 0; i < muts.length; i++) {
+            var m = muts[i];
+            if (m.type !== 'childList') continue;
+            var addedBlock = null, removedPara = false;
+            for (var a = 0; a < m.addedNodes.length; a++) {
+                var n = m.addedNodes[a];
+                if (n.nodeType === 1 && n.getAttribute
+                    && n.getAttribute('data-type') === 'code-block')
+                    addedBlock = n;
+            }
+            if (!addedBlock || !addedBlock.parentNode) continue;
+            for (var r = 0; r < m.removedNodes.length; r++) {
+                var d = m.removedNodes[r];
+                if (d.nodeType === 1 && d.tagName === 'P') removedPara = true;
+            }
+            if (!removedPara) continue;
+            var prev = addedBlock.previousElementSibling;
+            var next = addedBlock.nextElementSibling;
+            var gap = document.createElement('p');
+            gap.setAttribute('data-block', '0');
+            if (prev && prev.getAttribute && prev.getAttribute('data-type') === 'code-block')
+                addedBlock.parentNode.insertBefore(gap, addedBlock);
+            else if (next && next.getAttribute && next.getAttribute('data-type') === 'code-block')
+                addedBlock.parentNode.insertBefore(gap, next);
+        }
+    }
     // --expand 的盯守从全局 observer 拆出:全局 observer 只看 childList,
     // 结构上杜绝"我们写 class → observer → 重排 → 再写 class"的自环
     // (公式块点击卡死的根因)。expand 变更由这个专职观察器带 80ms 去抖处理,
@@ -2884,39 +3390,150 @@
     }
     startHeadingObserver();
 
-    // 设标题级别 n:已有标题改 data-marker + 标记 span(引擎真实结构:
-    // <h1 data-marker="#"><span class="vditor-ir__marker--heading">#</span>...);
-    // 段落则块首插标记。Ctrl+1~6 之后不显示 # —— 显示只认鼠标点击
+    // Change the block tag while moving its children, preserving text-node
+    // identity and both selection endpoints, including inline math and styles.
     function headingLevel(n) {
         var b = caretBlock();
         if (!b) { notice('光标不在文本块中'); return; }
         // 只对普通段落/标题生效:代码块、列表、表格里插 "#" 会把标记
         // 写进正文,破坏原块(Typora 里这些块上 Ctrl+1 本就无效)
         if (!/^(P|H[1-6])$/.test(b.tagName)) { notice('当前块不能设为标题'); return; }
-        hideHeadingMarker();
-        var marks = '';
-        for (var i = 0; i < n; i++) marks += '#';
-        var m = /^H([1-6])$/.exec(b.tagName);
-        if (m) {
-            try {
-                b.setAttribute('data-marker', marks);
-                var span = b.querySelector('.vditor-ir__marker--heading')
-                        || b.querySelector('span.vditor-ir__marker');
-                if (span) span.textContent = marks;
-            } catch (eM) {}
-            rerender();
-            return;
+        if (currentMode !== 'ir') return;
+        var selection = getSelection();
+        if (!selection.rangeCount) return;
+        var range = selection.getRangeAt(0).cloneRange();
+        if (range.collapsed && range.startContainer === editorRoot()) {
+            var beginsHere = editorRoot().childNodes[range.startOffset] === b;
+            range.selectNodeContents(b); range.collapse(beginsHere);
+            selection.removeAllRanges(); selection.addRange(range);
         }
-        // 段落:块首插入标记,insertValue 解析成标题(
-        // 缺 rerender 会让标记停在文本态)
-        var selN = window.getSelection();
-        var rngN = document.createRange();
-        rngN.selectNodeContents(b);
-        rngN.collapse(true);
-        selN.removeAllRanges();
-        selN.addRange(rngN);
-        vd.insertValue(marks + ' ', true);
-        rerender();
+        if (!b.contains(range.startContainer) || !b.contains(range.endContainer)) return;
+        // 段内换行的多行块(软换行,一个文本节点里带 \n):只把【光标所在行】
+        // 转成目标块,行前/行后各自成段 —— 用户的预期是"标题只是那一行",
+        // 不是把整段吞进标题(实测:标题+正文软换行同段时 Ctrl+1 全段变标题)
+        if (b.textContent && b.textContent.indexOf('\n') >= 0
+            && !b.querySelector('span.vditor-ir__node, img, [data-type]')) {
+            var txtAll = b.textContent;
+            var offAll = 0;
+            var twL = document.createTreeWalker(b, NodeFilter.SHOW_TEXT);
+            var nnL;
+            while ((nnL = twL.nextNode())) {
+                if (nnL === range.startContainer) { offAll += range.startOffset; break; }
+                offAll += nnL.textContent.length;
+            }
+            var lineStart = txtAll.lastIndexOf('\n', Math.max(0, offAll - 1)) + 1;
+            var lineEnd = txtAll.indexOf('\n', offAll);
+            if (lineEnd < 0) lineEnd = txtAll.length;
+            if (lineStart > 0 || lineEnd < txtAll.length) {
+                hideHeadingMarker();
+                clearStaleCaretBookmarks();
+                try { vd.vditor.undo.addToUndoStack(vd.vditor); } catch (eL) {}
+                var lineBlk = document.createElement(n > 0 ? 'h' + n : 'p');
+                lineBlk.setAttribute('data-block', '0');
+                if (n > 0) {
+                    lineBlk.setAttribute('data-marker', '#');
+                    lineBlk.classList.add('vditor-ir__node');
+                    var msp = document.createElement('span');
+                    msp.className = 'vditor-ir__marker vditor-ir__marker--heading';
+                    msp.setAttribute('data-type', 'heading-marker');
+                    msp.textContent = '#'.repeat(n) + ' ';
+                    lineBlk.appendChild(msp);
+                }
+                var lineNode = document.createTextNode(txtAll.slice(lineStart, lineEnd));
+                lineBlk.appendChild(lineNode);
+                var fragL = document.createDocumentFragment();
+                if (lineStart > 0) {
+                    var bpL = document.createElement('p');
+                    bpL.setAttribute('data-block', '0');
+                    bpL.appendChild(document.createTextNode(txtAll.slice(0, lineStart - 1)));
+                    fragL.appendChild(bpL);
+                }
+                fragL.appendChild(lineBlk);
+                if (lineEnd < txtAll.length) {
+                    var apL = document.createElement('p');
+                    apL.setAttribute('data-block', '0');
+                    apL.appendChild(document.createTextNode(txtAll.slice(lineEnd + 1)));
+                    fragL.appendChild(apL);
+                }
+                b.replaceWith(fragL);
+                var nrL = document.createRange();
+                nrL.setStart(lineNode, Math.max(0, Math.min(offAll - lineStart, lineNode.textContent.length)));
+                nrL.collapse(true);
+                selection.removeAllRanges();
+                selection.addRange(nrL);
+                suppressUntil = 0;
+                onInput(vd.getValue());
+                editorRoot().focus({ preventScroll: true });
+                scheduleGutters();
+                return;
+            }
+            // 光标行就是整块:走下面的整块转换
+        }
+        function bookmark() {
+            var anchor = document.createRange(), focus = document.createRange();
+            anchor.setStart(selection.anchorNode, selection.anchorOffset); anchor.collapse(true);
+            focus.setStart(selection.focusNode, selection.focusOffset); focus.collapse(true);
+            return { anchor:anchor, focus:focus };
+        }
+        function restore(saved) {
+            selection.setBaseAndExtent(saved.anchor.startContainer, saved.anchor.startOffset,
+                saved.focus.startContainer, saved.focus.startOffset);
+        }
+        // Undo inserts a caret marker, splitting text nodes and resetting the
+        // selection direction. Live endpoint ranges track those splits.
+        var saved = bookmark();
+        hideHeadingMarker();
+        clearStaleCaretBookmarks();
+        recordMathUndo();
+        var anchorNode = saved.anchor.startContainer, anchorOffset = saved.anchor.startOffset;
+        var focusNode = saved.focus.startContainer, focusOffset = saved.focus.startOffset;
+        var heading = document.createElement(n > 0 ? 'h' + n : 'p'), marks = '#'.repeat(n);
+        Array.prototype.forEach.call(b.attributes, function (attribute) {
+            heading.setAttribute(attribute.name, attribute.value);
+        });
+        heading.setAttribute('data-block', '0');
+        if (n > 0) heading.setAttribute('data-marker', '#');
+        heading.classList.add('vditor-ir__node');
+        var oldMarker = b.querySelector('span[data-type="heading-marker"]');
+        // n=0 = 转回普通段落:无标记
+        var marker = null;
+        if (n > 0) {
+            marker = document.createElement('span');
+            marker.className = 'vditor-ir__marker vditor-ir__marker--heading';
+            marker.setAttribute('data-type', 'heading-marker'); marker.textContent = marks + ' ';
+            heading.appendChild(marker);
+        }
+        function childOffset(offset) {
+            return (n > 0 ? 1 : 0) + Array.prototype.slice.call(b.childNodes, 0, offset).filter(function (child) {
+                return child !== oldMarker;
+            }).length;
+        }
+        var mappedAnchor = anchorNode === b ? childOffset(anchorOffset) : anchorOffset;
+        var mappedFocus = focusNode === b ? childOffset(focusOffset) : focusOffset;
+        while (b.firstChild) {
+            if (b.firstChild === oldMarker) oldMarker.remove();
+            else heading.appendChild(b.firstChild);
+        }
+        b.replaceWith(heading);
+        if (anchorNode === b) {
+            anchorNode = heading; anchorOffset = mappedAnchor;
+        }
+        if (focusNode === b) {
+            focusNode = heading; focusOffset = mappedFocus;
+        }
+        if (!anchorNode.isConnected) { anchorNode = heading; anchorOffset = 1; }
+        if (!focusNode.isConnected) { focusNode = heading; focusOffset = 1; }
+        if ((n > 0 ? heading.childNodes.length === 1 : heading.childNodes.length === 0) && range.collapsed) {
+            // A hidden marker alone is not a browser caret target. Match the
+            // existing editor's zero-width anchors so typing stays in the block.
+            var emptyAnchor = document.createTextNode('\u200b'); heading.appendChild(emptyAnchor);
+            anchorNode = focusNode = emptyAnchor; anchorOffset = focusOffset = 1;
+        }
+        selection.setBaseAndExtent(anchorNode, anchorOffset, focusNode, focusOffset);
+        suppressUntil = 0;
+        saved = bookmark(); recordMathUndo(); restore(saved);
+        onInput(vd.getValue());
+        editorRoot().focus({ preventScroll:true });
     }
     function headingStep(delta) { // delta<0 升级(向 H1),>0 降级
         var b = caretBlock();
@@ -3119,11 +3736,11 @@
                 (mod && !e.altKey && !e.shiftKey
                     && (c === 'KeyB' || c === 'KeyI' || c === 'KeyU' || c === 'KeyT'
                         || c === 'KeyK')) ||
-                // 注意:Ctrl+Shift+K(插入代码块)不在此列 —— 光标在代码块里时
-                // 它会在当前块之后新建一块,而不是往代码里插标记。此前一并
-                // 拦截且无任何反馈,表现为"按了没反应"
+                // Ctrl+Shift+K 一并拦截(Typora 语义:代码块内无效)。此前放行
+                // 会在当前块后面新建空块并弹语言候选 —— 用户看到的就是"按了
+                // 先空一行、然后弹个关不掉的语言框"
                 (mod && !e.altKey && e.shiftKey
-                    && (c === 'KeyM' || c === 'KeyQ'
+                    && (c === 'KeyM' || c === 'KeyQ' || c === 'KeyK'
                         || c === 'BracketLeft' || c === 'BracketRight'
                         || c === 'Backquote')) ||
                 (mod && e.altKey && !e.shiftKey && (c === 'Equal' || c === 'Minus')) ||
@@ -3166,6 +3783,14 @@
                     post({ t: 'replace', sel: (selNow ? selNow.toString() : '').slice(0, 80) });
                     return;
                 }
+                if (c === 'Digit0') {
+                    // Typora 语义:标题里 = 转普通段落;否则转发 C++ 重置整页缩放
+                    var b0 = caretBlock();
+                    if (b0 && /^H[1-6]$/.test(b0.tagName)) { e.preventDefault(); headingLevel(0); return; }
+                    e.preventDefault();
+                    post({ t: 'zoomReset' });
+                    return;
+                }
                 var hd = /^Digit([1-6])$/.exec(c);
                 if (hd) { e.preventDefault(); headingLevel(parseInt(hd[1], 10)); return; }
             }
@@ -3179,7 +3804,12 @@
         }
         if (e.altKey && e.shiftKey && c === 'Digit5') { e.preventDefault(); wrapInline('~~'); return; }
         if (k === 'F3') { e.preventDefault(); docFind(e.shiftKey ? -1 : 1); return; }
-        if (k === 'F9') { e.preventDefault(); post({ t: 'aiPanel' }); return; }
+        if (k === 'F9') {
+            // 仅裸 F9 打开 AI 面板:带 Ctrl/Alt/Shift 的 F9 属于输入法或其它
+            // 软件的习惯键位,不能误触面板(用户反馈"没按 AI 它自己开了")
+            if (e.ctrlKey || e.altKey || e.shiftKey) return;
+            e.preventDefault(); post({ t: 'aiPanel' }); return;
+        }
         if (k === 'F11') { e.preventDefault(); post({ t: 'fullscreen' }); return; }
         if (k === 'F12' && e.shiftKey) { e.preventDefault(); post({ t: 'devtools' }); return; }
     }, true);
@@ -3448,13 +4078,16 @@
         e.preventDefault();
         e.stopPropagation();
         try {
-            // 这里必须走浏览器/Vditor 的编辑事件,不能手工插 <p>。
-            // 手工改 DOM 会让 Vditor 的内部块缓存失配,触发 firstElementChild
-            // 空引用,表现为回车后光标跳飞或后续输入异常。
-            var okPara = false;
-            try { okPara = document.execCommand('insertParagraph'); } catch (e2) {}
-            if (!okPara && vd) vd.insertValue('\n', true);
-            setTimeout(function () { rerender(); }, 0);
+            // Keep an actual editable empty paragraph. Browser insertParagraph
+            // followed by SpinVditorIRDOM merges it into the preceding code block.
+            if (block) {
+                var anchor = document.createRange();
+                anchor.selectNodeContents(block); anchor.collapse(false);
+                var selection = getSelection(); selection.removeAllRanges(); selection.addRange(anchor);
+                vd.insertEmptyBlock('afterend');
+            } else {
+                document.execCommand('insertParagraph');
+            }
         } catch (err) { /* 失败则回退默认 */ }
     }, true);
 
@@ -3606,18 +4239,13 @@
             }
         }
         if (e.clipboardData && Array.prototype.indexOf.call(e.clipboardData.types, 'text/plain') !== -1 &&
-            insertMathSource(e.clipboardData.getData('text/plain'))) {
+            (insertMathSource(e.clipboardData.getData('text/plain')) ||
+             insertCodeSource(e.clipboardData.getData('text/plain')))) {
             e.preventDefault();
             e.stopPropagation();
             return;
         }
-        var codeTarget = preferLatex && currentMode === 'ir' ? currentCodeBlock() : null;
-        if (codeTarget && e.clipboardData) {
-            var beforeCodePaste = blockMarkdown(codeTarget);
-            clearTimeout(latexTimer);
-            latexTimer = setTimeout(function () { convertEditedLatexBlock(beforeCodePaste, codeTarget); }, 0);
-        }
-        if (preferLatex && e.clipboardData && root && root.contains(e.target) && !currentCodeBlock()) {
+        if (e.clipboardData && !currentCodeBlock()) {
             var raw = e.clipboardData.getData('text/plain');
             // Browser copies carry HTML. Convert it first so escaped dollar
             // markers and inline-code formulas take the same path as Markdown.
@@ -3627,9 +4255,11 @@
                 holder.content.querySelectorAll('script,style,iframe,object').forEach(function (node) { node.remove(); });
                 raw = vd.vditor.lute.HTML2Md(holder.innerHTML);
             }
-            var normalized = preferredText(raw);
+            var normalized = html && window.msLatexPreference
+                ? window.msLatexPreference.normalizeClipboard(raw, preferLatex) : preferredText(raw);
             if (normalized !== raw) {
                 e.preventDefault(); e.stopPropagation();
+                suppressUntil = 0;
                 recordMathUndo(); vd.insertMD(normalized); rerender(); recordMathUndo();
                 onInput(vd.getValue()); return;
             }
@@ -3720,6 +4350,10 @@
                 clearStaleCaretBookmarks();
                 vd.clearStack();
                 document.documentElement.style.setProperty('--ms-font-size', fontSize + 'px');
+                document.documentElement.style.setProperty('--ms-line-height', String(lineHeight));
+                // 初始文档自带 front matter 时标记为合法(输入路径不得回退)
+                syncFrontMatterFlag();
+                observeFrontMatter();   // 直盯 DOM:IME 合成输入也逃不过
                 // 重建编辑器后 DOM 树是全新的:观察器若还盯着旧的(已分离的)
                 // .vditor-ir,一切变更驱动的补挂全部失灵 —— 必须改盯新树
                 (function reobserveHeading() {
@@ -3864,6 +4498,8 @@
             lastValue = (md == null ? '' : String(md));
             try { vd.setValue(lastValue, false); }
             catch (e) { /* 忽略 */ }
+            // 加载自带 front matter 的文档:标记为合法,输入路径不得回退
+            fmHadBefore = /^---[ \t]*\r?\n[\s\S]*\r?\n---[ \t]*(\r?\n|$)/.test(lastValue);
             clearStaleCaretBookmarks();
             vd.clearStack();
             setTimeout(function () {
@@ -3945,13 +4581,12 @@
         imageSaved: function (rid, rel) {
             if (!vd) return;
             var pending = pendingImages[rid];
-            if (rid && !pending) return; // 页面粘贴的过期/重复应答:忽略(rid=0 的原生粘贴无快照时落到当前光标)
+            if (rid && !pending) return; // Ignore stale/duplicate replies.
             delete pendingImages[rid];
             if (pending && pending.blocked) { notice('请先将光标放到文档中，再粘贴图片'); return; }
-            // 保存期间视图可能被重建(模式切换/新标签加载窗口):旧快照不再可信,
-            // 但图片已落盘,丢弃等于丢掉这次粘贴 —— 改为落到当前光标处
-            if (pending && pending.root !== editorRoot())
-                pending.range = null;
+            if (pending && pending.root !== editorRoot()) {
+                notice('编辑视图已切换，请重新粘贴图片'); return;
+            }
             vd.focus();
             if (pending && pending.range && pending.range.startContainer.isConnected && pending.range.endContainer.isConnected) {
                 var selection = window.getSelection();
@@ -3964,6 +4599,9 @@
             recordMathUndo();
             vd.insertMD('\n![' + base + '](' + rel + ')\n');
             rerender();
+            // Resolve the document host before the snapshot, so the observer
+            // does not create an extra undo step containing only a URL change.
+            rewriteAllImgs(editorRoot());
             recordMathUndo();
             onInput(vd.getValue());
         },
@@ -3986,35 +4624,20 @@
                 }
             }
             if (currentMode === 'sv') {
-                // 索引与 pushOutline sv 分支同源:完全相同的行扫描正则取标题文本,
-                // 再按文本在 sv 的标题元素里对齐滚动。旧实现滚"textarea 行号",
-                // 而本版 vditor 的 sv 没有 textarea —— 滚动从未生效过。
                 var lines = vd.getValue().split('\n');
-                var fence = false, seen = 0, wantText = '', lineNo = 0;
+                var fence = false, seen = 0, lineNo = 0;
                 for (var i = 0; i < lines.length; i++) {
                     if (/^\s*(```|~~~)/.test(lines[i])) { fence = !fence; continue; }
                     if (fence) continue;
-                    var m = /^(#{1,6})\s+(.+?)\s*#*$/.exec(lines[i]);
-                    if (m) {
-                        if (seen === index) { wantText = m[2]; lineNo = i; break; }
+                    if (/^#{1,6}\s+/.test(lines[i])) {
+                        if (seen === index) { lineNo = i; break; }
                         seen++;
                     }
                 }
-                if (wantText) {
-                    var svHeads = document.querySelectorAll(
-                        '.vditor-sv h1,.vditor-sv h2,.vditor-sv h3,.vditor-sv h4,.vditor-sv h5,.vditor-sv h6');
-                    for (var k = 0; k < svHeads.length; k++) {
-                        if ((svHeads[k].textContent || '').replace(/\u200b/g, '').trim() === wantText.trim()) {
-                            svHeads[k].scrollIntoView({ behavior: 'smooth', block: 'start' });
-                            return;
-                        }
-                    }
-                }
-                // 兜底:DOM 里找不到(如 setext 标题)时按行高估算滚 sv 根
-                var svRootEl = editorRoot();
-                if (svRootEl && lineNo > 0) {
-                    var lh = parseFloat(getComputedStyle(svRootEl).lineHeight) || 22;
-                    svRootEl.scrollTop = Math.max(0, lineNo * lh);
+                var ta = document.querySelector('.vditor-sv textarea');
+                if (ta && lineNo > 0) {
+                    var lh = parseFloat(getComputedStyle(ta).lineHeight) || 22;
+                    ta.scrollTop = Math.max(0, (lineNo - 1) * lh);
                 }
             }
         },
@@ -4088,6 +4711,15 @@
             scheduleGutters();
         },
 
+        // 正文行距(偏好设置可调)。只作用正文:代码块/公式行距固定,不随动
+        setLineHeight: function (v) {
+            var n = parseFloat(v);
+            if (!(n >= 1.0 && n <= 2.2)) return;
+            lineHeight = n;
+            document.documentElement.style.setProperty('--ms-line-height', String(lineHeight));
+            scheduleGutters();
+        },
+
         // 代码块行号开关。开=自研行号系统;关=MarkText 式纯代码卡片:
         // 行号列完全不生成,左槽 16px(CSS 按 body.ms-no-lineno 切换)
         setLineNumbers: function (on) {
@@ -4152,6 +4784,7 @@
 
         insertText: function (text) {
             if (insertMathSource(String(text))) return;
+            if (insertCodeSource(String(text))) return;
             var codeTarget = preferLatex && currentMode === 'ir' ? currentCodeBlock() : null;
             var beforeCode = codeTarget ? blockMarkdown(codeTarget) : null;
             if (vd) {
@@ -4176,6 +4809,7 @@
             if (!t) return;
             if (vd) vd.focus();
             if (insertMathSource(t)) return;
+            if (insertCodeSource(t)) return;
             var codeTarget = preferLatex && currentMode === 'ir' ? currentCodeBlock() : null;
             var beforeCode = codeTarget ? blockMarkdown(codeTarget) : null;
             var normalized = currentCodeBlock() ? t : preferredText(t);
@@ -4242,7 +4876,7 @@
             var txt = selectionTextClean(r).replace(/<\/?font[^>]*>/gi, '');
             if (!txt) {
                 if (b.tagName !== 'P') { notice('请先选中要变色的文字'); return; }
-                txt = (b.textContent || '').replace(/​/g, '')
+                txt = (b.textContent || '').replace(/\u200b/g, '')
                                            .replace(/<\/?font[^>]*>/gi, '').trim();
                 if (!txt) return;
                 var wr = document.createRange();
@@ -4256,18 +4890,13 @@
             var ok = false;
             try { ok = document.execCommand('insertText', false, marked); } catch (e) {}
             if (!ok) {
-                var before = null;
-                try { before = r.toString(); } catch (e0) {}
                 try {
                     r.deleteContents();
                     r.collapse(true);
                     sel.removeAllRanges();
                     sel.addRange(r);
                     vd.insertValue(marked, true);
-                } catch (e2) {
-                    if (before) { try { vd.insertValue(before, true); } catch (e3) {} }
-                    notice('操作失败，请重试');
-                }
+                } catch (e2) {}
             }
             rerender();
             setTimeout(renderColorTags, 150);
@@ -4346,8 +4975,7 @@
     createEditor('ir', lastValue);
     window.msbridge.setTheme(themePending);
     window.msbridge.setFontSize(fontSize);
-    // 语言图标懒加载:syncCodeLangBtn/renderLangSuggest 在用到时各自 ensure,
-    // 启动时不再预取 45 个 svg(其中 9 个目录里根本没有,注定 404)
+    ensureLangIcons();
     // 行号默认态的 CSS 类要在启动就挂上:宿主指令到达前(或独立打开页面时)
     // 左槽宽度才会按默认"无行号"模式排版,否则首帧是 40px 再跳 16px
     document.body.classList.toggle('ms-no-lineno', !showLineNumbers);

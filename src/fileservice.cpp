@@ -53,10 +53,7 @@ QString decodeLegacy(const QByteArray &raw)
             return QString::fromWCharArray(w.data(), n);
     }
 #endif
-    // 两种代码页都整体校验失败:内容既不是 UTF-8 也不是 GBK/GB18030。
-    // 绝不能退回 fromUtf8 —— 那会产生整篇 U+FFFD 乱码,调用方一旦当作
-    // GBK 落盘就把原文件永久毁掉。返回空串让调用方拒绝打开。
-    return {};
+    return QString::fromUtf8(raw);
 }
 
 QByteArray encodeLegacy(const QString &text)
@@ -64,14 +61,24 @@ QByteArray encodeLegacy(const QString &text)
     if (text.isEmpty())
         return {};
 #ifdef Q_OS_WIN
+    // 关键:必须用 WC_NO_BEST_FIT_CHARS 询问"能否无损表示"。
+    // 若按默认标志(0)询问,Win32 会把任何字符一律当成功,只是把无法表示的
+    // 字符替换成 '?' 再返回长度 —— emoji/生僻字会静默毁掉,而保存照常"成功"。
+    // 编码侧同时用 WC_ERR_INVALID_CHARS,遇到无法表示的字符直接失败,
+    // 由调用方退回 UTF-8,绝不产出含 '?' 的文件。
     const auto *w = reinterpret_cast<const wchar_t *>(text.utf16());
     for (UINT cp : { 54936u, 936u }) {
-        const int n = WideCharToMultiByte(cp, 0, w, int(text.size()), nullptr, 0, nullptr, nullptr);
+        int n = WideCharToMultiByte(cp, WC_NO_BEST_FIT_CHARS, w, int(text.size()),
+                                    nullptr, 0, nullptr, nullptr);
         if (n <= 0)
             continue;
         QByteArray out(n, Qt::Uninitialized);
-        if (WideCharToMultiByte(cp, 0, w, int(text.size()), out.data(), n, nullptr, nullptr) > 0)
+        BOOL usedDefault = FALSE;
+        if (WideCharToMultiByte(cp, WC_ERR_INVALID_CHARS, w, int(text.size()),
+                                out.data(), n, nullptr, &usedDefault) > 0
+            && !usedDefault)
             return out;
+        // 有字符无法表示(usedDefault)或直接失败:换下一个代码页,都不行则退回 UTF-8
     }
 #endif
     return text.toUtf8();
@@ -112,14 +119,6 @@ QString FileService::readFile(const QString &path, bool *ok, Encoding *encOut, b
         return {};
     }
     QByteArray raw = f.readAll();
-    // 网络盘断连/U 盘拔出等半截读取不能当成功:编辑器一旦编辑,自动保存会把
-    // 截断后的内容写回原文件,尾部静默丢失
-    if (f.error() != QFile::NoError) {
-        f.close();
-        if (ok) *ok = false;
-        return {};
-    }
-    f.close();
     Encoding enc = Encoding::Utf8;
     QString text;
 
@@ -134,30 +133,18 @@ QString FileService::readFile(const QString &path, bool *ok, Encoding *encOut, b
         text = decodeWith(raw.mid(2), QStringConverter::Utf16BE);
     } else {
         // 无 BOM:先按 UTF-8 严格解码,失败说明不是 UTF-8(中文 Windows 上
-        // 多为 GBK/936),回退 GBK/GB18030 整体校验。两种都失败(Latin-1/
-        // Big5/日韩/损坏文件)时拒绝打开 —— 旧实现返回 U+FFFD 乱码还标成
-        // GBK,自动保存会把乱码写回,原文件被永久破坏
+        // 多为 GBK/936),回退系统 ANSI 代码页 —— 否则整个文件会变乱码,
+        // 且保存时按乱码写回,原文件被永久破坏
         QStringDecoder utf8(QStringConverter::Utf8);
         text = utf8(raw);
         if (utf8.hasError()) {
-            const QString legacy = decodeLegacy(raw);
-            if (legacy.isEmpty()) {
-                if (ok) *ok = false;
-                if (encOut) *encOut = Encoding::Utf8;
-                return {};
-            }
             enc = Encoding::Gbk;
-            text = legacy;
+            text = decodeLegacy(raw);
         }
     }
 
-    // 行尾按"多数派"判定而不是"存在即全局":99% LF、只夹一行 CRLF 的文件
-    // 保存时不再整篇被重写成 CRLF(反之亦然),混合行尾的整篇 diff 消失
-    if (crlfOut) {
-        const qsizetype crlf = text.count(QStringLiteral("\r\n"));
-        const qsizetype lf = text.count(QLatin1Char('\n')) - crlf;
-        *crlfOut = crlf > lf;
-    }
+    // Inspect decoded text: UTF-16 stores a zero byte between CR and LF.
+    if (crlfOut) *crlfOut = text.contains(QStringLiteral("\r\n"));
     if (ok) *ok = true;
     if (encOut) *encOut = enc;
     return text;
@@ -318,13 +305,7 @@ void FileService::pushRecentFile(const QString &path)
 {
     QSettings s;
     QStringList files = s.value(QStringLiteral("recentFiles")).toStringList();
-    // Windows 文件系统大小写不敏感:同一文件的不同拼写(命令行手敲 vs
-    // 对话框返回)不当两条,挤占最近列表的 10 条上限
-    files.erase(std::remove_if(files.begin(), files.end(),
-                               [&path](const QString &p) {
-                                   return p.compare(path, Qt::CaseInsensitive) == 0;
-                               }),
-                files.end());
+    files.removeAll(path);
     files.prepend(path);
     while (files.size() > kMaxRecent)
         files.removeLast();

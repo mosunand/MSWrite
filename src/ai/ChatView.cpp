@@ -306,38 +306,48 @@ QString injectMathImages(QTextDocument *doc, const QString &html,
     out.reserve(html.size() + 256);
     for (int i = 0; i < html.size(); ++i) {
         if (html.at(i) == kMathStart) {
-            const int close = html.indexOf(kMathEnd, i);
+const int close = html.indexOf(kMathEnd, i);
             if (close < 0) {
                 out += html.at(i);
                 continue;
             }
-            const int idx = html.mid(i + 1, close - i - 1).toInt();
-            if (idx >= 0 && idx < mathSlots.size()) {
-                const QPixmap pm = AiMathPainter::render(mathSlots.at(idx).latex, fg);
-                if (!pm.isNull()) {
-                    const QString name = QStringLiteral("math:%1").arg(idx);
-                    doc->addResource(QTextDocument::ImageResource, QUrl(name), QVariant(pm));
-                    // HTML 单位是逻辑像素:除以 dpr
-                    const int w = qRound(pm.width() / pm.devicePixelRatio());
-                    const int h = qRound(pm.height() / pm.devicePixelRatio());
-                    if (mathSlots.at(idx).display) {
-                        // 块级:独占一行,居中,上下留呼吸
-                        out += QStringLiteral(
-                                   "<br><p align=\"center\" style=\"margin-top:4px;"
-                                   "margin-bottom:4px\"><img src=\"%1\" width=\"%2\" "
-                                   "height=\"%3\"/></p><br>")
-                                   .arg(name, QString::number(w), QString::number(h));
-                    } else {
-                        // 行内:middle 对齐,不撑行高
-                        out += QStringLiteral(
-                                   "<img src=\"%1\" width=\"%2\" height=\"%3\" "
-                                   "style=\"vertical-align:middle\"/>")
-                                   .arg(name, QString::number(w), QString::number(h));
-                    }
+            const QString payload = html.mid(i + 1, close - i - 1);
+            if (payload.isEmpty()) {
+                out += html.at(i);
+                i = close;
+                continue;
+            }
+            bool ok = false;
+            int idx = payload.toInt(&ok);
+            if (!ok || idx < 0 || idx >= mathSlots.size()) {
+                out += html.at(i);
+                i = close;
+                continue;
+            }
+            const QPixmap pm = AiMathPainter::render(mathSlots.at(idx).latex, fg);
+            if (!pm.isNull()) {
+                const QString name = QStringLiteral("math:%1").arg(idx);
+                doc->addResource(QTextDocument::ImageResource, QUrl(name), QVariant(pm));
+                // HTML 单位是逻辑像素：除以 dpr
+                const int w = qRound(pm.width() / pm.devicePixelRatio());
+                const int h = qRound(pm.height() / pm.devicePixelRatio());
+                if (mathSlots.at(idx).display) {
+                    // 块级：独占一行，居中，上下留呼吸
+                    out += QStringLiteral(
+                               "<br><p align=\"center\" style=\"margin-top:4px;"
+                               "margin-bottom:4px\"><img src=\"%1\" width=\"%2\" "
+                               "height=\"%3\"/></p><br>")
+                               .arg(name, QString::number(w), QString::number(h));
                 } else {
-                    // 退回源码
-                    out += mathSlots.at(idx).latex.toHtmlEscaped();
+                    // 行内：middle 对齐，不撑行高
+                    out += QStringLiteral(
+                               "<img src=\"%1\" width=\"%2\" height=\"%3\" "
+                               "style=\"vertical-align:middle\"/>")
+                               .arg(name, QString::number(w), QString::number(h));
                 }
+            } else {
+                // 退回源码
+                out += mathSlots.at(idx).latex.toHtmlEscaped();
             }
             i = close;
             continue;

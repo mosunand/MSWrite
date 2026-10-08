@@ -13,10 +13,7 @@
 
 namespace {
 
-// 中止采用"代次"而非一次性布尔:worker 在工具执行间隙点停止时,置位的
-// 标志无人消费,会滞留误伤下一个新请求(旧一次性设计的缺陷)。代次只对
-// "发起之后发生过停止"的请求生效,窗口外天然失效。
-std::atomic<int> g_abortGen{0};
+std::atomic<bool> g_abort{false};
 
 // 每线程一个 QNetworkAccessManager:同一网关的连续请求(流式/重试/回退)
 // 复用连接与 TLS 会话,而不是每个请求都重新握手。QThreadStorage 在线程
@@ -35,17 +32,12 @@ namespace HttpAbort {
 
 void request()
 {
-    g_abortGen.fetch_add(1, std::memory_order_relaxed);
+    g_abort.store(true);
 }
 
-int generation()
+bool consume()
 {
-    return g_abortGen.load(std::memory_order_relaxed);
-}
-
-bool abortedSince(int generation)
-{
-    return g_abortGen.load(std::memory_order_relaxed) != generation;
+    return g_abort.exchange(false);
 }
 
 } // namespace HttpAbort
@@ -92,9 +84,8 @@ HttpResult get(const QUrl &url,
     QTimer abortPoll;
     abortPoll.setInterval(100);
     bool aborted = false;
-    const int abortGen = HttpAbort::generation();
     QObject::connect(&abortPoll, &QTimer::timeout, [&]() {
-        if (HttpAbort::abortedSince(abortGen)) {
+        if (HttpAbort::consume()) {
             aborted = true;
             reply->abort();
         }
@@ -175,9 +166,8 @@ HttpResult postJson(const QUrl &url,
     QTimer abortPoll;
     abortPoll.setInterval(100);
     bool aborted = false;
-    const int abortGen = HttpAbort::generation();
     QObject::connect(&abortPoll, &QTimer::timeout, [&]() {
-        if (HttpAbort::abortedSince(abortGen)) {
+        if (HttpAbort::consume()) {
             aborted = true;
             reply->abort();
         }
@@ -247,9 +237,8 @@ HttpResult postSse(const QUrl &url,
     QTimer abortPoll;
     abortPoll.setInterval(100);
     bool aborted = false;
-    const int abortGen = HttpAbort::generation();
     QObject::connect(&abortPoll, &QTimer::timeout, [&]() {
-        if (HttpAbort::abortedSince(abortGen)) {
+        if (HttpAbort::consume()) {
             aborted = true;
             reply->abort();
         }
@@ -258,10 +247,25 @@ HttpResult postSse(const QUrl &url,
 
     QByteArray pending;
     QByteArray all;
+    QByteArray eventData;
+    // 单段待切分字节 / 单个事件的累积上限:正常事件是几 KB 的 JSON。
+    // 端点若从不发 '\n',或一条事件永不闭合,这两个缓冲没有上限就会无限吃内存
+    constexpr int kPendingCap = 2 * 1024 * 1024;
+    constexpr int kEventCap = 4 * 1024 * 1024;
+    auto flushEvent = [&]() {
+        if (eventData.isEmpty()) return;
+        if (onData) onData(eventData);
+        eventData.clear();
+    };
     auto consumeChunk = [&](const QByteArray &chunk) {
         pending += chunk;
+        if (pending.size() > kPendingCap) {
+            // 畸形流:迟迟等不到换行,丢弃残段,继续收后面的帧
+            pending.clear();
+            return;
+        }
         if (all.size() < kRawCap)
-            all += chunk;
+            all += chunk.left(kRawCap - all.size());
         int idx;
         while ((idx = pending.indexOf('\n')) >= 0) {
             QByteArray line = pending.left(idx);
@@ -272,9 +276,19 @@ HttpResult postSse(const QUrl &url,
                 QByteArray data = line.mid(5);
                 if (data.startsWith(' '))
                     data = data.mid(1);
-                if (onData)
-                    onData(data);
-            }
+                // SSE 规范允许多行 data:,但本应用的 data 一律是单行 JSON。
+                // 网关按固定宽度拆行时,规范拼接(加 '\n')会把换行塞进 JSON
+                // 字符串内部 —— 解析"成功"但内容被污染(Qt 容忍串内原始换行),
+                // 整条增量被静默吞掉,工具调用参数残缺报错。这里按字节直连,
+                // 交给 LlmCodec 侧的容错兜底
+                eventData += data;
+                if (eventData.size() > kEventCap) {
+                    // 事件异常大:丢弃,防无限累积;后面的行让它自然错过闭合
+                    eventData.clear();
+                    pending.clear();
+                    return;
+                }
+            } else if (line.isEmpty()) flushEvent();
         }
     };
 
@@ -303,6 +317,12 @@ HttpResult postSse(const QUrl &url,
     }
 
     consumeChunk(reply->readAll());
+    if (pending.startsWith("data:")) {
+        QByteArray tail = pending.mid(5);
+        if (tail.startsWith(' ')) tail.remove(0, 1);
+        eventData += tail;
+    }
+    flushEvent();
     r.finalUrl = reply->url();
     r.contentType = QString::fromUtf8(
         reply->header(QNetworkRequest::ContentTypeHeader).toByteArray());

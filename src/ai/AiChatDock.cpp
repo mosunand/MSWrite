@@ -3,9 +3,12 @@
 #include "ai/AiChatDock.h"
 #include "ai/AiInputEdit.h"
 
+#include <windows.h>
+
 #include "ai/AiWorker.h"
 #include "ai/ChatView.h"
 #include "ai/ChatWebView.h"
+#include "ai/AiModelPicker.h"
 #include "ai/Http.h"
 #include "ai/Llm.h"
 #include "uiicons.h"
@@ -28,6 +31,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeyEvent>
+#include <QPointer>
 #include <QLabel>
 #include <QClipboard>
 #include <QListView>
@@ -50,8 +54,6 @@
 #include <QThread>
 #include <QTime>
 #include <QTimer>
-#include <QSemaphore>
-#include <memory>
 #include <QVBoxLayout>
 
 namespace {
@@ -74,7 +76,7 @@ protected:
         p.scale(scale,scale); p.translate(-240,0);
         QLinearGradient fill(100,0,390,180);
         fill.setColorAt(0,QColor(light ? "#e9ebf7" : "#222630"));
-        fill.setColorAt(1,QColor(light ? "#f3f4f7" : "#0e0f13"));
+        fill.setColorAt(1,QColor(light ? "#f3f4f7" : "#1a1d24"));
         QColor edge(light ? "#c8cfdf" : "#3e4657"); edge.setAlpha(125);
         p.setPen(QPen(edge,1.1)); p.setBrush(fill);
         QPainterPath left;
@@ -155,6 +157,12 @@ QPushButton#aiJump {
   background: rgba(20, 22, 30, 200);
 }
 QPushButton#aiJump:hover { background: rgba(37, 99, 235, 230); }
+QPushButton#aiModelBtn {
+  background: #ffffff; color: #374151;
+  border: 1px solid #d9dbe3; border-radius: 15px; min-height: 30px; max-height: 30px;
+  font-size: 12.5px; padding: 0 12px; text-align: left;
+}
+QPushButton#aiModelBtn:hover { border-color: #3b82f6; }
 QPushButton#aiWrite {
   border-radius: 15px; min-height: 30px; max-height: 30px;
   font-size: 12.5px; padding: 0 12px;
@@ -199,18 +207,18 @@ QLabel#aiCardDesc { color: #6b7280; font-size: 12px; background: transparent; }
 )");
     }
     return QStringLiteral(R"(
-AiChatDock { background: #0e0f13; }
-QFrame#aiSeparator { background:#202229; border:0; }
+AiChatDock { background: #1a1d24; }
+QFrame#aiSeparator { background:#2b2f38; border:0; }
 QLabel#aiModel { color: #9aa1ad; font-size: 12.5px; }
 QListView#aiChat {
   background: transparent; border: none; outline: none;
 }
 QListView#aiChat::item { border: none; }
 QLabel#aiHint {
-  color: #565b66; font-size: 11.5px;
+  color: #99a0ad; font-size: 11.5px;
 }
 QWidget#aiInputBox {
-  background: #13141a; border: 1px solid #26272e; border-radius: 14px;
+  background: #232730; border: 1px solid #383d49; border-radius: 14px;
 }
 QPlainTextEdit#aiInputInner {
   background: transparent; border: none; color: #e4e4e7;
@@ -224,36 +232,42 @@ QPushButton#aiSend {
 }
 QPushButton#aiSend:hover { background: #1d4ed8; }
 QPushButton#aiGhost {
-  background: transparent; color: #9ca3af;
-  border: 1px solid #26272e; border-radius: 15px;
+  background: transparent; color: #b3b9c6;
+  border: 1px solid #383d49; border-radius: 15px;
   min-width: 30px; max-width: 30px; min-height: 30px; max-height: 30px;
   font-size: 14px;
 }
-QPushButton#aiGhost:hover { background: #1b1c22; color: #e4e4e7; }
+QPushButton#aiGhost:hover { background: #2c313c; color: #f0f2f7; }
 QPushButton#aiAttach {
-  background: transparent; color: #9ca3af;
-  border: 1px solid #26272e; border-radius: 15px;
+  background: transparent; color: #b3b9c6;
+  border: 1px solid #383d49; border-radius: 15px;
   min-width: 32px; max-width: 32px; min-height: 32px; max-height: 32px;
   font-size: 14px;
 }
-QPushButton#aiAttach:hover { background: #1b1c22; color: #e4e4e7; }
+QPushButton#aiAttach:hover { background: #2c313c; color: #f0f2f7; }
 QPushButton#aiJump {
   color: #ffffff; border: none; border-radius: 15px;
   padding: 7px 18px; font-size: 12.5px; font-weight: 600;
-  background: rgba(20, 22, 30, 200);
+  background: rgba(45, 50, 62, 235);
 }
 QPushButton#aiJump:hover { background: rgba(37, 99, 235, 230); }
+QPushButton#aiModelBtn {
+  background: #232730; color: #d8dde6;
+  border: 1px solid #383d49; border-radius: 15px; min-height: 30px; max-height: 30px;
+  font-size: 12.5px; padding: 0 12px; text-align: left;
+}
+QPushButton#aiModelBtn:hover { border-color: #3b82f6; }
 QPushButton#aiWrite {
   border-radius: 15px; min-height: 30px; max-height: 30px;
   font-size: 12.5px; padding: 0 12px;
 }
 QComboBox#aiThink {
-  background: #13141a; color: #c2c8d0;
-  border: 1px solid #26272e; border-radius: 15px;
+  background: #232730; color: #d8dde6;
+  border: 1px solid #383d49; border-radius: 15px;
   min-height: 30px; max-height: 30px; padding: 0 8px 0 12px;
   font-size: 12.5px;
 }
-QComboBox#aiThink:hover { border: 1px solid #3a3d48; }
+QComboBox#aiThink:hover { border: 1px solid #4a5060; }
 QComboBox#aiThink::drop-down { border: none; width: 22px; }
 QComboBox#aiThink::down-arrow {
   image: none; border-left: 4px solid transparent;
@@ -261,29 +275,29 @@ QComboBox#aiThink::down-arrow {
   margin-right: 8px;
 }
 QComboBox QAbstractItemView {
-  background: #16171d; color: #e4e4e7;
-  border: 1px solid #2b2d36; selection-background-color: #2563eb;
+  background: #232730; color: #f0f2f7;
+  border: 1px solid #383d49; selection-background-color: #2563eb;
 }
 QScrollBar:vertical { background: transparent; width: 9px; margin: 0; }
 QScrollBar::handle:vertical {
-  background: #26272e; border-radius: 4px; min-height: 36px;
+  background: #3d424e; border-radius: 4px; min-height: 36px;
 }
-QScrollBar::handle:vertical:hover { background: #33353f; }
+QScrollBar::handle:vertical:hover { background: #515868; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 QWidget#aiWelcome { background: transparent; }
 QLabel#aiWelcomeTitle {
   color: #eef0fb; font-size: 27px; font-weight: 600; background: transparent;
 }
-QLabel#aiWelcomeSub { color: #8a8f9a; font-size: 13.5px; background: transparent; }
+QLabel#aiWelcomeSub { color: #a4abb8; font-size: 13.5px; background: transparent; }
 QFrame#aiCard {
-  background: #13141a; border: 1px solid #26272e; border-radius: 12px;
+  background: #232730; border: 1px solid #383d49; border-radius: 12px;
 }
 QFrame#aiCard:hover {
-  background: #16171d; border: 1px solid #3b82f6;
+  background: #2a2f3a; border: 1px solid #3b82f6;
 }
-QLabel#aiCardHead { color: #e7e9f2; font-size: 14px; font-weight: 600; background: transparent; }
-QLabel#aiCardDesc { color: #8a8f9a; font-size: 12px; background: transparent; }
+QLabel#aiCardHead { color: #eef0f7; font-size: 14px; font-weight: 600; background: transparent; }
+QLabel#aiCardDesc { color: #a4abb8; font-size: 12px; background: transparent; }
 )");
 }
 
@@ -316,15 +330,21 @@ AiChatDock::AiChatDock(QWidget *parent)
     } else {
         resize(883, 1096);
     }
-    // 主题:0 深色(默认) 1 浅色
-    m_lightTheme = QSettings().value(QStringLiteral("aiTheme"),
-        QSettings().value(QStringLiteral("theme"), QStringLiteral("light")).toString() == QLatin1String("dark") ? 0 : 1).toInt() == 1;
+    // 主题跟随主窗口(读主主题,不再读 aiTheme 旧覆盖值),主窗口切主题时
+    // 由 MainWindow::broadcastTheme → followHostTheme 实时同步
+    m_lightTheme = QSettings().value(QStringLiteral("theme"), QStringLiteral("light"))
+                       .toString() != QLatin1String("dark");
     setStyleSheet(chatQss(m_lightTheme));
 
     // 写入模式 / 思考程度持久化
     QSettings s;
     m_writeMode = qBound(0, s.value(QStringLiteral("aiWriteMode"), 0).toInt(), 2);
-    m_thinkLevel = qBound(0, s.value(QStringLiteral("aiThinkLevel"), 3).toInt(), 3);
+    // 思考档位持久化为档位名(字符串);旧版整数 0关1低2中3高 迁移:中并入高
+    m_thinkEffort = s.value(QStringLiteral("aiThinkEffort")).toString();
+    if (!s.contains(QStringLiteral("aiThinkEffort"))) {
+        const int old = s.value(QStringLiteral("aiThinkLevel"), 3).toInt();
+        m_thinkEffort = old <= 0 ? QString() : (old == 1 ? QStringLiteral("low") : QStringLiteral("high"));
+    }
 
     buildUi();
     // 网页启动前也保存主题,就绪后与会话一起同步。
@@ -344,17 +364,21 @@ AiChatDock::~AiChatDock()
     QSettings().setValue(QStringLiteral("aiGeometry"), saveGeometry());
     // 先请求中断在途请求,再停线程:避免线程卡在 HTTP 里拖住退出
     HttpAbort::request();
+    if (m_worker) {
+        // 原 runInsert 用 BlockingQueuedConnection 回调本对象:析构开始后
+        // GUI 不再处理事件,工作线程会永久卡住,wait 超时销毁 QThread 即 qFatal。
+        // 置位 stop 后 worker 侧 GUI 回调立即走超时放行,线程得以正常退出。
+        m_worker->requestStop();
+    }
     m_thread->quit();
     if (!m_thread->wait(3000)) {
-        // 3 秒没退干净(线程多半还压在带超时的跨线程调用上):销毁一个
-        // 仍在运行的 QThread 是未定义行为,析构里绝不硬来 —— 脱离对象树,
-        // 转入托管回收:线程在超时返回后自然退出,finished 链上 deleteLater
-        // (wireWorker 里已挂 finished→worker deleteLater,线程收尾时统一清理)
-        qWarning() << "Mswrite: AI 工作线程 3 秒内未退出,转入托管回收";
-        m_thread->disconnect(this);
+        // 线程没在 3s 内退出。m_thread 是本对象的子对象,析构后续会被 Qt 直接
+        // delete —— 那时若线程仍在运行,QThread 会 qFatal("Destroyed while thread
+        // is still running"),直接闪退。这里置 NULL 断掉父子关系,让线程由自身
+        // 的 deleteLater 路径回收,而不是被析构途中强行销毁。
+        qWarning("AI 工作线程未在超时内退出,放弃回收以避免崩溃");
         m_thread->setParent(nullptr);
-        connect(m_thread, &QThread::finished, m_thread, &QObject::deleteLater);
-        m_worker = nullptr;   // 生命周期已移交线程,防止析构后半段触碰
+        m_thread = nullptr;
     }
 }
 
@@ -369,6 +393,9 @@ void AiChatDock::buildUi()
     top->setSpacing(6);
     m_model = new QLabel(tr("未配置供应商"), this);
     m_model->setObjectName(QStringLiteral("aiModel"));
+    m_model->setCursor(Qt::PointingHandCursor);
+    m_model->setToolTip(tr("点击切换供应商/模型"));
+    m_model->installEventFilter(this); // 点击 = 模型切换菜单
     top->addWidget(m_model, 1);
     m_themeBtn = new QPushButton(m_lightTheme ? tr("🌙") : tr("☀"), this);
     m_themeBtn->setObjectName(QStringLiteral("aiGhost"));
@@ -421,6 +448,15 @@ void AiChatDock::buildUi()
         m_msgs->append(ChatMsg::Notice, tr("已导出 %1").arg(path), QStringLiteral("ok"));
     });
 
+    // 用户消息"复制进询问框":原文回填输入框(可改后再发,适合追问)
+    connect(m_chat, &ChatWebView::askEditRequested, this, [this](const QString &text) {
+        m_input->setPlainText(text);
+        QTextCursor c = m_input->textCursor();
+        c.movePosition(QTextCursor::End);
+        m_input->setTextCursor(c);
+        m_input->setFocus();
+    });
+
     // 消息出现 → 切到聊天页;清空 → 回欢迎页
     connect(m_msgs, &QAbstractItemModel::rowsInserted, this, [this] { updateStackPage(); });
     connect(m_msgs, &QAbstractItemModel::modelReset, this, [this] { updateStackPage(); });
@@ -434,9 +470,17 @@ void AiChatDock::buildUi()
     m_attachStrip->hide();
     lay->addWidget(m_attachStrip);
 
-    // ── 控制行:写入模式 / 思考程度 / 附件按钮 ──
+    // ── 控制行:模型切换 / 写入模式 / 思考程度 / 附件按钮 ──
     auto *controls = new QHBoxLayout;
     controls->setSpacing(6);
+    // 模型切换按钮:"供应商/模型 ▾",点开双栏弹层(左供应商右模型)
+    m_modelBtn = new QPushButton(this);
+    m_modelBtn->setObjectName(QStringLiteral("aiModelBtn"));
+    m_modelBtn->setCursor(Qt::PointingHandCursor);
+    m_modelBtn->setToolTip(tr("切换供应商/模型"));
+    m_modelBtn->setText(tr("未配置供应商 ▾"));
+    connect(m_modelBtn, &QPushButton::clicked, this, [this] { showModelMenu(); });
+    controls->addWidget(m_modelBtn);
     m_writeBtn = new QPushButton(this);
     m_writeBtn->setObjectName(QStringLiteral("aiWrite"));
     m_writeBtn->setCursor(Qt::PointingHandCursor);
@@ -471,12 +515,8 @@ void AiChatDock::buildUi()
 
     m_thinkBox = new QComboBox(this);
     m_thinkBox->setObjectName(QStringLiteral("aiThink"));
-    m_thinkBox->setToolTip(tr("思考程度(模型不支持时自动忽略)"));
-    m_thinkBox->addItem(tr("思考 关"), 0);
-    m_thinkBox->addItem(tr("思考 低"), 1);
-    m_thinkBox->addItem(tr("思考 中"), 2);
-    m_thinkBox->addItem(tr("思考 高"), 3);
-    m_thinkBox->setCurrentIndex(m_thinkLevel);
+    m_thinkBox->setToolTip(tr("思考程度(档位按当前模型配置;模型不支持时自动忽略)"));
+    rebuildThinkBox({QStringLiteral("low"), QStringLiteral("high")});
     connect(m_thinkBox, &QComboBox::currentIndexChanged, this,
             [this](int) { onThinkLevelChanged(); });
 
@@ -540,8 +580,9 @@ void AiChatDock::buildUi()
     m_input = new AiInputEdit(inputBox);
     m_input->setObjectName(QStringLiteral("aiInputInner"));
     m_input->setFixedHeight(44);
-    // Enter 发送 + 截图粘贴:事件过滤器
+    // Enter 发送 + 截图粘贴:事件过滤器;视口也要装(点击落在 viewport 上)
     m_input->installEventFilter(this);
+    m_input->viewport()->installEventFilter(this);
     m_send = new QPushButton(tr("➤"), inputBox);
     m_send->setObjectName(QStringLiteral("aiSend"));
     m_send->setCursor(Qt::PointingHandCursor);
@@ -601,6 +642,16 @@ void AiChatDock::wireWorker()
         if (userRow < 0)
             return;
         const QString userText = m_msgs->msgAt(userRow)->text;
+        // 从 worker 历史里截断:保留 userRow 之前的(含该 user 消息)
+        const int keepCount = userRow + 1;
+        // 【防御】lambda 在 worker 线程执行,不能捕获 this 再解引用 m_worker:
+        // 析构期间 wait() 阻塞 GUI 时,worker 仍可能跑这条已投递的调用。
+        // 直接捕获 worker 指针(QPointer 在其销毁后自动置空)。
+        QPointer<AiWorker> worker = m_worker;
+        QMetaObject::invokeMethod(m_worker, [worker, keepCount]() {
+            if (worker)
+                worker->truncateHistory(keepCount);
+        }, Qt::QueuedConnection);
         // 模型里删掉 userRow 之后的行(含 AI 回复)
         m_msgs->removeFrom(userRow + 1);
         scrollBottom();
@@ -610,28 +661,9 @@ void AiChatDock::wireWorker()
         const int clipMark = full.indexOf(QStringLiteral("\n📎 "));
         if (clipMark > 0)
             full = full.left(clipMark);
-        // worker 历史按"内容 + 序数"截断。GUI 行号与历史序列不对应
-        // (Thinking/Notice 行在历史里没有项,tool 消息在 GUI 里没有行),
-        // 旧实现拿 GUI 行号直接当历史下标,轻则旧回答全留在上下文,
-        // 重则切出"有 tool_use 没 tool_result"的非法序列被网关 400
-        int occurrence = 0;
-        for (int i = 0; i <= userRow; ++i) {
-            const ChatMsg *um = m_msgs->msgAt(i);
-            if (!um || um->kind != ChatMsg::User)
-                continue;
-            QString t = um->text;
-            const int mark = t.indexOf(QStringLiteral("\n📎 "));
-            if (mark > 0)
-                t = t.left(mark);
-            if (t == full)
-                ++occurrence;
-        }
-        QMetaObject::invokeMethod(m_worker, [this, full, occurrence]() {
-            m_worker->truncateAtUserMessage(full, occurrence);
-        }, Qt::QueuedConnection);
         m_dispatchImages.clear();
         m_dispatchMode = m_writeMode;
-        m_dispatchLevel = m_thinkLevel;
+        m_dispatchEffort = m_thinkEffort;
         dispatch(full);
     });
 
@@ -723,14 +755,14 @@ void AiChatDock::wireWorker()
 
     connect(m_worker, &AiWorker::turnFinished, this, [this](const QString &error) {
         // 没等到任何输出就把等待行收尾(错误详情由下方通知行显示)
-        if (m_thinkRow >= 0) {
-            if (ChatMsg *m = m_msgs->msgAt(m_thinkRow)) {
-                m->meta = tr("·");
-                m->role = error.isEmpty() ? QString() : QStringLiteral("error");
-                m_msgs->touch(m_thinkRow);
+if (m_thinkRow >= 0) {
+                if (ChatMsg *t = m_msgs->msgAt(m_thinkRow)) {
+                    t->meta = tr("·");
+                    t->role = error.isEmpty() ? QString() : QStringLiteral("error");
+                    m_msgs->touch(m_thinkRow);
+                }
+                m_thinkRow = -1;
             }
-            m_thinkRow = -1;
-        }
         if (error == QLatin1String("已中断")) {
             m_msgs->append(ChatMsg::Notice, tr("⏹ 已停止(可继续输入新指令)"),
                            QStringLiteral("muted"));
@@ -828,6 +860,10 @@ bool AiChatDock::eventFilter(QObject *obj, QEvent *event)
 {
     // 欢迎卡片:点击 = 填入预置指令并直接发送
     if (event->type() == QEvent::MouseButtonRelease) {
+        if (obj == m_model) {   // 顶栏模型名:点击 = 切换供应商/模型
+            showModelMenu();
+            return true;
+        }
         if (QWidget *card = qobject_cast<QWidget *>(obj)) {
             if (m_cardPrompts.contains(card)) {
                 m_input->setPlainText(m_cardPrompts.value(card));
@@ -836,9 +872,35 @@ bool AiChatDock::eventFilter(QObject *obj, QEvent *event)
             }
         }
     }
+    // 点输入框时把 Win32 焦点强制还给顶层窗口:点过聊天区后,Win32 焦点
+    // 停在聊天 WebView2 的 Chrome 子窗口,而 Qt 焦点仍在输入框(Qt 认为
+    // 焦点没变就不再抢)→ 键盘消息全进了网页,表现为"输入不了,点一下
+    // 思考强度下拉框(会触发 Qt 焦点变化)就好了"
+    if (m_input && (obj == m_input || obj == m_input->viewport())
+        && event->type() == QEvent::MouseButtonPress) {
+        QPointer<QWidget> win = window();
+        QTimer::singleShot(0, this, [win] {
+            if (win)
+                ::SetFocus(reinterpret_cast<HWND>(win->winId()));
+        });
+        return false;
+    }
     if (obj == m_input && event->type() == QEvent::KeyPress) {
         auto *ke = static_cast<QKeyEvent *>(event);
-        if(static_cast<AiInputEdit *>(m_input)->isComposing())
+        // 铁律:Enter=发送,Shift+Enter=换行。IME 组合中的 Enter 会被输入法
+        // 自己消费(提交用),根本到不了这里;能到这里的都是用户明确按键。
+        // 旧版在这里查 isComposing()/QInputMethod::isVisible(),中文输入法
+        // 下会把 Enter 拦成换行 —— 就是"写入后消息发不出去"的元凶
+        if ((ke->key() == Qt::Key_Return || ke->key() == Qt::Key_Enter)
+            && !(ke->modifiers() & Qt::ShiftModifier)) {
+            if (m_busy)
+                stop(); // 生成中回车 = 停止(与红色按钮同语义,不再无响应)
+            else
+                send();
+            return true;
+        }
+        // 拼音组合未上屏时,↑↓ 属于 IME 候选键,别抢(其余按键不受影响)
+        if (static_cast<AiInputEdit *>(m_input)->isComposing())
             return false;
         // ↑↓ 翻输入历史(终端式):空框或光标在第一行开头时 ↑ = 上一条
         if ((ke->key() == Qt::Key_Up || ke->key() == Qt::Key_Down)
@@ -869,14 +931,6 @@ bool AiChatDock::eventFilter(QObject *obj, QEvent *event)
                 m_input->moveCursor(QTextCursor::End);
                 return true;
             }
-        }
-        if ((ke->key() == Qt::Key_Return || ke->key() == Qt::Key_Enter)
-            && !(ke->modifiers() & Qt::ShiftModifier)) {
-            if (m_busy)
-                stop(); // 生成中回车 = 停止(与红色按钮同语义,不再无响应)
-            else
-                send();
-            return true;
         }
         // Ctrl+V:剪贴板里是图片/图片文件 → 进附件栏
         if (ke->key() == Qt::Key_V && (ke->modifiers() & Qt::ControlModifier)) {
@@ -945,8 +999,8 @@ void AiChatDock::cycleWriteMode()
 void AiChatDock::applyWriteModeStyle()
 {
     // 状态色固定(语义不变),底色随主题取对比值
-    const char *bg = m_lightTheme ? "#ffffff" : "#13141a";
-    const char *bd = m_lightTheme ? "#d9dbe3" : "#2b2d36";
+    const char *bg = m_lightTheme ? "#ffffff" : "#232730";
+    const char *bd = m_lightTheme ? "#d9dbe3" : "#383d49";
     const char *mut = m_lightTheme ? "#6b7280" : "#8a8f9a";
     switch (m_writeMode) {
     case 0:
@@ -971,15 +1025,30 @@ void AiChatDock::applyWriteModeStyle()
 
 void AiChatDock::onThinkLevelChanged()
 {
-    m_thinkLevel = m_thinkBox->currentData().toInt();
-    QSettings().setValue(QStringLiteral("aiThinkLevel"), m_thinkLevel);
+    m_thinkEffort = m_thinkBox->currentData().toString();
+    QSettings().setValue(QStringLiteral("aiThinkEffort"), m_thinkEffort);
 }
 
 // 浅色/深色切换:QSS + 调色板全量换,持久化,立即重绘
 void AiChatDock::toggleTheme()
 {
-    m_lightTheme = !m_lightTheme;
-    QSettings().setValue(QStringLiteral("aiTheme"), m_lightTheme ? 1 : 0);
+    // 会话内临时切换(不持久化):面板始终以主窗口主题为准,
+    // 主窗口下次切主题时由 followHostTheme 重新对齐
+    applyLightTheme(!m_lightTheme);
+}
+
+// 主窗口主题切换时让 AI 面板跟随(此前只在面板构造时读一次主题,
+// 之后主窗口切夜间/浅色,AI 面板永远停在旧主题)
+void AiChatDock::followHostTheme(bool light)
+{
+    if (m_lightTheme == light)
+        return;
+    applyLightTheme(light);
+}
+
+void AiChatDock::applyLightTheme(bool light)
+{
+    m_lightTheme = light;
     m_themeBtn->setText(m_lightTheme ? tr("🌙") : tr("☀"));
     setStyleSheet(chatQss(m_lightTheme));
     m_chat->setLightTheme(m_lightTheme);
@@ -1067,8 +1136,10 @@ void AiChatDock::rebuildAttachStrip()
         auto *thumb = new QLabel(m_attachStrip);
         thumb->setFixedSize(46, 46);
         thumb->setAlignment(Qt::AlignCenter);
-        thumb->setStyleSheet(QStringLiteral(
-            "background:#16171d;border:1px solid #2b2d36;border-radius:8px;"));
+        // 附件缩略图底色跟随主题(此前写死深色,浅色主题下是一排黑块)
+        thumb->setStyleSheet(m_lightTheme
+            ? QStringLiteral("background:#eef0f5;border:1px solid #d9dbe3;border-radius:8px;")
+            : QStringLiteral("background:#2c313c;border:1px solid #3d434f;border-radius:8px;"));
         if (!img.isNull())
             thumb->setPixmap(QPixmap::fromImage(img.scaled(
                 40, 40, Qt::KeepAspectRatio, Qt::SmoothTransformation)));
@@ -1080,8 +1151,9 @@ void AiChatDock::rebuildAttachStrip()
         auto *rm = new QPushButton(tr("✕"), m_attachStrip);
         rm->setFixedSize(20, 20);
         rm->setCursor(Qt::PointingHandCursor);
-        rm->setStyleSheet(QStringLiteral(
-            "background:#26272e;color:#c2c8d0;border:none;border-radius:10px;font-size:12px;"));
+        rm->setStyleSheet(m_lightTheme
+            ? QStringLiteral("background:#dfe2ea;color:#3a4150;border:none;border-radius:10px;font-size:12px;")
+            : QStringLiteral("background:#3d434f;color:#e8ebf2;border:none;border-radius:10px;font-size:12px;"));
         connect(rm, &QPushButton::clicked, this, [this, idx] {
             m_images.removeAt(idx);
             rebuildAttachStrip();
@@ -1091,17 +1163,20 @@ void AiChatDock::rebuildAttachStrip()
     for (int i = 0; i < m_textFiles.size(); ++i) {
         auto *chip = new QLabel(QStringLiteral("📄 ") + m_textFiles[i].first,
                                 m_attachStrip);
-        chip->setStyleSheet(QStringLiteral(
-            "background:#16171d;color:#c2c8d0;border:1px solid #2b2d36;"
-            "border-radius:14px;padding:4px 12px;font-size:12px;"));
+        chip->setStyleSheet(m_lightTheme
+            ? QStringLiteral("background:#eef0f5;color:#3a4150;border:1px solid #d9dbe3;"
+                            "border-radius:14px;padding:4px 12px;font-size:12px;")
+            : QStringLiteral("background:#2c313c;color:#e8ebf2;border:1px solid #3d434f;"
+                            "border-radius:14px;padding:4px 12px;font-size:12px;"));
         chip->setToolTip(tr("文本文件,内容将随消息发给 AI"));
         m_attachLay->addWidget(chip);
         const int idx = i;
         auto *rm = new QPushButton(tr("✕"), m_attachStrip);
         rm->setFixedSize(20, 20);
         rm->setCursor(Qt::PointingHandCursor);
-        rm->setStyleSheet(QStringLiteral(
-            "background:#26272e;color:#c2c8d0;border:none;border-radius:10px;font-size:12px;"));
+        rm->setStyleSheet(m_lightTheme
+            ? QStringLiteral("background:#dfe2ea;color:#3a4150;border:none;border-radius:10px;font-size:12px;")
+            : QStringLiteral("background:#3d434f;color:#e8ebf2;border:none;border-radius:10px;font-size:12px;"));
         connect(rm, &QPushButton::clicked, this, [this, idx] {
             m_textFiles.removeAt(idx);
             rebuildAttachStrip();
@@ -1242,6 +1317,11 @@ void AiChatDock::saveSession()
         const ChatMsg *m = m_msgs->msgAt(i);
         if (!m || m->kind == ChatMsg::Thinking) // 思考行是过程态,不存
             continue;
+        QJsonArray imgs;
+        for (const AiAttach &a : m->images)
+            imgs.append(QJsonObject{{QStringLiteral("n"), a.name},
+                                    {QStringLiteral("mime"), a.mime},
+                                    {QStringLiteral("b64"), a.base64}});
         rows.append(QJsonObject{
             { QStringLiteral("k"), int(m->kind) },
             { QStringLiteral("t"), m->text },
@@ -1250,24 +1330,11 @@ void AiChatDock::saveSession()
             { QStringLiteral("hero"), m->hero },
             { QStringLiteral("fin"), m->finalized },
             { QStringLiteral("preferLatex"), m->preferLatex },
+            { QStringLiteral("imgs"), imgs },
         });
     }
     QJsonArray hist;
-    // 快照经排队调用获取:run() 执行期间 worker 线程的事件循环被占用,本请求
-    // 只会在空闲(轮与轮之间)执行 —— 与 history_ 的修改天然串行,消除
-    // GUI 线程直读的跨线程数据竞争;超时则本次不落盘(保留上一份会话文件,
-    // 绝不能拿空历史覆盖掉旧记录)
-    struct SnapState { QSemaphore ready; QVector<ChatMessage> result; };
-    auto snap = std::make_shared<SnapState>();
-    QMetaObject::invokeMethod(m_worker, [this, snap]() {
-        snap->result = m_worker->historySnapshot();
-        snap->ready.release();
-    }, Qt::QueuedConnection);
-    if (!snap->ready.tryAcquire(1, 2000)) {
-        qWarning() << "Mswrite: AI 会话快照超时,本次不落盘";
-        return;
-    }
-    const QVector<ChatMessage> h = snap->result;
+    const QVector<ChatMessage> h = m_worker->historySnapshot();
     for (const ChatMessage &mm : h) {
         QJsonObject o{
             { QStringLiteral("role"), mm.role },
@@ -1281,9 +1348,16 @@ void AiChatDock::saveSession()
                 { QStringLiteral("id"), tc.id },
                 { QStringLiteral("name"), tc.name },
                 { QStringLiteral("input"), tc.input },
+                { QStringLiteral("thoughtSignature"), tc.thoughtSignature },
             });
         }
         o.insert(QStringLiteral("toolCalls"), tcs);
+        QJsonArray himgs;
+        for (const AiAttach &a : mm.images)
+            himgs.append(QJsonObject{{QStringLiteral("n"), a.name},
+                                     {QStringLiteral("mime"), a.mime},
+                                     {QStringLiteral("b64"), a.base64}});
+        o.insert(QStringLiteral("imgs"), himgs);
         hist.append(o);
     }
     const QString path = sessionFilePath();
@@ -1327,6 +1401,13 @@ bool AiChatDock::loadSession()
             m->hero = o.value(QStringLiteral("hero")).toBool();
             m->finalized = o.value(QStringLiteral("fin")).toBool();
             m->preferLatex = o.value(QStringLiteral("preferLatex")).toBool();
+            const QJsonArray imgs = o.value(QStringLiteral("imgs")).toArray();
+            for (const QJsonValue &iv : imgs) {
+                const QJsonObject io = iv.toObject();
+                m->images.append({io.value(QStringLiteral("n")).toString(),
+                                  io.value(QStringLiteral("mime")).toString(),
+                                  io.value(QStringLiteral("b64")).toString()});
+            }
         }
     }
     QVector<ChatMessage> hist;
@@ -1345,32 +1426,92 @@ bool AiChatDock::loadSession()
             tc.id = to.value(QStringLiteral("id")).toString();
             tc.name = to.value(QStringLiteral("name")).toString();
             tc.input = to.value(QStringLiteral("input")).toObject();
+            tc.thoughtSignature = to.value(QStringLiteral("thoughtSignature")).toString();
             m.toolCalls.push_back(tc);
+        }
+        const QJsonArray himgs = o.value(QStringLiteral("imgs")).toArray();
+        for (const QJsonValue &iv : himgs) {
+            const QJsonObject io = iv.toObject();
+            m.images.append({io.value(QStringLiteral("n")).toString(),
+                             io.value(QStringLiteral("mime")).toString(),
+                             io.value(QStringLiteral("b64")).toString()});
         }
         hist.push_back(m);
     }
     // 模型上下文回填到工作线程(排队执行,天然串行)
-    QMetaObject::invokeMethod(m_worker, [this, hist]() {
-        m_worker->restoreHistory(hist);
+    // 【防御】lambda 在 worker 线程执行:捕获 worker 本身而非 this,
+    // 析构期间 wait() 阻塞 GUI 时不会解引用已析构的 this(UAF)。
+    QPointer<AiWorker> worker = m_worker;
+    QMetaObject::invokeMethod(m_worker, [worker, hist]() {
+        if (worker)
+            worker->restoreHistory(hist);
     }, Qt::QueuedConnection);
     return true;
 }
 
 void AiChatDock::applyProvider(const AiProvider &p)
 {
-    m_hasProvider = !p.apiKey.trimmed().isEmpty() && !p.baseUrl.trimmed().isEmpty() && !p.model.trimmed().isEmpty();
-    m_modelText = QStringLiteral("%1 · %2").arg(p.name, p.model);
+    const QString modelId = p.effectiveModelId();
+    m_hasProvider = p.protocol != Protocol::Unsupported && !p.apiKey.trimmed().isEmpty()
+                    && !p.baseUrl.trimmed().isEmpty() && !modelId.trimmed().isEmpty();
+    m_modelText = QStringLiteral("%1 · %2").arg(p.name, modelId);
     m_model->setText(m_busy ? m_modelText + tr(" · 生成中…") : m_modelText);
+    m_curProvider = p.name;
+    m_curModelId = modelId;
+    if (m_modelBtn) {
+        // 供应商/模型名太长会把控制行撑变形:超长就省略模型名尾部
+        QString full = p.name + QLatin1Char('/') + modelId;
+        if (full.size() > 34)
+            full = p.name + QLatin1Char('/') + modelId.left(qMax(8, 30 - p.name.size())) + QStringLiteral("…");
+        m_modelBtn->setText(full + QStringLiteral(" ▾"));
+    }
+    rebuildThinkBox(p.effectiveThinkLevels());
 
     AiLlmConfig cfg;
     cfg.apiKey = p.apiKey;
     cfg.baseUrl = p.baseUrl;
-    cfg.model = p.model;
-    cfg.protocol = p.protocol;
-    cfg.maxTokens = p.maxTokens > 0 ? p.maxTokens : 4096;
-    QMetaObject::invokeMethod(m_worker, [this, cfg]() {
-        m_worker->applyConfig(cfg);
+    cfg.model = modelId;
+cfg.protocol = p.protocol;
+    cfg.maxTokens = p.effectiveMaxTokens(); // 0 = 默认 (LlmCodec 落 1000448)
+    // 【防御】同上：捕获 worker 本身，避免析构时 UAF。
+    QPointer<AiWorker> worker = m_worker;
+    QMetaObject::invokeMethod(m_worker, [worker, cfg]() {
+        if (worker)
+            worker->applyConfig(cfg);
     }, Qt::QueuedConnection);
+}
+
+// 思考档位下拉 = 关 + 当前模型配置的档位列表(每模型独立,可自定义)
+void AiChatDock::rebuildThinkBox(const QStringList &levels)
+{
+    const QString keep = m_thinkEffort;
+    const QSignalBlocker blocker(m_thinkBox);
+    m_thinkBox->clear();
+    m_thinkBox->addItem(tr("思考 关"), QString());
+    for (const QString &lv : levels)
+        m_thinkBox->addItem(tr("思考 %1").arg(lv), lv);
+    int idx = m_thinkBox->findData(keep);
+    if (idx < 0)
+        idx = m_thinkBox->count() - 1; // 档位名不在本模型列表:回退到最高档
+    if (idx < 0)
+        idx = 0;
+    m_thinkBox->setCurrentIndex(idx);
+    m_thinkEffort = m_thinkBox->currentData().toString();
+}
+
+// 点顶栏模型名/控制行按钮:双栏弹层切换(左供应商、右该网址下的模型)
+void AiChatDock::showModelMenu()
+{
+    if (!m_listProviders || !m_modelSwitch)
+        return;
+    QWidget *anchor = m_modelBtn ? m_modelBtn : static_cast<QWidget *>(m_model);
+    AiModelPicker::showFor(anchor, m_listProviders(), m_curProvider,
+        [this](const QString &provider, const QString &model) {
+            if (m_modelSwitch)
+                m_modelSwitch(provider, model);
+        },
+        [this] { emit configRequested(); },
+        !m_lightTheme);   // dark = 深色主题
 }
 
 void AiChatDock::setNoProvider()
@@ -1382,15 +1523,6 @@ void AiChatDock::setNoProvider()
 
 void AiChatDock::clearConversation()
 {
-    // 生成中不清:worker 的清除只是排队,在途的 run() 还会继续往 history_
-    // 和消息模型里追加输出,新会话会被旧回合污染、并被落盘
-    if (m_busy) {
-        m_msgs->append(ChatMsg::Notice,
-                       tr("正在生成,请先停止或等本轮结束后再开新对话。"),
-                       QStringLiteral("error"));
-        scrollBottom();
-        return;
-    }
     QMetaObject::invokeMethod(m_worker, [this]() {
         m_worker->clearHistory();
     }, Qt::QueuedConnection);
@@ -1461,12 +1593,15 @@ void AiChatDock::send()
     for (const AiAttach &a : m_images)
         names << a.name;
 
-    // 面板显示:正文 + 附件清单
+    // 面板显示:正文 + 附件清单;图片本体也存进气泡(用户要看到截图原图)
     QString display = text;
     if (!names.isEmpty())
         display += QStringLiteral("\n📎 ") + names.join(QStringLiteral("、"));
 
-    m_msgs->append(ChatMsg::User, display);
+    const QVector<AiAttach> images = m_images;
+    const int urow = m_msgs->append(ChatMsg::User, display);
+    if (ChatMsg *um = m_msgs->msgAt(urow))
+        um->images = images;
     m_chat->scrollToBottom(true);
     // 输入历史入栈(↑↓ 翻阅用;去重)
     if (!text.isEmpty()
@@ -1477,15 +1612,14 @@ void AiChatDock::send()
     }
     m_histIdx = -1; // 发出后回到"无浏览"态
 
-    const QVector<AiAttach> images = m_images;
     const int mode = m_writeMode;
-    const int level = m_thinkLevel;
+    const QString effort = m_thinkEffort;
     clearAttachments();
 
     // 捕获进 dispatch 链
     m_dispatchImages = images;
     m_dispatchMode = mode;
-    m_dispatchLevel = level;
+    m_dispatchEffort = effort;
     dispatch(full);
 }
 
@@ -1505,7 +1639,7 @@ void AiChatDock::dispatch(const QString &userText)
     // Set the guard before queuing the worker; rapid clicks cannot start two turns.
     m_busy=true;
     emit runRequested(userText,QString::fromUtf8(QJsonDocument(context).toJson(QJsonDocument::Compact)),
-                      mode,m_dispatchLevel,m_dispatchImages);
+                      mode,m_dispatchEffort,m_dispatchImages);
     m_dispatchImages.clear();
 }
 
@@ -1531,7 +1665,7 @@ void AiChatDock::requestSelection(const QString &text,const QString &name,int pa
         return;
     }
     m_msgs->append(ChatMsg::User,prompt);
-    m_dispatchMode=0; m_dispatchLevel=m_thinkLevel; m_dispatchImages.clear();
+    m_dispatchMode=0; m_dispatchEffort=m_thinkEffort; m_dispatchImages.clear();
     dispatch(prompt);
     m_chat->scrollToBottom(true);
 }

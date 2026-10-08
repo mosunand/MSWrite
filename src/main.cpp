@@ -230,6 +230,9 @@ int main(int argc, char *argv[])
     // 后台/最小化方式启动时,OS 会在事件循环开始后才应用最小化状态,
     // 同步检查拦不住 —— 用事件循环内的延迟检查兜底
     QTimer::singleShot(120, &win, [&win]() {
+        // screen() 在极少数无屏/拔屏瞬间可为 null;空则跳过几何矫正
+        if (!win.screen())
+            return;
         const QRect avail = win.screen()->availableGeometry();
         // 只处理"启动被最小化"的情况。旧条件把 Maximized/FullScreen
         // 也当成异常打回普通窗口,用户上次最大化退出后再开就被还原。

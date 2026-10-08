@@ -30,8 +30,7 @@ if (-not (Test-Path $Iscc)) { throw "找不到 ISCC.exe:$Iscc" }
 & $Iscc /Qp "/DStageDir=$stage" (Join-Path $root "installer\Mswrite.iss")
 if ($LASTEXITCODE -ne 0) { throw "ISCC 编译失败:$LASTEXITCODE" }
 
-$setup = Get-ChildItem (Join-Path $root "dist") -Filter "*-setup.exe" |
-         Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$setup = Get-Item -LiteralPath (Join-Path $root 'dist\setup.exe')
 Write-Output ""
 Write-Output ("安装包完成:{0}({1:N1} MB)" -f $setup.FullName, ($setup.Length / 1MB))
 

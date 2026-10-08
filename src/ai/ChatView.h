@@ -9,6 +9,8 @@
 #include <QHash>
 #include <QVector>
 
+#include "ai/Types.h"
+
 class QTextDocument;
 
 // 主题调色板(所有颜色集中于此,浅深两套)
@@ -41,6 +43,7 @@ struct ChatMsg {
     QString fullText;       // Thinking:完整思维链(展开用)
     bool expandable = false; // Thinking:可展开
     bool expanded = false;  // Thinking:当前展开
+    QVector<AiAttach> images; // User:图片附件(面板内显示原图)
     int rev = 0;      // 内容修订号(流式每次 +1)
     int builtRev = -1;
     int builtFrame = -1;   // 动画帧(流式光标闪烁用)

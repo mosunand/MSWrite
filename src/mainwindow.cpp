@@ -8,6 +8,7 @@
 #include "quickopendialog.h"
 #include "pdfview.h"
 #include "uidialogs.h"
+#include "welcomeoverlay.h"
 #include "ai/AiChatDock.h"
 #include "ai/AiConfigDialog.h"
 #include "ai/AiDoctor.h"
@@ -22,6 +23,9 @@
 #include <QDir>
 #include <QDirIterator>
 #include <QDateTime>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
 #include <QEventLoop>
 #include <QFile>
 #include <QFileDialog>
@@ -41,6 +45,7 @@
 #include <QColor>
 #include <QPainter>
 #include <QPixmap>
+#include <QPushButton>
 #include <QCursor>
 #include <QCryptographicHash>
 #include <QInputDialog>
@@ -75,7 +80,7 @@ QString pageUrl()
 {
     // ?v= 与 bridge.js 版本同步递增:editor.html 本体也绕过缓存
     QString url = QStringLiteral("https://") + QLatin1String(kVirtualHost)
-                + QStringLiteral("/editor.html?v=144");
+                + QStringLiteral("/editor.html?v=161");
     // 开发态才把排障开关传给页面(按键记录器等),生产环境不启用
     if (qEnvironmentVariableIsSet("MSWRITE_DEV"))
         url += QStringLiteral("&dev=1");
@@ -151,34 +156,6 @@ QString imageExtForMime(const QString &mime)
     if (m.contains(QLatin1String("svg")))  return QStringLiteral("svg");
     if (m.contains(QLatin1String("avif"))) return QStringLiteral("avif");
     return QStringLiteral("png");
-}
-
-// 剪贴板是否带 "PNG" 注册格式(截图工具几乎都会放,Qt 不认识这个自定义格式)
-bool clipboardHasPngStream()
-{
-    const UINT png = RegisterClipboardFormatW(L"PNG");
-    return png && IsClipboardFormatAvailable(png);
-}
-
-// 直接读 "PNG" 注册格式的字节流:Qt 图片转换(CF_BITMAP/DIB)拿不到时的兜底,
-// 覆盖"剪贴板只有 PNG 流"的截图工具与部分浏览器复制
-QImage imageFromPngStream()
-{
-    const UINT png = RegisterClipboardFormatW(L"PNG");
-    if (!png || !OpenClipboard(nullptr))
-        return {};
-    const auto close = qScopeGuard([] { CloseClipboard(); });
-    if (!IsClipboardFormatAvailable(png))
-        return {};
-    const HANDLE h = GetClipboardData(png);
-    if (!h)
-        return {};
-    const void *mem = GlobalLock(h);
-    if (!mem)
-        return {};
-    const auto unlock = qScopeGuard([h] { GlobalUnlock(h); });
-    const QByteArray bytes(static_cast<const char *>(mem), int(GlobalSize(h)));
-    return QImage::fromData(bytes);
 }
 
 // ExecuteScript 的结果是 JSON 序列化文本:字符串带引号与转义,包一层数组解析
@@ -312,6 +289,28 @@ MainWindow::MainWindow(QWidget *parent, const QString &initialPath)
             if (t.pdf || (t.host && t.host->isPageReady()))
                 return;
         }
+        // 【防御】内核其实还在"创建中"时不要打断:等待期间若曾收到过
+        // 页面就绪信号再退回未就绪(极少见的重载竞态),推迟到下一次检查
+        if (WebViewHost::environmentError().isEmpty()) {
+            static int softRetry = 0;
+            if (++softRetry < 3) {
+                QTimer::singleShot(8000, this, [this] {
+                    if (m_shuttingDown || m_runtimeWarned)
+                        return;
+                    for (const Tab &t : m_tabs) {
+                        if (t.pdf || (t.host && t.host->isPageReady()))
+                            return;
+                    }
+                    m_runtimeWarned = true;
+                    qCritical() << "Mswrite: 编辑器内核未就绪(延迟检查后仍失败)";
+                    QMessageBox::warning(this, tr("编辑器内核未能启动"),
+                        tr("WebView2 内核长时间没有就绪,编辑区无法使用。\n\n"
+                           "请确认系统已安装 Microsoft Edge WebView2 Runtime"
+                           "(Windows 10/11 通常自带),并检查程序目录下的 WebView2Loader.dll 是否完整。"));
+                });
+                return;
+            }
+        }
         m_runtimeWarned = true;
         const QString detail = WebViewHost::environmentError();
         qCritical() << "Mswrite: 编辑器内核未就绪" << detail;
@@ -321,6 +320,10 @@ MainWindow::MainWindow(QWidget *parent, const QString &initialPath)
                "(Windows 10/11 通常自带),并检查程序目录下的 WebView2Loader.dll 是否完整。")
                 .arg(detail.isEmpty() ? tr("原因:等待超时") : tr("原因:%1").arg(detail)));
     });
+
+    // 首次使用:欢迎页(Logo/版本/座右铭/礼花)。welcomeDone 落盘后不再出现
+    if (!QSettings().value(QStringLiteral("welcomeDone"), false).toBool())
+        QTimer::singleShot(260, this, [this] { showWelcome(); });
 }
 
 MainWindow::~MainWindow()
@@ -434,7 +437,9 @@ int MainWindow::addTab(const QString &path, const QString &content,
 
     const QString exeDir = QCoreApplication::applicationDirPath();
     const QJsonObject initial{{"content", content}, {"theme", m_theme},
-        {"fontSize", m_fontSize}, {"lineNumbers", m_lineNumbers},
+        {"fontSize", m_fontSize}, {"lineHeight",
+            QSettings().value(QStringLiteral("lineHeight"), 1.0).toDouble()},
+        {"lineNumbers", m_lineNumbers},
         {"preferLatex",QSettings().value(QStringLiteral("preferLatex"),false).toBool()}};
     const QString bootstrap = QStringLiteral("if(location.origin==='https://app.local'){window.msInitialState=%1;}")
         .arg(QString::fromUtf8(QJsonDocument(initial).toJson(QJsonDocument::Compact)));
@@ -452,7 +457,7 @@ int MainWindow::addTab(const QString &path, const QString &content,
                 || IsClipboardFormatAvailable(RegisterClipboardFormatW(L"PNG")));
         const bool handled = screenshot || (alt ? (vk == 0xBB || vk == 0xBD || vk == '0')
             : shift ? QStringLiteral("NSOTFEPW12").contains(QChar(vk))
-            : (QStringLiteral("SOPNWQF0").contains(QChar(vk))
+            : (QStringLiteral("SOPNWQF").contains(QChar(vk))
                || vk == 0xBF || vk == 0xBB || vk == 0xBD || vk == 0xBC));
         if (!handled) return false;
         // WebView2 accelerator callbacks are synchronous. Opening a modal
@@ -624,9 +629,7 @@ bool MainWindow::openPath(const QString &path)
     bool crlf = false;
     const QString content = FileService::readFile(path, &ok, &enc, &crlf);
     if (!ok) {
-        QMessageBox::warning(this, tr("打开失败"),
-            tr("无法读取文件(可能被占用、读取中断或编码无法识别,原文件未做任何修改):\n%1")
-                .arg(path));
+        QMessageBox::warning(this, tr("打开失败"), tr("无法读取文件:\n%1").arg(path));
         return false;
     }
     addTab(path, content, enc, crlf);
@@ -642,11 +645,9 @@ int MainWindow::addPdfTab(const QString &path)
     auto *view = new PdfViewWidget(this);
     view->setTheme(m_theme);
     if (!view->load(path)) {
-        const QString reason = view->lastLoadError();
         delete view;
         QMessageBox::warning(this, tr("打开失败"),
-            tr("无法读取 PDF 文件:\n%1\n\n%2").arg(path,
-                reason.isEmpty() ? tr("请确认文件存在且未损坏。") : reason));
+            tr("无法读取 PDF 文件:\n%1").arg(path));
         return -1;
     }
     Tab t;
@@ -971,8 +972,7 @@ void MainWindow::syncStatusFromTab()
         return;
     }
     m_statsLabel->setText(t->stats.isEmpty() ? QStringLiteral("    ") : t->stats);
-    m_modeLabel->setText(t->mode == QLatin1String("sv") ? tr("源码模式")
-                                                        : tr("所见即所得"));
+    m_modeLabel->setText(modeLabelText(t->mode == QLatin1String("sv")));
     updateSaveIndicator(t->dirty);
     updateZoomLabel(t->zoom);   // 切标签:缩放胶囊跟随该标签
 }
@@ -1576,7 +1576,7 @@ bool MainWindow::eventFilter(QObject *obj, QEvent *ev)
 void MainWindow::buildStatusBar()
 {
     m_statsLabel = new QLabel(QStringLiteral("    "), this);
-    m_modeLabel = new QLabel(tr("所见即所得"), this);
+    m_modeLabel = new QLabel(modeLabelText(false), this);
     m_saveLabel = new QLabel(this);
     m_saveLabel->setObjectName(QStringLiteral("saveStatus"));
     m_saveLabel->setCursor(Qt::PointingHandCursor);
@@ -1690,7 +1690,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transp
     }
 }
 
-void MainWindow::broadcastTheme() const
+void MainWindow::broadcastTheme()
 {
     for (const Tab &t : m_tabs) {
         if (t.pdf) t.pdf->setTheme(m_theme);
@@ -1699,6 +1699,10 @@ void MainWindow::broadcastTheme() const
             t.host->runScript(Bridge::call(QStringLiteral("setTheme"), { m_theme }));
         }
     }
+    // AI 面板跟随主窗口主题(此前只在面板首次创建时读一次,之后主窗口
+    // 切夜间/浅色,AI 面板永远停在旧主题)
+    if (m_aiDock)
+        m_aiDock->followHostTheme(m_theme != QLatin1String("dark"));
 }
 
 void MainWindow::changeFontSize(int delta)
@@ -1748,8 +1752,8 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
         // WebView2 原生子窗口的鼠标捕获冲突,菜单弹不出来
         const bool math = obj.value(QStringLiteral("math")).toBool();
         const bool mathBold = obj.value(QStringLiteral("mathBold")).toBool();
-        QTimer::singleShot(0, this, [this, sender, math, mathBold] {
-            if (currentTab() && currentTab()->host == sender)
+        QTimer::singleShot(0, this, [this, host = QPointer<WebViewHost>(sender), math, mathBold] {
+            if (currentTab() && currentTab()->host == host)
                 showEditorContextMenu(math, mathBold);
         });
         return;
@@ -1960,8 +1964,7 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
     if (t == QLatin1String("mode")) {
         tab->mode = obj.value(QStringLiteral("value")).toString();
         if (index == currentTabIndex())
-            m_modeLabel->setText(tab->mode == QLatin1String("sv") ? tr("源码模式")
-                                                                  : tr("所见即所得"));
+            m_modeLabel->setText(modeLabelText(tab->mode == QLatin1String("sv")));
         return;
     }
     if (t == QLatin1String("html")) {
@@ -1987,7 +1990,7 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
         return;
     }
     if (t == QLatin1String("pickImage")) {
-        QTimer::singleShot(0, this, [this, host = sender] {
+        QTimer::singleShot(0, this, [this, host = QPointer<WebViewHost>(sender)] {
             const int idx = indexOfHost(host);
             if (idx >= 0)
                 m_tabbar->setCurrentIndex(idx);
@@ -1997,7 +2000,7 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
     }
     if (t == QLatin1String("replace")) {
         const QString prefill = obj.value(QStringLiteral("sel")).toString();
-        QTimer::singleShot(0, this, [this, host = sender, prefill] {
+        QTimer::singleShot(0, this, [this, host = QPointer<WebViewHost>(sender), prefill] {
             Tab *rt = tabForHost(host);
             if (!rt)
                 return;
@@ -2008,6 +2011,14 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
         });
         return;
     }
+    if (t == QLatin1String("hostTheme")) {
+        // 页面侧请求切换主窗口主题(与主题菜单同一入口,便于验证与网页联动)
+        const QString th = obj.value(QStringLiteral("theme")).toString();
+        if (th == QLatin1String("light") || th == QLatin1String("dark")
+            || th == QLatin1String("paper"))
+            applyTheme(th);
+        return;
+    }
     if (t == QLatin1String("fullscreen")) {
         toggleFullscreen();
         return;
@@ -2015,6 +2026,13 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
     if (t == QLatin1String("aiPanel")) {
         // F9 来自编辑区(键盘事件在 Chromium 内,经页面转发)
         toggleAiDock();
+        return;
+    }
+    if (t == QLatin1String("zoomReset")) {
+        // Ctrl+0 已让给页面:光标在标题里 = 转普通段落,否则页面回发这里重置缩放
+        Tab *zt = currentTab();
+        if (zt)
+            applyZoom(*zt, 1.0);
         return;
     }
     if (t == QLatin1String("openUrl")) {
@@ -2028,7 +2046,7 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
         // Ctrl+K:弹链接地址输入(预填 https://),回页面插 [选中文字](链接)。
         // 延后到 COM 回调之外弹对话框(与右键菜单同一规避)
         const QString selText = obj.value(QStringLiteral("sel")).toString();
-        QTimer::singleShot(0, this, [this, host = sender, selText] {
+        QTimer::singleShot(0, this, [this, host = QPointer<WebViewHost>(sender), selText] {
             Tab *lt = tabForHost(host);
             if (!lt)
                 return;
@@ -2130,14 +2148,39 @@ void MainWindow::reopenClosedFile()
 
 void MainWindow::showPrefs()
 {
-    QMessageBox::information(this, tr("偏好设置"),
-        tr("当前版本的设置项:\n"
-           "· 主题:菜单 主题(浅色/夜间/纸白)\n"
-           "· 页面缩放:Ctrl+= / Ctrl+- / Ctrl+0(Ctrl+滚轮同)\n"
-           "· 字号:Ctrl+Alt+= 放大 / Ctrl+Alt+- 缩小 / Ctrl+Alt+0 复原\n"
-           "· 图片:自动存入文档旁 assets 目录\n"
-           "· 自动保存:停笔 2 秒\n"
-           "更多设置界面开发中"));
+    // 主题化对话框在 UiDialogs(行距 1.0~2.2 默认 1.0 + 座右铭可改可取消);
+    // 确定后这里应用:行距下发各标签,座右铭刷新状态栏
+    if (!UiDialogs::showPrefs(this, m_theme))
+        return;
+    const double lh = QSettings().value(QStringLiteral("lineHeight"), 1.0).toDouble();
+    for (const Tab &t : m_tabs) {
+        if (!t.host) continue;
+        t.host->runScript(Bridge::call(QStringLiteral("setLineHeight"), { lh }));
+        QTimer::singleShot(80, t.host, [host = t.host]() {
+            host->runScript(QStringLiteral("window.msbridge.resyncDecor()"));
+        });
+    }
+    m_motto = QSettings().value(QStringLiteral("motto")).toString().trimmed();
+    if (auto *t = currentTab())
+        m_modeLabel->setText(t->pdf ? tr("PDF 阅读") : modeLabelText(t->mode == QLatin1String("sv")));
+}
+
+// 状态栏左侧的模式位:有座右铭时用座右铭替代「所见即所得」(源码模式/PDF 除外)
+QString MainWindow::modeLabelText(bool sourceMode) const
+{
+    if (sourceMode)
+        return tr("源码模式");
+    return m_motto.isEmpty() ? tr("所见即所得") : m_motto;
+}
+
+// 首次启动:欢迎页(Logo/版本/座右铭/礼花),之后不再出现
+void MainWindow::showWelcome()
+{
+    WelcomeOverlay welcome(this);
+    welcome.exec();
+    m_motto = QSettings().value(QStringLiteral("motto")).toString().trimmed();
+    if (auto *t = currentTab())
+        m_modeLabel->setText(modeLabelText(t->mode == QLatin1String("sv")));
 }
 
 void MainWindow::toggleOutlinePanel()
@@ -2213,12 +2256,8 @@ void MainWindow::handlePickImage()
 void MainWindow::pasteFromClipboard()
 {
     Tab *t = currentTab();
-    if (!t || !t->host) {
-        // PDF 等无编辑器宿主的标签:不再静默返回,让用户知道为什么没反应
-        if (t && t->pdf)
-            statusBar()->showMessage(tr("当前是 PDF 阅读标签,图片只能粘贴进 Markdown 文档"), 3000);
+    if (!t || !t->host)
         return;
-    }
     const QMimeData *mime = QApplication::clipboard()->mimeData();
     if (!mime)
         return;
@@ -2237,21 +2276,10 @@ void MainWindow::pasteFromClipboard()
         statusBar()->showMessage(tr("已插入 %1").arg(rel), 3000);
     };
 
-    // 1) 位图(截图/复制图片):统一转 PNG 落盘。
-    //    截图工具刚释放剪贴板时,Qt 可能瞬间读到空图(剪贴板仍被占用或
-    //    延迟渲染未完成)——短暂重试;仍拿不到就直接读原生 "PNG" 注册流。
-    const bool pngStream = clipboardHasPngStream();
-    if (mime->hasImage() || pngStream) {
-        QImage img;
-        for (int attempt = 0; attempt < 6 && img.isNull(); ++attempt) {
-            img = QApplication::clipboard()->image();
-            if (img.isNull())
-                img = QApplication::clipboard()->pixmap().toImage();
-            if (img.isNull())
-                Sleep(60);
-        }
-        if (img.isNull() && pngStream)
-            img = imageFromPngStream();
+    // 1) 位图(截图/复制图片):统一转 PNG 落盘
+    if (mime->hasImage()) {
+        QImage img = QApplication::clipboard()->image();
+        if (img.isNull()) img = QApplication::clipboard()->pixmap().toImage();
         if (!img.isNull()) {
             QByteArray bytes;
             QBuffer buf(&bytes);
@@ -2528,6 +2556,7 @@ QString MainWindow::composeExportHtml(const QString &bodyHtml, const Tab &tab)
 body.ms-export{margin:0;}
 body.ms-export .ms-export-article{max-width:856px;margin:0 auto;padding:40px 28px;box-sizing:border-box;}
 body.ms-export .vditor-reset{font-size:var(--ms-font-size,16px);line-height:1.75;}
+body.ms-export .vditor-reset blockquote{border-left:none;color:inherit;background:rgba(91,141,239,0.07);border-radius:8px;padding:8px 14px;margin:10px 0;}
 body.ms-export .vditor-reset pre{margin:8px 0;padding:12px 16px;border-radius:6px;overflow:auto;line-height:inherit;background:var(--code-background,#f6f8fa)!important;}
 body.ms-export .vditor-reset pre code{display:block;padding:0!important;background:transparent!important;white-space:pre;max-height:none!important;}
 body.ms-export .vditor-reset code{font-family:"Cascadia Code","JetBrains Mono",Consolas,"Courier New",monospace;}
@@ -2902,11 +2931,6 @@ bool MainWindow::handleAccelerator(int vk, bool ctrl, bool shift, bool alt)
         if (zt) applyZoom(*zt, zt->zoom - 0.05);
         return true;
     }
-    case '0': {   // Ctrl+0 重置整页缩放为 100%
-        Tab *zt = currentTab();
-        if (zt) applyZoom(*zt, 1.0);
-        return true;
-    }
     case 0xBC:   return showPrefs(), true;              // Ctrl+, 偏好设置
     default:     return false;                          // 其余放行给页面
     }
@@ -2923,17 +2947,37 @@ void MainWindow::ensureAiDock()
     if (m_aiDock)
         return;
     m_aiDock = new AiChatDock(); // 故意不传父窗口
-    // 无已保存几何(首次/新机器)时,摆在主窗口右侧外侧;有则恢复用户上次的位置
+    // 无已保存几何(首次/新机器)时:与主窗口【同高】、【2/3 宽】,摆在主窗
+    // 口右侧;有则恢复用户上次的位置(旧版本默认 883x1096 比不少屏幕还高,
+    // 曾把超大几何存进设置 —— 恢复后超出当前屏幕时按屏幕钳回)
+    const QRect aiAvail = screen() ? screen()->availableGeometry() : QRect();
     if (QSettings().value(QStringLiteral("aiGeometry")).toByteArray().isEmpty()) {
         const QRect mg = geometry();
-        const int w = 883, gap = 12;
-        QPoint pos(mg.right() + gap, mg.y() + 60);
-        if (QScreen *scr = screen()) {
-            const QRect avail = scr->availableGeometry();
-            if (pos.x() + w > avail.right())
-                pos.setX(qMax(avail.left(), mg.left() - w - gap));
+        int w = qRound(mg.width() * 2.0 / 3.0);
+        int h = mg.height();
+        if (!aiAvail.isEmpty()) {
+            w = qBound(460, w, qMax(460, aiAvail.width()));
+            h = qBound(520, h, qMax(520, aiAvail.height()));
+        }
+        m_aiDock->resize(w, h);
+        const int gap = 12;
+        QPoint pos(mg.right() + gap, mg.y());
+        if (!aiAvail.isEmpty()) {
+            if (pos.x() + w > aiAvail.right())
+                pos.setX(qMax(aiAvail.left(), mg.left() - w - gap));
+            if (pos.y() + h > aiAvail.bottom())
+                pos.setY(qMax(aiAvail.top(), aiAvail.bottom() - h));
         }
         m_aiDock->move(pos);
+    } else if (!aiAvail.isEmpty()) {
+        const QRect frame = m_aiDock->frameGeometry();
+        const int overW = frame.width() - aiAvail.width();
+        const int overH = frame.height() - aiAvail.height();
+        if (overW > 0 || overH > 0) {
+            const QSize s = m_aiDock->size();
+            m_aiDock->resize(qMax(460, s.width() - qMax(0, overW)),
+                             qMax(520, s.height() - qMax(0, overH)));
+        }
     }
     m_aiDock->hide();
     m_aiDock->setDocumentReader(
@@ -2941,6 +2985,14 @@ void MainWindow::ensureAiDock()
     m_aiDock->setContextProvider([this]{return aiDocumentContext();});
     m_aiDock->setInsertHandler(
         [this](const QString &id,const QString &text) { return insertAiText(id,text); });
+    // 顶栏模型名 → 供应商/模型两级切换(一个网址可挂多个模型)
+    m_aiDock->setModelSwitch(
+        [this](const QString &provider, const QString &model) {
+            m_aiStore.setCurrentModel(provider, model);
+            m_aiStore.setCurrent(provider);
+            applyCurrentAiProvider();
+        },
+        [this] { return m_aiStore.all(); });
     connect(m_aiDock, &AiChatDock::configRequested, this, [this] {
         openAiConfig(m_aiDock, m_aiDock->isLightTheme() ? QStringLiteral("light") : QStringLiteral("dark"));
     });
@@ -2957,6 +3009,35 @@ void MainWindow::toggleAiDock()
 {
     ensureAiDock();
     m_aiDock->setVisible(!m_aiDock->isVisible());
+    if (m_aiDock->isVisible()) {
+        // 打开时必须弹到前台并抢焦点:只 setVisible 会藏在主窗口后面,
+        // 用户得去任务栏点(独立顶层窗口的默认行为)。
+        // Qt 的 activateWindow 受 Windows 前台锁定限制经常静默失败,
+        // 用 Win32 AttachThreadInput + SetForegroundWindow 强制置前。
+        m_aiDock->show();
+        m_aiDock->raise();
+        m_aiDock->activateWindow();
+        if (HWND hwnd = reinterpret_cast<HWND>(m_aiDock->winId())) {
+            const HWND foreground = GetForegroundWindow();
+            if (foreground && foreground != hwnd) {
+                const DWORD fgThread = GetWindowThreadProcessId(foreground, nullptr);
+                const DWORD thisThread = GetCurrentThreadId();
+                if (fgThread != thisThread && AttachThreadInput(thisThread, fgThread, TRUE)) {
+                    SetForegroundWindow(hwnd);
+                    AttachThreadInput(thisThread, fgThread, FALSE);
+                } else {
+                    SetForegroundWindow(hwnd);
+                }
+            } else {
+                SetForegroundWindow(hwnd);
+            }
+            // 附加兜底:窗口样式加最顶层再立即撤销,绕过前台锁定
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
     if (m_aiToggleAction && m_aiToggleAction->isChecked() != m_aiDock->isVisible())
         m_aiToggleAction->setChecked(m_aiDock->isVisible());
 }
@@ -3101,7 +3182,8 @@ void MainWindow::closeEvent(QCloseEvent *event)
         QStringList names;
         for(int i:dirty) {
             names.append(m_tabs[i].path.isEmpty() ? tr("未命名文档") : QFileInfo(m_tabs[i].path).fileName());
-            m_tabs[i].autoSave->stop();
+            if (m_tabs[i].autoSave)   // PDF 标签没有 autoSave
+                m_tabs[i].autoSave->stop();
         }
         const auto ret = UiDialogs::confirmSave(this,m_theme,names,true);
         if (ret == UiDialogs::SaveChoice::Cancel) {
@@ -3146,8 +3228,10 @@ void MainWindow::closeEvent(QCloseEvent *event)
     // 记住布局与打开的文件(几何异常时不落盘,防止坏值反复复活)
     {
         const QRect g = normalGeometry();
-        const QRect avail = this->screen()->availableGeometry();
-        const bool sane = g.width() >= 600 && g.height() >= 400 && avail.intersects(g);
+        // 拔屏/会话结束时 screen() 可能为空:无法验证几何就照常保存,别丢用户布局
+        const QRect avail = this->screen() ? this->screen()->availableGeometry() : QRect();
+        const bool sane = avail.isEmpty()
+                          || (g.width() >= 600 && g.height() >= 400 && avail.intersects(g));
         QSettings geo;
         if (sane)
             geo.setValue(QStringLiteral("geometry"), saveGeometry());

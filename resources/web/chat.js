@@ -7,7 +7,7 @@
     const context = document.querySelector('#context');
     const records = new Map();
     const post = data => window.chrome?.webview?.postMessage(data);
-    window.addEventListener('error', event => post({t:'chatError',message:event.message}));
+    window.addEventListener('error', event => post({t:'chatError',message:event.message,sequence:window.chatViewSequence ?? -1}));
     const lute = Lute.New();
     if (lute.SetSanitize) lute.SetSanitize(true);
     if (lute.SetInlineMathAllowDigitAfterOpenMarker) lute.SetInlineMathAllowDigitAfterOpenMarker(true);
@@ -131,11 +131,31 @@
             else markdown(d.preferLatex ? window.msLatexPreference.normalize(d.text) : d.text, content);
             record.renderedText = d.text;
             record.renderedPreferLatex = !!d.preferLatex;
+            record.renderedImages = '';  // textContent 会清空内容,图片行必须重建
+        }
+        // 用户消息的图片附件(截图):显示原图,不再只是"📎 截图"文字
+        const imgKey = (d.kind === 0 && Array.isArray(d.images))
+            ? d.images.map(im => (im.n || '') + ':' + (im.src || '').length).join('|') : '';
+        if (imgKey && record.renderedImages !== imgKey) {
+            record.renderedImages = imgKey;
+            let box = content.querySelector('.attach-imgs');
+            if (!box) { box = document.createElement('div'); box.className = 'attach-imgs'; content.append(box); }
+            box.replaceChildren();
+            for (const im of d.images) {
+                const img = document.createElement('img');
+                img.className = 'attach-img';
+                img.src = im.src;
+                img.alt = im.n || '图片';
+                img.title = im.n || '';
+                box.append(img);
+            }
         }
         content.classList.toggle('streaming', d.kind === 1 && !d.finalized);
         const actions = el.querySelector('.actions'); actions.replaceChildren();
         if (d.kind === 0 || d.finalized) {
             actions.append(button('复制', 'copy'));
+            // 用户消息多一个"复制进询问框":原文回填输入框,改完再发
+            if (d.kind === 0) actions.append(button('复制进询问框', 'askEdit'));
             if (d.kind === 1) { const b=button('重新生成', 'regenerate'); b.disabled=busy; actions.append(b); }
         }
         if (d.meta) { const meta=document.createElement('span'); meta.className='meta'; meta.textContent=d.meta; actions.append(meta); }
@@ -149,7 +169,20 @@
     }
     window.chatView = {
         scrollToBottom,
+        setTheme(light) {
+            try {
+                if (!document.documentElement) return false;
+                document.documentElement.dataset.theme = light ? 'light' : 'dark';
+                const codeTheme = document.querySelector('#codeTheme');
+                if (codeTheme)
+                    codeTheme.href = `vditor/dist/js/highlight.js/styles/github${light?'':'-dark'}.min.css`;
+                return true;
+            } catch (_) {
+                return false;
+            }
+        },
         update(payload) {
+            window.chatViewSequence = payload.sequence;
             if (payload.reset) { records.clear(); root.replaceChildren(); follow = true; }
             busy = payload.busy;
             const theme = payload.light ? 'light' : 'dark';
@@ -174,7 +207,7 @@
             window.msWaitForRender(root).then(() => {
                 if (ticket === paintTicket) post({t:'chatRendered', count:records.size, sequence:payload.sequence});
             }, () => {
-                if (ticket === paintTicket) post({t:'chatError', message:'Conversation rendering failed'});
+                if (ticket === paintTicket) post({t:'chatError', message:'Conversation rendering failed', sequence:payload.sequence});
             });
         }
     };
@@ -193,6 +226,10 @@
         const record=records.get(Number(b.closest('article')?.dataset.id));
         switch (b.dataset.action) {
             case 'copy': copy(record.data.text); break;
+            case 'askEdit':
+                // 去掉"📎 附件名"尾巴,只把问题正文回填输入框
+                post({t:'chatAskEdit', text: record.data.text.replace(/\n+📎[^\n]*$/, '')});
+                break;
             case 'copyCode': copy(b._copyText); break;
             case 'copyAll': copy(allMarkdown()); break;
             case 'copySelection': copy(b._copyText); break;

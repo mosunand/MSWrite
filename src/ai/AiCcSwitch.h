@@ -18,11 +18,12 @@ struct AiCcProvider {
     QString apiKey;
     QString baseUrl;
     QString model;   // 原样保留，包括 [1M] 等网关后缀
+    QJsonObject sourceConfig;
 };
 
 class AiCcSwitch {
 public:
     static QString dbPath(); // CC_SWITCH_HOME 或 ~/.cc-switch/cc-switch.db
-    static QVector<AiCcProvider> listAll();
+    static QVector<AiCcProvider> listAll(QString *error = nullptr);
     static AiCcProvider loadCurrent(); // 优先 claude 系当前项
 };

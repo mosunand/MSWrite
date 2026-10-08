@@ -3,9 +3,10 @@
 // ReadDocument 按需读取当前文档; Insert 经 GUI 线程写入光标处。
 
 #include <QObject>
-#include <QPointer>
 #include <QString>
 #include <QVector>
+
+#include <atomic>
 
 #include "ai/Llm.h"
 #include "ai/Types.h"
@@ -17,13 +18,14 @@ class AiWorker : public QObject {
 public:
     explicit AiWorker(QObject *parent = nullptr);
 
-    // dock 用 QPointer:窗口先一步销毁(退出托管回收路径)时自动置空,
-    // 裸指针在 BlockingQueued/排队回调里会悬垂
     void setDock(AiChatDock *dock) { dock_ = dock; }
 
     void applyConfig(const AiLlmConfig &cfg);
     void setTransport(Llm::Transport transport) { llm_.setTransport(std::move(transport)); }
     bool hasProvider() const { return !cfg_.apiKey.isEmpty(); }
+    // GUI 侧关窗/退出前调用:跨线程原子置位,worker 立即放弃后续 GUI 回调,
+    // 不再卡在 BlockingQueuedConnection 里拖死线程退出
+    void requestStop() { stop_.store(true); }
     void clearHistory() { history_.clear(); }
     // 会话持久化(均要求工作线程空闲时调用)
     QVector<ChatMessage> historySnapshot() const { return history_; }
@@ -33,29 +35,10 @@ public:
         if (keepCount >= 0 && keepCount < history_.size())
             history_.resize(keepCount);
     }
-    // "重新生成"用:截到第 occurrence 条文本等于 text 的用户消息(含)。
-    // GUI 行号与 worker 历史不是同一序列(思考/通知行、tool 消息都无对应),
-    // 旧实现拿 GUI 行号直接当下标会切错位置。按内容+序数定位与显示层无关。
-    void truncateAtUserMessage(const QString &text, int occurrence)
-    {
-        int seen = 0;
-        for (int i = 0; i < history_.size(); ++i) {
-            const ChatMessage &m = history_.at(i);
-            if (m.role == QLatin1String("user") && m.text == text) {
-                ++seen;
-                if (seen == occurrence) {
-                    history_.resize(i + 1);
-                    return;
-                }
-            }
-        }
-        // 找不到(历史被裁剪过等):不截断,保留现状 —— 错切会造出
-        // "有 tool_use 没 tool_result"的非法序列,网关直接 400
-    }
 
 public slots:
     void run(const QString &userText, const QString &docMarkdown,
-             int writeMode, int thinkLevel, const QVector<AiAttach> &images);
+             int writeMode, const QString &thinkEffort, const QVector<AiAttach> &images);
 
 signals:
     void textDelta(const QString &text);
@@ -72,5 +55,6 @@ private:
     AiLlmConfig cfg_;
     Llm llm_;
     QVector<ChatMessage> history_;
-    QPointer<AiChatDock> dock_ = nullptr;
+    AiChatDock *dock_ = nullptr;
+    std::atomic_bool stop_ = false; // GUI 请求终止:GUI 回调走超时放行,不再无限阻塞
 };

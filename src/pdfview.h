@@ -25,8 +25,6 @@ public:
 
     bool load(const QString &path);  // false = 加载失败
     QString path() const { return m_path; }
-    // 最近一次 load 的失败原因(加密/损坏/权限),给上层区分提示用
-    QString lastLoadError() const { return m_lastError; }
     int pageCount() const;
     int currentPage() const;         // 0-based
 
@@ -104,7 +102,6 @@ private:
     QPushButton *m_searchPrevBtn = nullptr;
 
     QString m_path;
-    QString m_lastError;
     bool m_loaded = false;
     bool m_spinGuard = false;
 };

@@ -3,6 +3,7 @@
 #include <QWidget>
 #include <QJsonObject>
 #include <QStringList>
+#include <QTimer>
 #include <functional>
 
 // 承载 WebView2(系统自带 Chromium)的 Qt 原生控件。
@@ -47,6 +48,11 @@ public:
     // 打开开发者工具(Shift+F12)
     void openDevTools();
 
+    // 整链重建:关闭现有 COM 控制器与页面,用原参数完全重新创建。
+    // 用于页面进入无法自愈的死态(消息管道断/渲染永挂)时的终极自愈,
+    // 等效于重启整个 WebView2 实例,但不影响同进程的其他宿主。
+    void recreateBrowser();
+
     // 整页缩放(WebView2 原生 ZoomFactor,Chrome 同款行为):
     // factor 1.0 = 100%;范围钳制 0.5~2.0
     void setZoomFactor(double factor);
@@ -70,6 +76,7 @@ public:
     static QString environmentError();
 
     bool isPageReady() const { return m_pageReady; }
+    bool isClosing() const { return m_closing; }
 
 signals:
     void pageReady();                 // 首次导航完成
@@ -83,11 +90,11 @@ protected:
     void showEvent(QShowEvent *event) override;
     void hideEvent(QHideEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
+    void retryLoading();   // 子类自愈用(对话页转圈卡死时自动重载)
 
 private:
     friend struct Impl;
     void raiseLoading();
-    void retryLoading();
     struct Impl;
     Impl *d = nullptr;
 
@@ -96,4 +103,11 @@ private:
     bool m_closing = false;
     QStringList m_pendingScripts;
     QWidget *m_loading = nullptr;
+    // WebView2 控制器创建的确定性兜底:CreateCoreWebView2Controller 的完成
+    // 回调在父窗口隐藏等场景下会被静默吞掉(无成功也无失败回调),页面永久
+    // 转圈。创建后 12s 内没拿到控制器就自动重试;窗口不可见时先挂起,等
+    // showEvent 再建(WebView2 要求创建时父窗口可见)。
+    QTimer m_ctrlWatchdog;
+    bool m_createOnShow = false;
+    qint64 m_lastRecreateAt = 0;   // 上次整链重建时刻:600ms 内的重复触发合并
 };

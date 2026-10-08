@@ -28,15 +28,39 @@
         overflow: visible !important;
     }
     /* Keep a clickable line when Enter creates an empty paragraph. */
-    .vditor-ir pre.vditor-reset p:empty { min-height: 1.75em; }
+    .vditor-ir pre.vditor-reset p:empty { min-height: calc(var(--ms-line-height, 1.0) * 1em); }
     /* 隐藏代码块的"复制"悬浮按钮:Typora 没有它,且它带一个 textarea,
        在空代码块上会占据整块、看起来像一团莫名其妙的灰块 */
     .vditor-copy { display: none !important; }
     .vditor { border: 0 !important; border-radius: 0 !important; }
     .vditor-content { background: transparent !important; }
 
-    /* 字号(由宿主 setFontSize 调整) */
-    .vditor-reset { font-size: var(--ms-font-size, 16px); }
+    /* 字号(由宿主 setFontSize 调整);正文行距由 --ms-line-height 控制
+       (默认 1.0,偏好设置可调 1.0~2.2)。代码块/公式的行距【固定独立】,
+       不随正文行距变 —— 代码卡片两态(编辑/预览)都用同一固定值,
+       点击位置映射依旧成立 */
+    .vditor-reset { font-size: var(--ms-font-size, 16px); line-height: var(--ms-line-height, 1.0); }
+    .vditor-ir div[data-type="code-block"] pre.vditor-ir__marker--pre,
+    .vditor-ir div[data-type="code-block"] pre.vditor-ir__marker--pre code,
+    .vditor-ir div[data-type="code-block"] .vditor-ir__preview pre.vditor-reset,
+    .vditor-wysiwyg div[data-type="code-block"] pre,
+    .vditor-wysiwyg div[data-type="code-block"] pre code,
+    .vditor-reset pre > code { line-height: 1.7 !important; }
+    .vditor-reset .katex,
+    .vditor-reset .katex-display { line-height: normal; }
+
+    /* 引用块:用户明确不要「竖线 + 右侧变浅色」的样式 —— 改为无竖线的
+       圆角底色卡片,文字用正常色,靠底色区分(粘贴进来的旧引用同样生效)。
+       !important:Vditor 运行时把内容主题 CSS 动态注入 head 末尾,必须压住 */
+    .vditor-reset blockquote {
+        border-left: none !important;
+        color: inherit !important;
+        background: var(--quote-background, rgba(91, 141, 239, 0.07)) !important;
+        border-radius: 8px;
+        padding: 8px 14px;
+        margin: 10px 0;
+    }
+    .vditor-reset blockquote p { margin: 4px 0; }
 
     /* Align prose beside Markdown images with the image center. Exclude
        emoji and math assets; expanded image sources keep their block preview. */
@@ -88,12 +112,9 @@
         opacity: 1;
     }
 
-    /* 标题标记(# 与 H1~H6 徽标)默认全部隐藏,只有被鼠标点过的那一个标题
-       显示(ms-show-marker 由 bridge.js 的 mousedown 监听维护)。
-       注意:不能挂 Vditor 的 --expand 类 —— Ctrl+1~6 之后光标留在标题里,
-       Vditor 会自动加 --expand,# 号立刻冒出来。与光标解耦、只认点击,
-       才是 Typora 式的干净排版。仅视觉隐藏,data-marker 与标记文本仍在
-       DOM 里,markdown 往返不受影响 */
+    /* 标题标记(# 与 H1~H6 徽标)一律不显示 —— 对齐 Typora:标题就是大字,
+       不出现 # 号。仅视觉隐藏,data-marker 与标记文本仍在 DOM 里,
+       markdown 往返不受影响 */
     .vditor-ir h1::before,
     .vditor-ir h2::before,
     .vditor-ir h3::before,
@@ -109,20 +130,6 @@
     .vditor-ir h5 .vditor-ir__marker--heading,
     .vditor-ir h6 .vditor-ir__marker--heading {
         display: none !important;
-    }
-    .vditor-ir h1.ms-show-marker::before { content: 'H1' !important; }
-    .vditor-ir h2.ms-show-marker::before { content: 'H2' !important; }
-    .vditor-ir h3.ms-show-marker::before { content: 'H3' !important; }
-    .vditor-ir h4.ms-show-marker::before { content: 'H4' !important; }
-    .vditor-ir h5.ms-show-marker::before { content: 'H5' !important; }
-    .vditor-ir h6.ms-show-marker::before { content: 'H6' !important; }
-    .vditor-ir h1.ms-show-marker .vditor-ir__marker--heading,
-    .vditor-ir h2.ms-show-marker .vditor-ir__marker--heading,
-    .vditor-ir h3.ms-show-marker .vditor-ir__marker--heading,
-    .vditor-ir h4.ms-show-marker .vditor-ir__marker--heading,
-    .vditor-ir h5.ms-show-marker .vditor-ir__marker--heading,
-    .vditor-ir h6.ms-show-marker .vditor-ir__marker--heading {
-        display: inline !important;
     }
 
     /* 代码块:对齐 Typora —— 一张卡片,左侧行号,语法高亮。
@@ -491,6 +498,13 @@
     .vditor-ir .ms-mi.ms-mi-active > .vditor-ir__marker--pre {
         display: inline !important;
     }
+    .vditor-ir .ms-mi.ms-mi-active > code[data-type="math-inline"] {
+        color: #a000c8;
+        background: transparent;
+    }
+    body[data-ms-theme="dark"] .vditor-ir .ms-mi.ms-mi-active > code[data-type="math-inline"] {
+        color: #e1a4ff;
+    }
     /* 编辑态的渲染结果不进文档流:由下方悬浮气泡承载(#ms-math-pop) */
     .vditor-ir .ms-mi.ms-mi-active > .vditor-ir__preview {
         display: none !important;
@@ -601,8 +615,9 @@
     <script defer src="vditor/dist/js/highlight.js/highlight.min.js"></script>
     <script defer id="vditorKatexScript" src="vditor/dist/js/katex/katex.min.js"></script>
     <script defer id="vditorKatexChemScript" src="vditor/dist/js/katex/mhchem.min.js"></script>
-<script defer src="latex-preference.js?v=136"></script>
-<script defer src="render-ready.js?v=143"></script>
-<script defer src="bridge.js?v=144"></script>
+<script defer src="strong-spacing.js?v=161"></script>
+<script defer src="latex-preference.js?v=161"></script>
+<script defer src="render-ready.js?v=144"></script>
+<script defer src="bridge.js?v=161"></script>
 </body>
 </html>

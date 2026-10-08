@@ -6,5 +6,6 @@
         <file alias="tab-close.png">../purple.png</file>
         <file alias="tab-close-hover.png">../red.png</file>
         <file alias="pdf/Reader.qml">pdf/Reader.qml</file>
+        <file alias="icons/check-green.svg">icons/check-green.svg</file>
     </qresource>
 </RCC>

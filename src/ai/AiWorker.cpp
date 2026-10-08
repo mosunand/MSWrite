@@ -3,6 +3,7 @@
 #include "ai/AiWorker.h"
 
 #include "ai/AiChatDock.h"
+#include "ai/LlmCodec.h"
 #include "ai/MswriteSkill.h"
 
 #include <QElapsedTimer>
@@ -10,7 +11,6 @@
 #include <QJsonObject>
 #include <QMetaObject>
 #include <QUuid>
-#include <QRegularExpression>
 #include <QJsonDocument>
 #include <QSemaphore>
 #include <QPointer>
@@ -27,56 +27,8 @@ constexpr int kHistoryCap = 40; // 发给模型的最大历史条数(从用户�
 
 namespace {
 
-// 从 text 中提取 DSML 工具调用并清理裸标签
-void parseStrayToolCalls(ChatResponse &resp)
-{
-    // DSML 格式:<｜DSML｜｜ invoke name="Insert"><｜DSML｜｜ parameter name="text" string="true">内容</｜DSML｜｜ parameter></｜DSML｜｜ invoke>
-    // 全角竖线 U+FF5C;匹配 invoke...parameter...value.../invoke 整段。
-    // 旧版正则两处笔误(竖线数量与注释格式不符、结尾 "/uFF5C?" 丢了反斜杠),
-    // 实测从未匹配过任何输入 —— 本版经样例实测:名称/参数/值三组均正确捕获
-    static const QRegularExpression invokeRe(
-        QStringLiteral("<\uFF5C+DSML\uFF5C+\\s*invoke\\s+name=\"([^\"]+)\"[^>]*>"
-                       "[\\s\\S]*?"
-                       "<\uFF5C+DSML\uFF5C+\\s*parameter\\s+name=\"([^\"]*)\"[^>]*>([\\s\\S]*?)"
-                       "</\uFF5C+DSML\uFF5C+\\s*parameter>"
-                       "[\\s\\S]*?"
-                       "</\uFF5C+DSML\uFF5C+\\s*invoke>"));
-    static const QRegularExpression tagRe(
-        QStringLiteral("(?:</?)\uFF5C+DSML\uFF5C+[^>]*>"));
-
-    bool found = false;
-    QString cleaned;
-    cleaned.reserve(resp.text.size());
-    qsizetype prev = 0;
-    auto it = invokeRe.globalMatch(resp.text);
-    while (it.hasNext()) {
-        const auto m = it.next();
-        found = true;
-        const QString toolName = m.captured(1);
-        const QString paramName = m.captured(2);
-        const QString paramValue = m.captured(3);
-
-        if (toolName == QLatin1String("Insert") && paramName == QLatin1String("text")) {
-            ToolCall tc;
-            tc.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
-            tc.name = toolName;
-            QJsonObject input;
-            input.insert(paramName, paramValue);
-            tc.input = input;
-            resp.toolCalls.push_back(tc);
-            qWarning() << "Mswrite: DSML 正文工具调用已提取(" << paramValue.size() << "字)";
-        }
-        cleaned += resp.text.mid(prev, m.capturedStart() - prev);
-        prev = m.capturedEnd();
-    }
-    if (!found)
-        return;
-    cleaned += resp.text.mid(prev);
-
-    // 清除所有残漏的 DSML 标签(包装 calls / 独立 parameter 闭标签等)
-    cleaned.remove(tagRe);
-    resp.text = cleaned.trimmed();
-}
+// DeepSeek 系模型偶尔把工具调用写进 text 而非 tool_calls:
+// 提取逻辑在 LlmCodec::extractStrayToolCalls(实现与单测同处一文件)。
 
 } // namespace
 
@@ -167,24 +119,26 @@ void AiWorker::applyConfig(const AiLlmConfig &cfg)
 
 QString AiWorker::runInsert(const QString &text)
 {
-    if (!dock_)
+    if (!dock_ || stop_.load())
         return QStringLiteral("Error: no document window");
-    // 跨线程插入改用"排队 + 信号量 + 超时",替代 BlockingQueuedConnection:
-    // 后者在 GUI 线程销毁 dock 时永远不会返回(事件无主可投递),worker 卡死、
-    // 析构 wait() 超时后销毁运行中的线程 —— 即退出崩溃的根源。排队调用随
-    // dock 析构自动丢弃,QPointer 守卫兜底,超时后以错误继续。
+    // 跨线程回调 GUI 执行插入并回传结果:Queued + 信号量等待(与 readDocument
+    // 同模式),带超时兜底。原先的 BlockingQueuedConnection 在 GUI 忙于模态
+    // 对话框/退出时会让工作线程永久挂起,wait() 超时后销毁仍在运行的 QThread
+    // 直接 qFatal(退出偶发闪退的根源)。
     struct InsertState { QSemaphore ready; QString result; };
     auto state = std::make_shared<InsertState>();
-    QMetaObject::invokeMethod(dock_, [guard = QPointer<AiChatDock>(dock_), text, state] {
+    QMetaObject::invokeMethod(dock_, [guard = QPointer<AiChatDock>(dock_), state, text] {
         if (!guard) {
             state->result = QStringLiteral("Error: document window closed");
-        } else {
-            state->result = guard->insertAtCursor(text);
+            state->ready.release();
+            return;
         }
+        state->result = guard->insertAtCursor(text);
         state->ready.release();
     }, Qt::QueuedConnection);
-    if (!state->ready.tryAcquire(1, 8000))
-        return QStringLiteral("Error: document window is busy; the text was not inserted.");
+    // 5 秒未完成视为 GUI 不可达:放弃插入,轮次以错误收尾而不是挂死
+    if (!state->ready.tryAcquire(1, 5000))
+        return QStringLiteral("Error: document window busy; insert skipped");
     return state->result;
 }
 
@@ -205,22 +159,16 @@ AiDocumentResult AiWorker::readDocument(const QJsonObject &request)
 }
 
 void AiWorker::run(const QString &userText, const QString &docMarkdown,
-                   int writeMode, int thinkLevel, const QVector<AiAttach> &images)
+                   int writeMode, const QString &thinkEffort, const QVector<AiAttach> &images)
 {
-    // 纯附件(空文本 + 带图)是合法输入:补一条默认指令让模型看图干活。
-    QString prompt = userText;
-    if (prompt.trimmed().isEmpty() && !images.isEmpty())
-        prompt = QStringLiteral("请查看我发送的图片附件并按要求处理。");
-    if (prompt.trimmed().isEmpty()) {
-        // 防御路径:绝不静默返回 —— busyChanged 不配对会把面板永久卡在忙态
-        emit busyChanged(true);
-        emit turnFinished(QStringLiteral("没有可发送的内容"));
+    if (userText.trimmed().isEmpty() && images.isEmpty()) {
+        emit turnFinished(QStringLiteral("请输入文字或添加图片"));
         emit busyChanged(false);
         return;
     }
-    qWarning() << "Mswrite: AI 轮次开始(输入" << prompt.size()
+    qWarning() << "Mswrite: AI 轮次开始(输入" << userText.size()
                << "字,文档" << docMarkdown.size()
-               << "字,写入模式" << writeMode << ",思考" << thinkLevel
+               << "字,写入模式" << writeMode << ",思考" << thinkEffort
                << ",图片" << images.size() << "张)";
     // 防御:配置未生效(Key 为空)时不发 doomed 请求,给出明确提示
     if (cfg_.apiKey.isEmpty()) {
@@ -233,12 +181,12 @@ void AiWorker::run(const QString &userText, const QString &docMarkdown,
     emit busyChanged(true);
 
     // 思考程度随轮次生效(模型不支持时 Llm 会剥参自动降级重试)
-    cfg_.thinkLevel = thinkLevel;
+    cfg_.thinkEffort = thinkEffort;
     llm_.setConfig(cfg_);
 
     ChatMessage u;
     u.role = QStringLiteral("user");
-    u.text = prompt;
+    u.text = userText;
     u.images = images;
     history_.push_back(u);
 
@@ -261,6 +209,11 @@ void AiWorker::run(const QString &userText, const QString &docMarkdown,
     bool retried = false; // 网络/服务端错误自动重试(仅一次)
 
     for (int turn = 1; turn <= kMaxTurns; ++turn) {
+        // GUI 已请求终止(关窗/退出):不再发起请求与 GUI 回调,立即收尾
+        if (stop_.load()) {
+            error = QStringLiteral("已中断");
+            break;
+        }
         // 文档内容随轮次重建:AI 自己插入的内容也在其历史(tool 结果)里
         const QString system = MswriteSkill::withContext(docMarkdown, writeMode,skills);
 
@@ -299,11 +252,9 @@ void AiWorker::run(const QString &userText, const QString &docMarkdown,
             break;
         }
         if (!resp.error.isEmpty()) {
-            // 网络/服务端类错误自动重试一次(4xx 客户端错误不重试);
-            // 本轮已经流出过正文则不重试 —— 重试会把两段正文拼进同一气泡
-            const bool retryable = (resp.httpStatus == 0   // 超时/断连
-                                 || resp.httpStatus >= 500) // 网关故障
-                                && streamedTurnText.isEmpty();
+            // 网络/服务端类错误自动重试一次(4xx 客户端错误不重试)
+            const bool retryable = resp.httpStatus == 0   // 超时/断连
+                                 || resp.httpStatus >= 500; // 网关故障
             if (retryable && turn == 1 && !retried) {
                 retried = true;
                 emit thinkingDelta(QStringLiteral("网络波动,自动重试…"));
@@ -321,7 +272,7 @@ void AiWorker::run(const QString &userText, const QString &docMarkdown,
 
         // DeepSeek 系模型偶尔把工具调用写进 text 而非 tool_calls:
         // 从正文提取成正式 ToolCall,清除裸 DSML 标签
-        parseStrayToolCalls(resp);
+        LlmCodec::extractStrayToolCalls(resp);
         // Some gateways return a complete response without streaming deltas.
         // The final response must still reach the conversation model.
         if(streamedTurnText.isEmpty() && !resp.text.isEmpty()) sink.onText(resp.text);

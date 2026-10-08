@@ -15,6 +15,9 @@
 #include <QUrl>
 #include <QUuid>
 
+static AiModelCfg modelFromJson(const QJsonObject &o);
+static QJsonObject modelToJson(const AiModelCfg &m);
+
 namespace {
 
 AiProvider fromJson(const QJsonObject &o)
@@ -22,10 +25,7 @@ AiProvider fromJson(const QJsonObject &o)
     AiProvider p;
     p.id = o.value(QStringLiteral("id")).toString();
     p.name = o.value(QStringLiteral("name")).toString();
-    p.protocol = (o.value(QStringLiteral("protocol")).toString().trimmed().toLower()
-                  == QLatin1String("openai"))
-                     ? Protocol::OpenAi
-                     : Protocol::Anthropic;
+    p.protocol = protocolFromName(o.value(QStringLiteral("protocol")).toString(QStringLiteral("anthropic")));
     p.apiKey = o.value(QStringLiteral("apiKey")).toString();
     p.baseUrl = o.value(QStringLiteral("baseUrl")).toString();
     // 模型名原样保留([1M] 等后缀是网关约定,由用户自己写进模型名)
@@ -35,6 +35,22 @@ AiProvider fromJson(const QJsonObject &o)
     p.maxTokens = o.value(QStringLiteral("maxTokens")).toInt(0);
     p.importedFrom = o.value(QStringLiteral("importedFrom")).toString();
     p.importedId = o.value(QStringLiteral("importedId")).toString();
+    p.sourceConfig = o.value(QStringLiteral("sourceConfig")).toObject();
+    // 模型列表:新格式直读;旧格式(单 model 字段)迁移成一个模型条目
+    const QJsonArray ms = o.value(QStringLiteral("models")).toArray();
+    for (const QJsonValue &v : ms) {
+        AiModelCfg m = modelFromJson(v.toObject());
+        if (!m.id.isEmpty())
+            p.models.push_back(m);
+    }
+    p.currentModel = o.value(QStringLiteral("currentModel")).toString();
+    if (p.models.isEmpty() && !p.model.isEmpty()) {
+        AiModelCfg m;
+        m.id = p.model;
+        m.maxOutput = p.maxTokens;
+        p.models.push_back(m);
+        p.currentModel = p.model;
+    }
     while (p.baseUrl.endsWith(QLatin1Char('/')))
         p.baseUrl.chop(1);
     if (p.id.isEmpty())
@@ -44,17 +60,23 @@ AiProvider fromJson(const QJsonObject &o)
 
 QJsonObject toJson(const AiProvider &p)
 {
+    QJsonArray models;
+    for (const AiModelCfg &m : p.models)
+        models.append(modelToJson(m));
     return QJsonObject{
         { QStringLiteral("id"), p.id },
         { QStringLiteral("name"), p.name },
         { QStringLiteral("protocol"), protocolName(p.protocol) },
         { QStringLiteral("apiKey"), p.apiKey },
         { QStringLiteral("baseUrl"), p.baseUrl },
-        { QStringLiteral("model"), p.model },
+        { QStringLiteral("model"), p.effectiveModelId() },
         { QStringLiteral("contextWindow"), p.contextWindow },
-        { QStringLiteral("maxTokens"), p.maxTokens },
+        { QStringLiteral("maxTokens"), p.effectiveMaxTokens() },
+        { QStringLiteral("models"), models },
+        { QStringLiteral("currentModel"), p.effectiveModel() ? p.effectiveModel()->id : p.currentModel },
         { QStringLiteral("importedFrom"), p.importedFrom },
         { QStringLiteral("importedId"), p.importedId },
+        { QStringLiteral("sourceConfig"), p.sourceConfig },
     };
 }
 
@@ -65,8 +87,8 @@ void normalizeModel(AiProvider &)
 
 bool usable(const AiProvider &p)
 {
-    return !p.apiKey.trimmed().isEmpty() && !p.baseUrl.trimmed().isEmpty()
-        && !p.model.trimmed().isEmpty();
+    return p.protocol != Protocol::Unsupported && !p.apiKey.trimmed().isEmpty() && !p.baseUrl.trimmed().isEmpty()
+        && !p.effectiveModelId().trimmed().isEmpty();
 }
 
 QString normalizedUrl(QString url)
@@ -123,10 +145,13 @@ AiProviderStore::AiProviderStore(const QString &path)
     }
     const QJsonObject root = doc.object();
     autoImportCcSwitch_ = root.value(QStringLiteral("autoImportCcSwitch")).toBool(true);
+    const QString app = root.value(QStringLiteral("ccSwitchApp")).toString();
+    if (app == QLatin1String("claude") || app == QLatin1String("codex") || app == QLatin1String("gemini")) ccSwitchApp_ = app;
     for (const auto &v : root.value(QStringLiteral("ignoredCcSwitch")).toArray()) {
         if (v.isString())
             ignoredCcSwitch_ << v.toString();
     }
+    lastFollowedCcId_ = root.value(QStringLiteral("lastFollowedCcId")).toString();
     current_ = root.value(QStringLiteral("current")).toString();
     const QJsonArray arr = root.value(QStringLiteral("providers")).toArray();
     QStringList names;
@@ -189,6 +214,89 @@ AiProvider *AiProviderStore::findMut(const QString &name)
     return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// 模型列表(一个网址可挂多个模型):新旧格式互转
+// ---------------------------------------------------------------------------
+
+static AiModelCfg modelFromJson(const QJsonObject &o)
+{
+    AiModelCfg m;
+    m.id = o.value(QStringLiteral("id")).toString();
+    m.contextWindow = o.value(QStringLiteral("contextWindow")).toInt(0);
+    m.maxOutput = o.value(QStringLiteral("maxOutput")).toInt(0);
+    m.smartConfig = o.value(QStringLiteral("smart")).toBool(true);
+    const QJsonArray lv = o.value(QStringLiteral("thinkLevels")).toArray();
+    if (!lv.isEmpty()) {
+        m.thinkLevels.clear();
+        for (const QJsonValue &v : lv) {
+            const QString s = v.toString().trimmed();
+            if (!s.isEmpty()) m.thinkLevels << s;
+        }
+    }
+    m.inImage = o.value(QStringLiteral("image")).toBool(false);
+    m.inVideo = o.value(QStringLiteral("video")).toBool(false);
+    m.inPdf = o.value(QStringLiteral("pdf")).toBool(false);
+    m.capStructured = o.value(QStringLiteral("structured")).toBool(false);
+    m.capSearch = o.value(QStringLiteral("search")).toBool(false);
+    m.capSystem = o.value(QStringLiteral("systemMsg")).toBool(false);
+    m.enabled = o.value(QStringLiteral("enabled")).toBool(true);
+    return m;
+}
+
+static QJsonObject modelToJson(const AiModelCfg &m)
+{
+    return QJsonObject{
+        { QStringLiteral("id"), m.id },
+        { QStringLiteral("contextWindow"), m.contextWindow },
+        { QStringLiteral("maxOutput"), m.maxOutput },
+        { QStringLiteral("smart"), m.smartConfig },
+        { QStringLiteral("thinkLevels"), QJsonArray::fromStringList(m.thinkLevels) },
+        { QStringLiteral("image"), m.inImage },
+        { QStringLiteral("video"), m.inVideo },
+        { QStringLiteral("pdf"), m.inPdf },
+        { QStringLiteral("structured"), m.capStructured },
+        { QStringLiteral("search"), m.capSearch },
+        { QStringLiteral("systemMsg"), m.capSystem },
+        { QStringLiteral("enabled"), m.enabled },
+    };
+}
+
+const AiModelCfg *AiProvider::effectiveModel() const
+{
+    if (models.isEmpty())
+        return nullptr;
+    if (!currentModel.isEmpty()) {
+        for (const AiModelCfg &m : models)
+            if (m.id == currentModel && m.enabled)
+                return &m;
+    }
+    for (const AiModelCfg &m : models)
+        if (m.enabled)
+            return &m;
+    return nullptr;
+}
+
+QString AiProvider::effectiveModelId() const
+{
+    if (const AiModelCfg *m = effectiveModel())
+        return m->id;
+    return model; // 旧格式单模型
+}
+
+int AiProvider::effectiveMaxTokens() const
+{
+    if (const AiModelCfg *m = effectiveModel())
+        return m->maxOutput;
+    return maxTokens; // 旧格式
+}
+
+QStringList AiProvider::effectiveThinkLevels() const
+{
+    if (const AiModelCfg *m = effectiveModel())
+        return m->thinkLevels;
+    return { QStringLiteral("low"), QStringLiteral("high") };
+}
+
 bool AiProviderStore::save(QString *err) const
 {
     if (!loadError_.isEmpty()) {
@@ -204,7 +312,9 @@ bool AiProviderStore::save(QString *err) const
         { QStringLiteral("current"), current_ },
         { QStringLiteral("providers"), arr },
         { QStringLiteral("autoImportCcSwitch"), autoImportCcSwitch_ },
+        { QStringLiteral("ccSwitchApp"), ccSwitchApp_ },
         { QStringLiteral("ignoredCcSwitch"), QJsonArray::fromStringList(ignoredCcSwitch_) },
+        { QStringLiteral("lastFollowedCcId"), lastFollowedCcId_ },
     };
     QSaveFile f(path_);
     if (!f.open(QIODevice::WriteOnly)) {
@@ -234,7 +344,7 @@ QString AiProviderStore::add(const AiProvider &pin)
         return QStringLiteral("API Key 不能为空");
     if (p.baseUrl.isEmpty())
         return QStringLiteral("API 地址不能为空");
-    if (p.model.isEmpty())
+    if (p.effectiveModelId().isEmpty())
         return QStringLiteral("模型不能为空");
     if (p.id.isEmpty())
         p.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -262,7 +372,7 @@ QString AiProviderStore::upsert(const AiProvider &pin, const QString &originalNa
         return QStringLiteral("API Key 不能为空");
     if (p.baseUrl.isEmpty())
         return QStringLiteral("API 地址不能为空");
-    if (p.model.isEmpty())
+    if (p.effectiveModelId().isEmpty())
         return QStringLiteral("模型不能为空");
 
     AiProvider *existing = nullptr;
@@ -286,6 +396,7 @@ QString AiProviderStore::upsert(const AiProvider &pin, const QString &originalNa
     // Editing a copied provider must retain its source identity for deduplication.
     p.importedFrom = existing->importedFrom;
     p.importedId = existing->importedId;
+    p.sourceConfig = existing->sourceConfig;
     const bool wasCurrent = existing->name.compare(current_, Qt::CaseInsensitive) == 0;
     *existing = p;
     if (wasCurrent)
@@ -331,12 +442,36 @@ QString AiProviderStore::setCurrent(const QString &name)
         return QStringLiteral("供应商 %1 需要填写 API Key、API 地址和模型").arg(p->name);
     const auto before = *this;
     current_ = p->name;
+    // 保持 lastFollowedCcId_ 不变:importFromCcSwitch(行 609) 会通过比较
+    // preferredId != lastFollowedCcId_ 来判断来源是否真的变化,实现"粘性选择"
     QString err;
     if (!save(&err)) {
         *this = before;
         return err;
     }
     return {};
+}
+
+QString AiProviderStore::setCurrentModel(const QString &providerName, const QString &modelId)
+{
+    AiProvider *p = findMut(providerName);
+    if (!p)
+        return QStringLiteral("未找到供应商:%1").arg(providerName);
+    for (const AiModelCfg &m : p->models) {
+        if (m.id == modelId) {
+            if (!m.enabled)
+                return QStringLiteral("模型 %1 已停用").arg(modelId);
+            const auto before = *this;
+            p->currentModel = modelId;
+            QString err;
+            if (!save(&err)) {
+                *this = before;
+                return err;
+            }
+            return {};
+        }
+    }
+    return QStringLiteral("未找到模型:%1").arg(modelId);
 }
 
 QString AiProviderStore::setAutoImportCcSwitch(bool enabled)
@@ -351,16 +486,28 @@ QString AiProviderStore::setAutoImportCcSwitch(bool enabled)
     return {};
 }
 
+QString AiProviderStore::setCcSwitchApp(const QString &app)
+{
+    if (app != QLatin1String("claude") && app != QLatin1String("codex") && app != QLatin1String("gemini"))
+        return QStringLiteral("未知同步来源");
+    const auto before = *this;
+    ccSwitchApp_ = app;
+    QString error;
+    if (!save(&error)) { *this = before; return error; }
+    return {};
+}
+
 int AiProviderStore::importFromCcSwitch(QString *report, bool automatic)
 {
     if (!loadError_.isEmpty()) {
         if (report) *report = loadError_;
         return -1;
     }
-    const QVector<AiCcProvider> src = AiCcSwitch::listAll();
-    if (src.isEmpty()) {
+    QString sourceError;
+    const QVector<AiCcProvider> src = AiCcSwitch::listAll(&sourceError);
+    if (!sourceError.isEmpty() || src.isEmpty()) {
         if (report)
-            *report = QStringLiteral("没有读到 cc-switch 供应商(%1)").arg(AiCcSwitch::dbPath());
+            *report = sourceError.isEmpty() ? QStringLiteral("没有读到 cc-switch 供应商(%1)").arg(AiCcSwitch::dbPath()) : sourceError;
         return -1;
     }
 
@@ -371,10 +518,13 @@ int AiProviderStore::importFromCcSwitch(QString *report, bool automatic)
     QStringList skipped;
     QStringList importedNames;
     QString preferred;
-    int preferredRank = 100;
+    QString preferredId;
+    QStringList sourceIds;
+    bool allValid = true;
 
     for (const AiCcProvider &c : src) {
-        if (!c.ok || c.apiKey.trimmed().isEmpty() || c.baseUrl.trimmed().isEmpty()) {
+        if (!c.ok) {
+            allValid = false;
             if (!c.name.isEmpty())
                 skipped << c.name;
             continue;
@@ -385,6 +535,7 @@ int AiProviderStore::importFromCcSwitch(QString *report, bool automatic)
         const QString tag = QStringLiteral("cc-switch:%1/%2").arg(c.appType, c.name);
         const QString identity = c.id.isEmpty() ? tag
             : QStringLiteral("cc-switch:%1/%2").arg(c.appType, c.id);
+        sourceIds << identity;
         if (automatic && (ignoredCcSwitch_.contains(identity) || ignoredCcSwitch_.contains(tag))) {
             skipped << wanted;
             continue;
@@ -401,29 +552,24 @@ int AiProviderStore::importFromCcSwitch(QString *report, bool automatic)
             }
         }
         if (!existing) {
-            // Legacy metadata can regain its key only when name, URL and protocol
-            // all match. A same-name provider on another endpoint is separate.
             AiProvider *named = findMut(wanted);
-            if (named && named->protocol == c.protocol
-                && normalizedUrl(named->baseUrl) == normalizedUrl(c.baseUrl)
-                && named->importedId.isEmpty())
+            if (named && named->importedFrom == tag && named->importedId.isEmpty())
                 existing = named;
         }
         if (existing) {
-            if (existing->importedFrom == tag && existing->importedId.isEmpty()) {
-                existing->importedId = identity;
-                changed = true;
-            }
-            if (existing->apiKey.trimmed().isEmpty() && existing->protocol == c.protocol
-                && normalizedUrl(existing->baseUrl) == normalizedUrl(c.baseUrl)) {
-                existing->apiKey = c.apiKey;
-                if (existing->model.trimmed().isEmpty()) existing->model = c.model;
-                existing->importedFrom = tag;
-                existing->importedId = identity;
-                ++completed;
-                changed = true;
-            } else {
-                skipped << wanted;
+            AiProvider updated = *existing;
+            if (updated.name != wanted && !find(wanted)) updated.name = wanted;
+            updated.apiKey = c.apiKey;
+            updated.baseUrl = normalizedUrl(c.baseUrl);
+            updated.model = c.model;
+            updated.protocol = c.protocol;
+            updated.sourceConfig = c.sourceConfig;
+            updated.importedFrom = tag;
+            updated.importedId = identity;
+            if (toJson(updated) != toJson(*existing)) {
+                if (current_ == existing->name) current_ = updated.name;
+                *existing = updated;
+                ++completed; changed = true;
             }
         } else {
             AiProvider p;
@@ -438,25 +584,34 @@ int AiProviderStore::importFromCcSwitch(QString *report, bool automatic)
             p.model = c.model; // 不猜测源配置缺少的模型
             p.importedFrom = tag;
             p.importedId = identity;
+            p.sourceConfig = c.sourceConfig;
             items_.push_back(p);
             existing = &items_.last();
             importedNames << p.name;
             ++added;
             changed = true;
         }
-        const int rank = c.appType.startsWith(QLatin1String("claude")) ? 0
-                       : c.appType == QLatin1String("codex") ? 1 : 2;
-        if (c.isCurrent && usable(*existing) && rank < preferredRank) {
+        if (c.isCurrent && c.appType == ccSwitchApp_ && usable(*existing)) {
             preferred = existing->name;
-            preferredRank = rank;
+            preferredId = identity;
         }
     }
 
-    if (current_.isEmpty()) {
-        current_ = preferred;
-        ensureCurrent();
-        changed |= current_ != before.current_;
+    if (allValid) {
+        for (int i = items_.size() - 1; i >= 0; --i) {
+            if (items_[i].importedId.startsWith(QLatin1String("cc-switch:")) && !sourceIds.contains(items_[i].importedId)) {
+                items_.removeAt(i); changed = true;
+            }
+        }
     }
+    // 跟随 cc-switch 的当前供应商 —— 但只在来源真的变化时:来源没变而
+    // 用户在应用内(模型切换弹层/设置)改选过,启动导入不得悄悄改回去
+    if (!preferred.isEmpty() && preferredId != lastFollowedCcId_) {
+        current_ = preferred;
+        lastFollowedCcId_ = preferredId;
+    }
+    ensureCurrent();
+    changed |= current_ != before.current_;
 
     QString err;
     if (changed && !save(&err)) {
@@ -466,10 +621,10 @@ int AiProviderStore::importFromCcSwitch(QString *report, bool automatic)
         return -1;
     }
     if (report) {
-        QString r = QStringLiteral("新增 %1 个，补全 Key %2 个，跳过 %3 个")
+        QString r = QStringLiteral("新增 %1 个，更新 %2 个，跳过 %3 个；当前同步来源：%4")
                         .arg(added)
                         .arg(completed)
-                        .arg(skipped.size());
+                        .arg(skipped.size()).arg(ccSwitchApp_);
         if (!importedNames.isEmpty())
             r += QStringLiteral(";新增:") + importedNames.join(QStringLiteral(", "));
         if (!skipped.isEmpty())

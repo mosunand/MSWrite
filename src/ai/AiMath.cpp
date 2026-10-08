@@ -236,11 +236,19 @@ struct Node {
     QVector<Node> children; // Group contents; Sup/Sub [arg]; SupSub [sup, sub]
 };
 
+// 递归深度上限:每层 '{' / '^' / '_' 嵌套占一帧。超限即停止展开,
+// 防止恶意/畸形 LaTeX 把线程栈冲爆(栈溢出必崩)。64 远超任何正常公式。
+static constexpr int kMaxLexDepth = 64;
+
 // result: node list + how far we got
-void lex(const QString& s, int from, const QString& stopCmds,
-         QVector<Node>* out, int* endPos, QString* hitCmd)
-{
-    int i = from;
+    void lex(const QString& s, int from, const QString& stopCmds,
+             QVector<Node>* out, int* endPos, QString* hitCmd, int depth = 0)
+    {
+        if (depth > kMaxLexDepth) {
+            if (endPos) *endPos = from; // 停在入口,不吞剩余输入
+            return;
+        }
+        int i = from;
     while (i < s.size()) {
         const QChar c = s.at(i);
         if (c == QLatin1Char('\\')) {
@@ -276,7 +284,7 @@ void lex(const QString& s, int from, const QString& stopCmds,
             QVector<Node> inner;
             int end = i;
             QString hc;
-            lex(s, i + 1, stopCmds, &inner, &end, &hc);
+            lex(s, i + 1, stopCmds, &inner, &end, &hc, depth + 1);
             if (hc.isEmpty()) {
                 // stopped at a bare '}' (lex returns when it sees it below)
             }
@@ -305,7 +313,7 @@ void lex(const QString& s, int from, const QString& stopCmds,
             if (k < s.size() && s.at(k) == QLatin1Char('{')) {
                 int e = k;
                 QString hc;
-                lex(s, k + 1, QString(), &arg, &e, &hc);
+                lex(s, k + 1, QString(), &arg, &e, &hc, depth + 1);
                 i = e;
                 if (i < s.size() && s.at(i) == QLatin1Char('}'))
                     ++i;
@@ -340,7 +348,8 @@ void lex(const QString& s, int from, const QString& stopCmds,
                 i = k;
             }
             // merge ^a_b into SupSub when adjacent
-            if (!out->isEmpty() && out->last().kind == Node::Sup && c == QLatin1Char('_')) {
+            // (悬空脚本符号如 "x_^\n" 会产出空 arg;first() 须先判空,空则退回普通分支)
+            if (!arg.isEmpty() && !out->isEmpty() && out->last().kind == Node::Sup && c == QLatin1Char('_')) {
                 Node& prev = out->last();
                 Node n;
                 n.kind = Node::SupSub;
@@ -349,7 +358,8 @@ void lex(const QString& s, int from, const QString& stopCmds,
                 prev = n;
                 continue;
             }
-            if (!out->isEmpty() && out->last().kind == Node::Sub && c == QLatin1Char('^')) {
+            if (!arg.isEmpty() && !out->isEmpty() && out->last().kind == Node::Sub && c == QLatin1Char('^')
+                && !out->last().children.isEmpty()) {
                 Node& prev = out->last();
                 Node n;
                 n.kind = Node::SupSub;

@@ -28,12 +28,17 @@ ChatResponse Llm::complete(const QString &system,
                            const QVector<ToolSchema> &tools,
                            StreamSink sink) const
 {
-    const QUrl url = LlmCodec::endpoint(cfg_.protocol, cfg_.baseUrl);
+    if (cfg_.protocol == Protocol::Unsupported) {
+        ChatResponse error;
+        error.error = QStringLiteral("Unsupported AI protocol");
+        return error;
+    }
+    const QUrl url = LlmCodec::endpoint(cfg_.protocol, cfg_.baseUrl, cfg_.model, false);
     const auto headers = LlmCodec::headers(cfg_.protocol, cfg_.apiKey);
     const QString model = cfg_.model; // 原样发送,不拼任何后缀
 
     if (transport_) {
-        const QByteArray body = LlmCodec::requestBody(cfg_.protocol, model, system, history, tools, false, cfg_.maxTokens, cfg_.thinkLevel);
+        const QByteArray body = LlmCodec::requestBody(cfg_.protocol, model, system, history, tools, false, cfg_.maxTokens, cfg_.thinkEffort);
         ChatResponse raw = transport_(cfg_.protocol, url, body, headers, cfg_.timeoutMs);
         if (!raw.raw.isEmpty())
             return LlmCodec::parse(cfg_.protocol, raw.httpStatus, raw.raw);
@@ -41,16 +46,18 @@ ChatResponse Llm::complete(const QString &system,
     }
 
     auto runStream = [&](bool extras) {
-        QByteArray streamBody = LlmCodec::requestBody(cfg_.protocol, model, system, history, tools, true, cfg_.maxTokens, cfg_.thinkLevel);
+        QByteArray streamBody = LlmCodec::requestBody(cfg_.protocol, model, system, history, tools, true, cfg_.maxTokens, cfg_.thinkEffort);
         if (!extras) {
             QJsonObject obj = QJsonDocument::fromJson(streamBody).object();
             obj.remove(QStringLiteral("enable_thinking"));
             obj.remove(QStringLiteral("thinking"));
             obj.remove(QStringLiteral("reasoning_effort"));
+            obj.remove(QStringLiteral("reasoning"));
             streamBody = QJsonDocument(obj).toJson(QJsonDocument::Compact);
         }
         LlmCodec::StreamAssembler assembler(cfg_.protocol, sink);
-        const HttpResult hr = Http::postSse(url, streamBody, headers, cfg_.timeoutMs,
+        const QUrl streamUrl = LlmCodec::endpoint(cfg_.protocol, cfg_.baseUrl, cfg_.model, true);
+        const HttpResult hr = Http::postSse(streamUrl, streamBody, headers, cfg_.timeoutMs,
                                             [&](const QByteArray &data) { assembler.feed(data); });
         return assembler.finish(hr.status, hr.body, hr.error);
     };
@@ -61,15 +68,13 @@ ChatResponse Llm::complete(const QString &system,
 
     if (streamed.sseEvents > 0 || !streamed.text.isEmpty() || !streamed.toolCalls.isEmpty())
         return streamed;
-    if (!streamed.error.isEmpty() && streamed.httpStatus >= 400 && !looksLikeUnknownField(streamed))
+    if (streamed.error == QStringLiteral("已中断") || streamed.error.contains(QLatin1String("timeout"), Qt::CaseInsensitive))
         return streamed;
-    // 用户点了停止(HTTP 已中断):中断是意图不是失败,绝不能回退成
-    // 非流式把完整请求再发一遍 —— 那样"停止"最长要 120 秒后才生效
-    if (streamed.error == QLatin1String("已中断"))
+    if (!streamed.error.isEmpty() && streamed.httpStatus >= 400 && !looksLikeUnknownField(streamed))
         return streamed;
 
     // 流式完全没起来:回退非流式
-    const QByteArray body = LlmCodec::requestBody(cfg_.protocol, model, system, history, tools, false, cfg_.maxTokens, cfg_.thinkLevel);
+    const QByteArray body = LlmCodec::requestBody(cfg_.protocol, model, system, history, tools, false, cfg_.maxTokens, cfg_.thinkEffort);
     const HttpResult plain = Http::postJson(url, body, headers, cfg_.timeoutMs);
     ChatResponse parsed = LlmCodec::parse(cfg_.protocol, plain.status, plain.body);
     if (parsed.error.isEmpty() && parsed.text.isEmpty() && parsed.toolCalls.isEmpty() && !plain.error.isEmpty())

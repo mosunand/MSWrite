@@ -41,6 +41,12 @@ public:
     void setDocumentReader(DocumentReader r) { m_docReader = std::move(r); }
     void setContextProvider(ContextProvider p) { m_contextProvider=std::move(p); }
     void setInsertHandler(InsertHandler h) { m_insert = std::move(h); }
+    // 模型切换(一个网址多模型):列出全部供应商,切换 (供应商, 模型) 由宿主落库
+    using ModelSwitchHandler = std::function<void(const QString &providerName, const QString &modelId)>;
+    using ProviderListProvider = std::function<QVector<AiProvider>()>;
+    void setModelSwitch(ModelSwitchHandler sw, ProviderListProvider list) {
+        m_modelSwitch = std::move(sw); m_listProviders = std::move(list);
+    }
     void readDocument(const QJsonObject &request, std::function<void(AiDocumentResult)> done);
     void requestSelection(const QString &text, const QString &name, int page, bool translate);
 
@@ -48,6 +54,7 @@ public:
     void setNoProvider();                    // 未配置时的提示标签
     void clearConversation();                // 清历史 + 清屏
     bool isLightTheme() const { return m_lightTheme; }
+    void followHostTheme(bool light);        // 主窗口主题变化时 AI 面板跟随
 
 public slots:
     // 工作线程经 BlockingQueuedConnection 调用(在 GUI 线程执行)
@@ -55,7 +62,7 @@ public slots:
 
 signals:
     void runRequested(const QString &userText, const QString &docMarkdown,
-                       int writeMode, int thinkLevel, const QVector<AiAttach> &images);
+                       int writeMode, const QString &thinkEffort, const QVector<AiAttach> &images);
     void configRequested(); // 面板请求打开 AI 设置
     void skillsRequested();
     void visibilityChanged(bool visible); // QWidget 没有,自发自收供菜单同步
@@ -90,9 +97,12 @@ private:
     void cycleWriteMode();
     void applyWriteModeStyle();
     void onThinkLevelChanged();
+    void rebuildThinkBox(const QStringList &levels); // 按当前模型的档位重建下拉
+    void showModelMenu();                            // 点顶栏模型名:切换供应商/模型
 
     // 主题
     void toggleTheme();
+    void applyLightTheme(bool light); // 应用主题(toggleTheme/followHostTheme 共用主体)
     void repaintAll(); // 主题切换后全量重绘(气泡/列表/欢迎页)
     void restyleDynamicWidgets(); // 写按钮/思考下拉随主题换色
 
@@ -113,6 +123,9 @@ private:
     QWidget *m_attachStrip = nullptr;    // 附件缩略图条
     class QHBoxLayout *m_attachLay = nullptr;
     QPushButton *m_writeBtn = nullptr;    // 写入模式:不写入/AI 决定/强制全写
+    QPushButton *m_modelBtn = nullptr;    // 控制行:模型切换("供应商/模型 ▾")
+    QString m_curProvider;                // 当前供应商(模型切换弹层用)
+    QString m_curModelId;                 // 当前模型 id
     QComboBox *m_thinkBox = nullptr;      // 思考程度:关/低/中/高
 
     ChatModel *m_msgs = nullptr;
@@ -123,8 +136,8 @@ private:
     QVector<QPair<QString, QString>> m_textFiles;      // 待发送文本附件 (名, 内容)
 
     int m_writeMode = 0;   // 0不写入 1AI 决定 2强制全写(持久化)
-    int m_thinkLevel = 3;  // 0关 1低 2中 3高(持久化)
-    bool m_lightTheme = false; // 浅色主题(持久化 aiTheme=1)
+    QString m_thinkEffort = QStringLiteral("high"); // 思考档位名,""=关(持久化 aiThinkEffort)
+    bool m_lightTheme = false; // 浅色主题(跟随主窗口,月亮按钮仅会话内临时切换)
 
     int m_assistRow = -1;      // 本轮流式回答的气泡行
     int m_thinkRow = -1;       // 本轮思考行(正文出现后冻结)
@@ -148,9 +161,11 @@ private:
     // 本轮参数随 runRequested 一起发
     QVector<AiAttach> m_dispatchImages;
     int m_dispatchMode = 0;
-    int m_dispatchLevel = 3;
+    QString m_dispatchEffort = QStringLiteral("high");
 
     DocumentReader m_docReader;
     ContextProvider m_contextProvider;
     InsertHandler m_insert;
+    ModelSwitchHandler m_modelSwitch;
+    ProviderListProvider m_listProviders;
 };

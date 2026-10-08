@@ -386,7 +386,10 @@ struct Parser {
     const QString &s;
     int i = 0;
     bool upright = false;
-    int depth = 0;   // 递归深度:readAtoms↔readGroup 互递归无上限会被病态 {{{{ 打爆栈
+    // {...} 嵌套深度:readGroup ↔ readAtoms ↔ readAtom 互递归,深度 = 花括号层数。
+    // 无上限则畸形公式可把栈冲爆,故硬性截断。
+    static constexpr int kMaxDepth = 64;
+    int depth = 0;
 
     Parser(const QString &src) : s(src) {}
 
@@ -412,10 +415,15 @@ struct Parser {
     // 读一个 {...} 组(已位于 '{')
     BoxVec readGroup()
     {
-        ++i; // '{'(无论是否触上限都先吃掉,保证解析前进,不留死循环)
-        // 超深嵌套按空组处理:单条病态公式不该崩掉整个进程
-        if (depth >= 200)
+        if (depth >= Parser::kMaxDepth) {
+            // 超深嵌套:跳到匹配的 '}'(或串尾)并返回空组,防止无限递归
+            while (i < s.size() && s.at(i) != QLatin1Char('}'))
+                ++i;
+            if (i < s.size())
+                ++i;
             return {};
+        }
+        ++i; // '{'
         // 组内也要合并上下标,否则分子/根号中的 x^2 会退化为 x2。
         ++depth;
         BoxVec out = readAtoms();
@@ -436,6 +444,21 @@ struct Parser {
 
     BoxPtr readAtom()
     {
+        if (depth >= Parser::kMaxDepth) {
+            // 超深：跳过单个字符/命令，避免死循环
+            if (!atEnd()) {
+                if (peek() == QLatin1Char('\\')) {
+                    ++i; // 跳过反斜杠
+                    if (i < s.size() && s.at(i).isLetter()) {
+                        while (i < s.size() && s.at(i).isLetter())
+                            ++i;
+                    }
+                } else {
+                    ++i;
+                }
+            }
+            return nullptr;
+        }
         if (atEnd())
             return nullptr;
         const QChar c = peek();

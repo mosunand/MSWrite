@@ -16,6 +16,7 @@
 #include <QPair>
 #include <QMouseEvent>
 #include <QTimer>
+#include <QDateTime>
 #include <QUrl>
 #include <QPointer>
 #include <QLabel>
@@ -48,6 +49,8 @@ __CRT_UUID_DECL(ICoreWebView2WebResourceRequestedEventHandler, 0xab00b74c, 0x15f
 __CRT_UUID_DECL(ICoreWebView2_7, 0x79c24d83, 0x09a3, 0x45ae, 0x94, 0x18, 0x48, 0x7f, 0x32, 0xa5, 0x87, 0x40)
 __CRT_UUID_DECL(ICoreWebView2Environment6, 0x7cecdbf4, 0xd694, 0x4e2f, 0xa0, 0x82, 0x24, 0x4e, 0x99, 0xd4, 0x80, 0x7f)
 __CRT_UUID_DECL(ICoreWebView2PrintToPdfCompletedHandler, 0xccf1ef04, 0xfd8e, 0x4d5f, 0xb2, 0xde, 0x09, 0x83, 0xe4, 0x1b, 0x8c, 0x36)
+__CRT_UUID_DECL(ICoreWebView2ProcessFailedEventHandler, 0x79e0aea4, 0x990b, 0x42d9, 0xaa, 0x1d, 0x0f, 0xcc, 0x2e, 0x5b, 0xc7, 0xf1)
+__CRT_UUID_DECL(ICoreWebView2ProcessFailedEventArgs, 0x8155a9a4, 0x1474, 0x4a86, 0x8c, 0xae, 0x15, 0x1b, 0x0f, 0xa6, 0xb8, 0xca)
 
 namespace {
 
@@ -343,9 +346,44 @@ public:
         *ppv = nullptr;
         return E_NOINTERFACE;
     }
-    HRESULT STDMETHODCALLTYPE Invoke(HRESULT, LPCWSTR result) override {
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, LPCWSTR result) override {
         if (onResult)
             onResult(result ? QString::fromWCharArray(result) : QString());
+        return S_OK;
+    }
+private:
+    std::atomic<ULONG> m_ref{1};
+};
+
+// 渲染/浏览器进程死亡:WebView2 不会自动恢复页面 DOM,当前页所有
+// ExecuteScript 都返回 null(即"正在加载对话…"/空白的终极根源之一)。
+// 收到事件立即自愈:渲染进程死亡 → 重新导航;浏览器进程死亡 → 整链重建。
+class ProcessFailedHandler final : public ICoreWebView2ProcessFailedEventHandler {
+public:
+    std::function<void(COREWEBVIEW2_PROCESS_FAILED_KIND)> onFailed;
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++m_ref; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG n = --m_ref;
+        if (!n) delete this;
+        return n;
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+        if (!ppv) return E_POINTER;
+        if (IsEqualIID(riid, __uuidof(IUnknown)) ||
+            IsEqualIID(riid, __uuidof(ICoreWebView2ProcessFailedEventHandler))) {
+            *ppv = static_cast<ICoreWebView2ProcessFailedEventHandler *>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *sender,
+                                     ICoreWebView2ProcessFailedEventArgs *args) override {
+        COREWEBVIEW2_PROCESS_FAILED_KIND kind =
+            COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED;
+        if (args) args->get_ProcessFailedKind(&kind);
+        if (onFailed) onFailed(kind);
         return S_OK;
     }
 private:
@@ -447,11 +485,14 @@ struct WebViewHost::Impl {
     NavCompletedHandler      *hNav = nullptr;
     AcceleratorHandler       *hAcc = nullptr;
     ResourceHandler          *hResource = nullptr;
+    ProcessFailedHandler     *hProcFail = nullptr;
 
     EventRegistrationToken tokMsg{};
     EventRegistrationToken tokNav{};
     EventRegistrationToken tokAcc{};
     EventRegistrationToken tokResource{};
+    EventRegistrationToken tokProcFail{};
+    HWND createdHwnd = nullptr;   // 控制器创建时绑定的原生 HWND
 
     QString virtualHost;
     QString virtualFolder;
@@ -540,9 +581,7 @@ struct WebViewHost::Impl {
         HWND parent=nullptr;ctrl->get_ParentWindow(&parent);
         if(parent!=current) ctrl->put_ParentWindow(current);
         applyBounds();
-    }
-
-    void setMapping(const QString &host, const QString &folder)
+    }    void setMapping(const QString &host, const QString &folder)
     {
         ICoreWebView2_3 *web3 = nullptr;
         if (SUCCEEDED(web->QueryInterface(__uuidof(ICoreWebView2_3),
@@ -608,6 +647,7 @@ struct WebViewHost::Impl {
     {
         if (hCtrl) { hCtrl->Release(); hCtrl=nullptr; }
         ++controllerAttempts;
+        q->m_ctrlWatchdog.start();   // 12s 无成功/失败回调就自动重试
 
         auto *h = new ControllerCreatedHandler;
         h->onDone = [guard = QPointer<WebViewHost>(q)](HRESULT result, ICoreWebView2Controller *c) {
@@ -619,12 +659,14 @@ struct WebViewHost::Impl {
         hCtrl = h;
 
         const HWND hwnd = reinterpret_cast<HWND>(q->winId());
+        createdHwnd = hwnd;   // 记录控制器绑定的原生窗口,HWND 被外部重建时触发整链重建
         const HRESULT result=env->CreateCoreWebView2Controller(hwnd, hCtrl);
         if (FAILED(result)) controllerFailed(result);
     }
 
     void controllerFailed(HRESULT result)
     {
+        q->m_ctrlWatchdog.stop();
         qWarning() << "Mswrite: WebView controller creation failed" << Qt::hex << result;
         // A new tab can arrive while WebView2 is stopping its last browser
         // process. Retry after that transition; permanent errors stay bounded.
@@ -639,6 +681,7 @@ struct WebViewHost::Impl {
 
     void onController(ICoreWebView2Controller *controller)
     {
+        q->m_ctrlWatchdog.stop();
         ctrl = controller; // Invoke 中已 AddRef
         bindWindow();
         ctrl->get_CoreWebView2(&web);
@@ -689,6 +732,31 @@ struct WebViewHost::Impl {
         };
         hNav = n;
         web->add_NavigationCompleted(hNav, &tokNav);
+
+        // 进程死亡自愈:渲染进程被杀(切主题换样式表/字体时可触发)后,
+        // 当前页所有 ExecuteScript 静默返回 null、DOM 全空 —— 不导航就
+        // 永远是一张白纸。浏览器进程死亡则整链重建。
+        auto *pf = new ProcessFailedHandler;
+        pf->onFailed = [guard = QPointer<WebViewHost>(q)](COREWEBVIEW2_PROCESS_FAILED_KIND kind) {
+            qWarning() << "Mswrite: WebView 进程失败 kind=" << int(kind);
+            if (!guard)
+                return;
+            QTimer::singleShot(0, guard, [guard, kind] {
+                if (!guard || guard->m_closing)
+                    return;
+                if (kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED) {
+                    guard->recreateBrowser();
+                } else {
+                    // 页面曾就绪:navigate() 实测救不活已死的执行上下文,
+                    // 整链重建是唯一被验证可靠的复活手段。
+                    // 页面未就绪时同样重建:否则初始加载撞上进程死亡,
+                    // 用户会永远卡在加载遮罩(遮罩的重试按钮是最后兜底)。
+                    guard->recreateBrowser();
+                }
+            });
+        };
+        hProcFail = pf;
+        web->add_ProcessFailed(pf, &tokProcFail);
 
         // 编辑区 Ctrl 组合键 -> Qt 侧过滤器
         auto *a = new AcceleratorHandler;
@@ -775,10 +843,12 @@ struct WebViewHost::Impl {
     {
         // 关键:环境创建是异步的,若本实例在回调前销毁,s_waiters 里
         // 会留下悬垂指针 —— 回调触发即 use-after-free(启动瞬间关标签/关窗)
+        q->m_ctrlWatchdog.stop();
         s_waiters.removeAll(this);
         if (web) {
             if (hMsg) web->remove_WebMessageReceived(tokMsg);
             if (hNav) web->remove_NavigationCompleted(tokNav);
+            if (hProcFail) web->remove_ProcessFailed(tokProcFail);
             if (hResource) web->remove_WebResourceRequested(tokResource);
         }
         if (ctrl) {
@@ -794,6 +864,7 @@ struct WebViewHost::Impl {
         rel(reinterpret_cast<void **>(&hNav));
         rel(reinterpret_cast<void **>(&hAcc));
         rel(reinterpret_cast<void **>(&hResource));
+        rel(reinterpret_cast<void **>(&hProcFail));
         rel(reinterpret_cast<void **>(&hCtrl));
     }
 
@@ -867,6 +938,24 @@ WebViewHost::WebViewHost(QWidget *parent)
     // Native ancestors keep the browser inside the stacked page's clipping and
     // visibility hierarchy. Alien ancestors can leave a live but covered HWND.
     setMinimumSize(200, 200);
+    // 控制器创建兜底:回调静默丢失时自动重试(见 m_ctrlWatchdog 注释)
+    m_ctrlWatchdog.setSingleShot(true);
+    m_ctrlWatchdog.setInterval(12000);
+    connect(&m_ctrlWatchdog, &QTimer::timeout, this, [this] {
+        if (m_closing || !d || d->ctrl)
+            return;
+        qWarning() << "Mswrite: WebView 控制器创建 12s 无回调,自动重试"
+                   << d->controllerAttempts;
+        if (!isVisible() && !d->alwaysVisible) {
+            m_createOnShow = true;   // 仍不可见:挂起,等 showEvent 再建
+            return;
+        }
+        if (d->controllerAttempts < 4) {
+            d->createController();   // 重试(内部会重启 watchdog)
+        } else {
+            showLoadingError(QObject::tr("编辑器内核未能启动，请重新加载。"));
+        }
+    });
 }
 
 WebViewHost::~WebViewHost()
@@ -927,9 +1016,14 @@ void WebViewHost::finishLoading()
 
 void WebViewHost::retryLoading()
 {
-    if (!m_loading || m_closing) return;
-    auto *surface = static_cast<LoadingSurface *>(m_loading);
-    surface->begin(surface->loadingText());
+    if (m_closing) return;
+    // 页面已渲染过时 loading 遮罩早已销毁(finishLoading 置空),
+    // 但自愈重载依然必须执行 —— 旧行为在此直接 return,导致页面静默
+    // 死亡后永远无法恢复("正在加载对话…"卡死的最后一块拼图)。
+    if (m_loading) {
+        auto *surface = static_cast<LoadingSurface *>(m_loading);
+        surface->begin(surface->loadingText());
+    }
     m_pageReady = false;
     emit loadingRetry();
     if (d->web) navigate(d->startUrl);
@@ -949,6 +1043,15 @@ void WebViewHost::start(const QString &userDataFolder,
     d->virtualFolder = virtualFolder;
     d->startUrl = startUrl;
     d->initialScript = initialScript;
+
+    // 关键防御:WebView2 要求创建 controller 时父窗口可见。AI 面板是"先
+    // 创建后隐藏"的顶层窗口,在隐藏态创建的 controller 回调会被静默吞掉,
+    // 页面永久转圈且无任何失败信号 —— 这里推迟到首次 showEvent 再建。
+    // 导出页等 setAlwaysVisible(true) 的隐藏宿主不受此限制。
+    if (!isVisible() && !d->alwaysVisible) {
+        m_createOnShow = true;
+        return;
+    }
 
     if (Impl::s_env) {
         d->onEnvironment(Impl::s_env); // 环境已就绪,直接建控制器
@@ -1000,6 +1103,25 @@ void WebViewHost::openDevTools()
 {
     if (d->web)
         d->web->OpenDevToolsWindow();
+}
+
+void WebViewHost::recreateBrowser()
+{
+    if (m_closing)
+        return;
+    // 防御:进程失败/回调超时/HWND 变更可能同帧触发多次重建,600ms 内合并
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - m_lastRecreateAt < 600)
+        return;
+    m_lastRecreateAt = now;
+    qWarning() << "Mswrite: WebView 整链重建(终极自愈)";
+    // shutdown 释放全部 COM 引用并摘除 handler;原参数已在 d 中,
+    // 直接重走 start(内部按可见性决定立即创建还是挂起)。
+    d->shutdown();
+    m_pageReady = false;
+    m_createOnShow = false;
+    start(d->userDataFolder, d->virtualHost, d->virtualFolder,
+          d->startUrl, d->initialScript);
 }
 
 void WebViewHost::setZoomFactor(double factor)
@@ -1068,14 +1190,19 @@ void WebViewHost::waitRendered(std::function<void()> done)
         cb();
     });
     // 等两帧 + 字体就绪,并主动等所有图片 decode 完成
+    // 【防御】rAF 在窗口最小化/被完全遮挡时会被浏览器挂起,叠加 setTimeout 兜底
+    // (两者先到先放行),避免导出时用户恰好切窗导致 8s 超时误报
     const std::wstring js =
         L"(function(){function imgs(){var a=document.images;"
         L"return Promise.all(Array.prototype.map.call(a,function(i){"
         L"return (i.decode?i.decode():Promise.resolve()).catch(function(){0;})}));}"
         L"var fonts=(document.fonts&&document.fonts.ready)?document.fonts.ready:Promise.resolve();"
         L"function post(){try{window.chrome.webview.postMessage({t:'rendered',request:%1});}catch(e){}}"
-        L"new Promise(function(r){requestAnimationFrame(function(){"
-        L"requestAnimationFrame(function(){r(0);});});})"
+        L"function twoFrames(cb){var fired=false;"
+        L"function fin(){if(fired)return;fired=true;cb();}"
+        L"try{requestAnimationFrame(function(){requestAnimationFrame(fin);});}catch(e){fin();return;}"
+        L"setTimeout(fin,600);}"
+        L"new Promise(function(r){twoFrames(function(){r(0);});})"
         L".then(function(){return Promise.all([fonts,imgs()]);}).then(post,post);})()";
     d->runScriptNow(QString::fromWCharArray(js.c_str()).arg(request));
 }
@@ -1090,8 +1217,21 @@ void WebViewHost::resizeEvent(QResizeEvent *event)
 bool WebViewHost::event(QEvent *event)
 {
     const bool result=QWidget::event(event);
-    if(d && (event->type()==QEvent::WinIdChange || event->type()==QEvent::ParentChange))
+    if(d && (event->type()==QEvent::WinIdChange || event->type()==QEvent::ParentChange)) {
         d->bindWindow();
+        // 原生 HWND 被外部重建(实测:宿主窗口 QSS 全量重刷 = AI 窗口切主题时):
+        // 旧控制器绑定的窗口已销毁,页面执行上下文随之死亡 —— put_ParentWindow
+        // 救不活,所有脚本打进虚空。检测到 HWND 变更立即整链重建,在新 HWND 上
+        // 重新创建控制器并恢复页面。
+        if (d->ctrl && d->createdHwnd
+            && d->createdHwnd != reinterpret_cast<HWND>(internalWinId())) {
+            qWarning() << "Mswrite: WebView 宿主 HWND 已变更,整链重建适配新窗口";
+            QTimer::singleShot(0, this, [guard = QPointer<WebViewHost>(this)] {
+                if (guard && !guard->m_closing)
+                    guard->recreateBrowser();
+            });
+        }
+    }
     return result;
 }
 
@@ -1101,6 +1241,16 @@ void WebViewHost::showEvent(QShowEvent *event)
     d->bindWindow();
     if (d->ctrl)
         d->ctrl->put_IsVisible(TRUE);
+    else if (m_createOnShow) {
+        // start() 时窗口还隐藏,当时挂起了控制器创建;现在可见了,补建
+        m_createOnShow = false;
+        if (Impl::s_env)
+            d->onEnvironment(Impl::s_env);
+        else if (!Impl::s_waiters.contains(d)) {
+            Impl::s_waiters.append(d);
+            Impl::ensureEnvironment(d->userDataFolder);
+        }
+    }
     raiseLoading();
 }
 

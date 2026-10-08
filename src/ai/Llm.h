@@ -16,9 +16,9 @@ struct AiLlmConfig {
     QString baseUrl;
     QString model;          // 原样发送:需要 [1M] 等后缀时直接写进模型名
     Protocol protocol = Protocol::Anthropic;
-    int maxTokens = 4096;
+    int maxTokens = 0; // 0 = 默认(见 LlmCodec::kDefaultMaxTokens)
     int timeoutMs = 120000;
-    int thinkLevel = 3;     // 思考程度 0关/1低/2中/3高(默认高;模型不支持会自动降级重试)
+    QString thinkEffort = QStringLiteral("high"); // 思考档位:"" = 关;档位名来自模型配置(默认 low/high),不支持会自动降级重试
 };
 
 class Llm {

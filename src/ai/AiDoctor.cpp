@@ -20,12 +20,17 @@ Result run(const AiProvider &p)
     r.sslBuildVersion = QSslSocket::sslLibraryBuildVersionString();
 
     // GET {endpoint 的根}/models:打真实网关但不消耗 token
-    r.url = LlmCodec::endpoint(p.protocol, p.baseUrl).toString();
-    if (r.url.endsWith(QStringLiteral("/messages")))
-        r.url.chop(9);
-    else if (r.url.endsWith(QStringLiteral("/chat/completions")))
-        r.url.chop(17);
-    r.url += QStringLiteral("/models");
+    QUrl modelsUrl = LlmCodec::endpoint(p.protocol, p.baseUrl, p.model);
+    QString path = modelsUrl.path();
+    if (p.protocol == Protocol::Gemini) {
+        const int modelStart = path.indexOf(QStringLiteral("/models/"));
+        if (modelStart >= 0) path.truncate(modelStart);
+    } else if (path.endsWith(QStringLiteral("/responses"))) path.chop(10);
+    else if (path.endsWith(QStringLiteral("/messages"))) path.chop(9);
+    else if (path.endsWith(QStringLiteral("/chat/completions"))) path.chop(17);
+    modelsUrl.setPath(path + QStringLiteral("/models"));
+    modelsUrl.setQuery(QString());
+    r.url = modelsUrl.toString();
 
     const qint64 t0 = QDateTime::currentMSecsSinceEpoch();
     const HttpResult hr = Http::get(QUrl(r.url),
