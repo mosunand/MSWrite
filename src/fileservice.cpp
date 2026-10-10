@@ -19,12 +19,7 @@
 
 namespace {
 constexpr int kMaxRecent = 10;
-
-QString decodeWith(const QByteArray &raw, QStringConverter::Encoding enc)
-{
-    QStringDecoder decoder(enc);
-    return decoder(raw);
-}
+constexpr qint64 kMaxDocumentBytes = 64 * 1024 * 1024;
 
 QByteArray encodeWith(const QString &text, QStringConverter::Encoding enc)
 {
@@ -37,8 +32,9 @@ QByteArray encodeWith(const QString &text, QStringConverter::Encoding enc)
 // 在这里就是 UTF-8,拿它解 GBK 只会得到一片 U+FFFD —— 老文档照旧被毁。
 // 54936(GB18030)是 GBK 的超集,能同时吃下 GBK 与 GB18030 文本;
 // 取不到再退 936(纯 GBK)。
-QString decodeLegacy(const QByteArray &raw)
+QString decodeLegacy(const QByteArray &raw, bool *valid)
 {
+    *valid = true;
     if (raw.isEmpty())
         return {};
 #ifdef Q_OS_WIN
@@ -53,7 +49,8 @@ QString decodeLegacy(const QByteArray &raw)
             return QString::fromWCharArray(w.data(), n);
     }
 #endif
-    return QString::fromUtf8(raw);
+    *valid = false;
+    return {};
 }
 
 QByteArray encodeLegacy(const QString &text)
@@ -64,18 +61,20 @@ QByteArray encodeLegacy(const QString &text)
     // 关键:必须用 WC_NO_BEST_FIT_CHARS 询问"能否无损表示"。
     // 若按默认标志(0)询问,Win32 会把任何字符一律当成功,只是把无法表示的
     // 字符替换成 '?' 再返回长度 —— emoji/生僻字会静默毁掉,而保存照常"成功"。
-    // 编码侧同时用 WC_ERR_INVALID_CHARS,遇到无法表示的字符直接失败,
-    // 由调用方退回 UTF-8,绝不产出含 '?' 的文件。
+    // GB18030 严格校验 UTF-16；GBK 检查 usedDefault，均拒绝静默替换。
     const auto *w = reinterpret_cast<const wchar_t *>(text.utf16());
     for (UINT cp : { 54936u, 936u }) {
-        int n = WideCharToMultiByte(cp, WC_NO_BEST_FIT_CHARS, w, int(text.size()),
-                                    nullptr, 0, nullptr, nullptr);
+        // GB18030 requires null default-character pointers; GBK needs a flag
+        // preventing best-fit substitution. Win32 rejects mixing those rules.
+        const DWORD flags = cp == 54936u ? WC_ERR_INVALID_CHARS : WC_NO_BEST_FIT_CHARS;
+        BOOL usedDefault = FALSE;
+        BOOL *used = cp == 54936u ? nullptr : &usedDefault;
+        int n = WideCharToMultiByte(cp, flags, w, int(text.size()), nullptr, 0, nullptr, used);
         if (n <= 0)
             continue;
         QByteArray out(n, Qt::Uninitialized);
-        BOOL usedDefault = FALSE;
-        if (WideCharToMultiByte(cp, WC_ERR_INVALID_CHARS, w, int(text.size()),
-                                out.data(), n, nullptr, &usedDefault) > 0
+        if (WideCharToMultiByte(cp, flags, w, int(text.size()),
+                                out.data(), n, nullptr, used) > 0
             && !usedDefault)
             return out;
         // 有字符无法表示(usedDefault)或直接失败:换下一个代码页,都不行则退回 UTF-8
@@ -111,38 +110,67 @@ FileService::FileService(QObject *parent)
 {
 }
 
+bool FileService::readBytes(const QString &path, qint64 limit, QByteArray *data)
+{
+    if (!data) return false;
+    data->clear();
+    if (limit < 0 || limit > kMaxDocumentBytes || !QFileInfo(path).isFile()) return false;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly) || file.size() > limit) return false;
+    const QByteArray bytes = file.read(limit + 1);
+    if (file.error() != QFile::NoError || bytes.size() > limit || !file.atEnd()) return false;
+    *data = bytes;
+    return true;
+}
+
 QString FileService::readFile(const QString &path, bool *ok, Encoding *encOut, bool *crlfOut)
 {
+    if (ok) *ok = false;
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly)) {
         if (ok) *ok = false;
         return {};
     }
-    QByteArray raw = f.readAll();
+    // Refuse huge/nonregular files and incomplete reads instead of treating
+    // their partial data as a successfully opened document eligible for save.
+    if (!QFileInfo(path).isFile() || f.size() > kMaxDocumentBytes) return {};
+    QByteArray raw = f.read(kMaxDocumentBytes + 1);
+    if (f.error() != QFile::NoError || raw.size() > kMaxDocumentBytes || !f.atEnd()) return {};
     Encoding enc = Encoding::Utf8;
     QString text;
 
     if (raw.startsWith("\xEF\xBB\xBF")) {
         enc = Encoding::Utf8Bom;
-        text = QString::fromUtf8(raw.mid(3));
+        QStringDecoder decoder(QStringConverter::Utf8, QStringConverter::Flag::Stateless);
+        text = decoder(raw.mid(3));
+        if (decoder.hasError()) return {};
     } else if (raw.startsWith("\xFF\xFE")) {
+        if ((raw.size() - 2) % 2 != 0) return {};
         enc = Encoding::Utf16LE;
-        text = decodeWith(raw.mid(2), QStringConverter::Utf16LE);
+        QStringDecoder decoder(QStringConverter::Utf16LE, QStringConverter::Flag::Stateless);
+        text = decoder(raw.mid(2));
+        if (decoder.hasError()) return {};
     } else if (raw.startsWith("\xFE\xFF")) {
+        if ((raw.size() - 2) % 2 != 0) return {};
         enc = Encoding::Utf16BE;
-        text = decodeWith(raw.mid(2), QStringConverter::Utf16BE);
+        QStringDecoder decoder(QStringConverter::Utf16BE, QStringConverter::Flag::Stateless);
+        text = decoder(raw.mid(2));
+        if (decoder.hasError()) return {};
     } else {
         // 无 BOM:先按 UTF-8 严格解码,失败说明不是 UTF-8(中文 Windows 上
         // 多为 GBK/936),回退系统 ANSI 代码页 —— 否则整个文件会变乱码,
         // 且保存时按乱码写回,原文件被永久破坏
-        QStringDecoder utf8(QStringConverter::Utf8);
+        QStringDecoder utf8(QStringConverter::Utf8, QStringConverter::Flag::Stateless);
         text = utf8(raw);
         if (utf8.hasError()) {
             enc = Encoding::Gbk;
-            text = decodeLegacy(raw);
+            bool valid = false;
+            text = decodeLegacy(raw, &valid);
+            if (!valid) return {};
         }
     }
 
+    if (!text.isValidUtf16()) return {};
     // Inspect decoded text: UTF-16 stores a zero byte between CR and LF.
     if (crlfOut) *crlfOut = text.contains(QStringLiteral("\r\n"));
     if (ok) *ok = true;
@@ -152,6 +180,7 @@ QString FileService::readFile(const QString &path, bool *ok, Encoding *encOut, b
 
 bool FileService::writeFile(const QString &path, const QString &content, Encoding enc)
 {
+    if (content.size() > kMaxDocumentBytes || !content.isValidUtf16()) return false;
     QByteArray raw;
     switch (enc) {
     case Encoding::Utf8Bom:
@@ -169,9 +198,12 @@ bool FileService::writeFile(const QString &path, const QString &content, Encodin
     case Encoding::Utf8:
         raw = content.toUtf8();
         break;
+    default:
+        return false; // An invalid enum must not produce an empty successful save.
     }
 
     // 先写临时文件再原子替换:断电/杀进程时不会留下被截断的半成品覆盖原稿
+    if (raw.size() > kMaxDocumentBytes) return false;
     QSaveFile f(path);
     if (!f.open(QIODevice::WriteOnly))
         return false;

@@ -1,9 +1,11 @@
 #include "webviewhost.h"
+#include "securitypolicy.h"
 
 #include <QResizeEvent>
 #include <QShowEvent>
 #include <QHideEvent>
 #include <QDebug>
+#include <QDesktopServices>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -26,6 +28,7 @@
 
 #include <functional>
 #include <atomic>
+#include <cmath>
 
 #include <windows.h>
 #include <objbase.h>
@@ -40,6 +43,8 @@ __CRT_UUID_DECL(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler, 0x4e
 __CRT_UUID_DECL(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler, 0x6c4819f3, 0xc9b7, 0x4260, 0x81, 0x27, 0xc9, 0xf5, 0xbd, 0xe7, 0xf6, 0x8c)
 __CRT_UUID_DECL(ICoreWebView2WebMessageReceivedEventHandler, 0x57213f19, 0x00e6, 0x49fa, 0x8e, 0x07, 0x89, 0x8e, 0xa0, 0x1e, 0xcb, 0xd2)
 __CRT_UUID_DECL(ICoreWebView2NavigationCompletedEventHandler, 0xd33a35bf, 0x1c49, 0x4f98, 0x93, 0xab, 0x00, 0x6e, 0x05, 0x33, 0xfe, 0x1c)
+__CRT_UUID_DECL(ICoreWebView2NavigationStartingEventHandler, 0x9adbe429, 0xf36d, 0x432b, 0x9d, 0xdc, 0xf8, 0x88, 0x1f, 0xbd, 0x76, 0xe3)
+__CRT_UUID_DECL(ICoreWebView2NewWindowRequestedEventHandler, 0xd4c185fe, 0xc81c, 0x4989, 0x97, 0xaf, 0x2d, 0x3f, 0xa7, 0xab, 0x56, 0x51)
 __CRT_UUID_DECL(ICoreWebView2ExecuteScriptCompletedHandler, 0x49511172, 0xcc67, 0x4bca, 0x99, 0x23, 0x13, 0x71, 0x12, 0xf4, 0xc4, 0xcc)
 __CRT_UUID_DECL(ICoreWebView2AcceleratorKeyPressedEventHandler, 0xb29c7e28, 0xfa79, 0x41a8, 0x8e, 0x44, 0x65, 0x81, 0x1c, 0x76, 0xdc, 0xb2)
 __CRT_UUID_DECL(ICoreWebView2_3, 0xA0D6DF20, 0x3B92, 0x416D, 0xAA, 0x0C, 0x43, 0x7A, 0x9C, 0x72, 0x78, 0x57)
@@ -176,7 +181,7 @@ private:
 
 class MessageHandler final : public ICoreWebView2WebMessageReceivedEventHandler {
 public:
-    std::function<void(const QString &)> onMessage;
+    std::function<void(const QString &, const QUrl &)> onMessage;
 
     ULONG STDMETHODCALLTYPE AddRef() override { return ++m_ref; }
     ULONG STDMETHODCALLTYPE Release() override {
@@ -197,15 +202,68 @@ public:
     }
     HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *,
                                     ICoreWebView2WebMessageReceivedEventArgs *args) override {
+        LPWSTR source = nullptr;
+        if (FAILED(args->get_Source(&source)) || !source) return S_OK;
+        const QUrl sourceUrl(QString::fromWCharArray(source));
+        CoTaskMemFree(source);
         LPWSTR raw = nullptr;
         if (SUCCEEDED(args->get_WebMessageAsJson(&raw)) && raw) {
-            if (onMessage) onMessage(QString::fromWCharArray(raw));
+            if (onMessage) onMessage(QString::fromWCharArray(raw), sourceUrl);
             CoTaskMemFree(raw);
         }
         return S_OK;
     }
 private:
     std::atomic<ULONG> m_ref{1};
+};
+
+class NavigationGuard final : public ICoreWebView2NavigationStartingEventHandler {
+public:
+    std::function<bool(const QUrl &, bool)> allow;
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++ref; }
+    ULONG STDMETHODCALLTYPE Release() override { const auto n = --ref; if (!n) delete this; return n; }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+        if (!out) return E_POINTER;
+        if (IsEqualIID(id, IID_IUnknown) || IsEqualIID(id, IID_ICoreWebView2NavigationStartingEventHandler)) {
+            *out = static_cast<ICoreWebView2NavigationStartingEventHandler *>(this); AddRef(); return S_OK;
+        }
+        *out = nullptr; return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *, ICoreWebView2NavigationStartingEventArgs *args) override {
+        LPWSTR raw = nullptr; BOOL user = FALSE;
+        args->get_Uri(&raw); args->get_IsUserInitiated(&user);
+        const QUrl url(raw ? QString::fromWCharArray(raw) : QString());
+        if (raw) CoTaskMemFree(raw);
+        if (!allow || !allow(url, user != FALSE)) args->put_Cancel(TRUE);
+        return S_OK;
+    }
+private:
+    std::atomic<ULONG> ref{1};
+};
+
+class NewWindowGuard final : public ICoreWebView2NewWindowRequestedEventHandler {
+public:
+    std::function<void(const QUrl &)> open;
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++ref; }
+    ULONG STDMETHODCALLTYPE Release() override { const auto n = --ref; if (!n) delete this; return n; }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+        if (!out) return E_POINTER;
+        if (IsEqualIID(id, IID_IUnknown) || IsEqualIID(id, IID_ICoreWebView2NewWindowRequestedEventHandler)) {
+            *out = static_cast<ICoreWebView2NewWindowRequestedEventHandler *>(this); AddRef(); return S_OK;
+        }
+        *out = nullptr; return E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *, ICoreWebView2NewWindowRequestedEventArgs *args) override {
+        args->put_Handled(TRUE); // 用户文档不能创建另一个带本机能力的浏览器窗口。
+        LPWSTR raw = nullptr; BOOL user = FALSE;
+        args->get_Uri(&raw); args->get_IsUserInitiated(&user);
+        const QUrl url(raw ? QString::fromWCharArray(raw) : QString());
+        if (raw) CoTaskMemFree(raw);
+        if (user && open && SecurityPolicy::externalUrl(url)) open(url);
+        return S_OK;
+    }
+private:
+    std::atomic<ULONG> ref{1};
 };
 
 // 环境创建完成(共享环境,回调分发到所有等待实例)
@@ -486,22 +544,30 @@ struct WebViewHost::Impl {
     AcceleratorHandler       *hAcc = nullptr;
     ResourceHandler          *hResource = nullptr;
     ProcessFailedHandler     *hProcFail = nullptr;
+    NavigationGuard         *hNavigationGuard = nullptr;
+    NewWindowGuard          *hNewWindowGuard = nullptr;
 
     EventRegistrationToken tokMsg{};
     EventRegistrationToken tokNav{};
     EventRegistrationToken tokAcc{};
     EventRegistrationToken tokResource{};
     EventRegistrationToken tokProcFail{};
+    EventRegistrationToken tokNavigationGuard{};
+    EventRegistrationToken tokNewWindowGuard{};
     HWND createdHwnd = nullptr;   // 控制器创建时绑定的原生 HWND
 
     QString virtualHost;
     QString virtualFolder;
     QString startUrl;
     QString initialScript;
+    QString recoveryText;
+    int recoveryRev = 0;
+    bool hasRecovery = false;
     QString userDataFolder;
     QString curUrl;                      // 最近一次导航的 URL
     bool alwaysVisible = false;         // 导出页等隐藏场景:渲染不挂起
     double zoom = 1.0;                  // 页面缩放(控制器就绪后恢复)
+    quint64 controllerGeneration = 0;
     QHash<QString, QString> resourceFolders; // Live document/image roots, including Save As.
     std::function<void()> renderedCb;   // waitRendered 的在途回调
     int renderRequest = 0;
@@ -518,7 +584,10 @@ struct WebViewHost::Impl {
         // 已有环境或正在创建:直接继续(调用方自行处理)
         if (s_env || s_creating)
             return;
-        HMODULE lib = s_loaderLib ? s_loaderLib : LoadLibraryW(L"WebView2Loader.dll");
+        const auto loaderPath = QDir::toNativeSeparators(QCoreApplication::applicationDirPath()
+            + QStringLiteral("/WebView2Loader.dll")).toStdWString();
+        HMODULE lib = s_loaderLib ? s_loaderLib : LoadLibraryExW(loaderPath.c_str(), nullptr,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!lib) {
             s_envError = QStringLiteral("无法加载 WebView2Loader.dll(错误码 %1)")
                              .arg(GetLastError());
@@ -531,6 +600,7 @@ struct WebViewHost::Impl {
         const auto createEnv = reinterpret_cast<PFN_CreateEnv>(
             GetProcAddress(lib, "CreateCoreWebView2EnvironmentWithOptions"));
         if (!createEnv) {
+            if (!s_loaderLib) FreeLibrary(lib);
             s_envError = QStringLiteral("WebView2Loader.dll 缺少导出函数");
             qCritical() << "Mswrite:" << s_envError;
             return;
@@ -637,6 +707,7 @@ struct WebViewHost::Impl {
 
     void onEnvironment(ICoreWebView2Environment *environment)
     {
+        if (env) env->Release();
         environment->AddRef(); // 本实例自持引用(回调路径与直调路径统一在此加)
         env = environment;     // 全局 s_env 由 ensureEnvironment 持有,不归本实例
 
@@ -647,11 +718,12 @@ struct WebViewHost::Impl {
     {
         if (hCtrl) { hCtrl->Release(); hCtrl=nullptr; }
         ++controllerAttempts;
+        const quint64 generation = ++controllerGeneration;
         q->m_ctrlWatchdog.start();   // 12s 无成功/失败回调就自动重试
 
         auto *h = new ControllerCreatedHandler;
-        h->onDone = [guard = QPointer<WebViewHost>(q)](HRESULT result, ICoreWebView2Controller *c) {
-            if (guard) {
+        h->onDone = [guard = QPointer<WebViewHost>(q), generation](HRESULT result, ICoreWebView2Controller *c) {
+            if (guard && !guard->m_closing && guard->d->controllerGeneration == generation) {
                 if (c) guard->d->onController(c);
                 else guard->d->controllerFailed(result);
             } else if (c) { c->Close(); c->Release(); }
@@ -673,7 +745,9 @@ struct WebViewHost::Impl {
         const bool transient=result==CO_E_SERVER_EXEC_FAILURE || result==E_ABORT
             || result==HRESULT_FROM_WIN32(ERROR_INVALID_STATE);
         if (transient && controllerAttempts<3) {
-            QTimer::singleShot(250*controllerAttempts,q,[this]{createController();});
+            QTimer::singleShot(250*controllerAttempts,q,[this, generation = controllerGeneration] {
+                if (!q->m_closing && !ctrl && controllerGeneration == generation) createController();
+            });
         } else {
             q->showLoadingError(QObject::tr("编辑器内核未能启动，请重新加载。"));
         }
@@ -684,17 +758,31 @@ struct WebViewHost::Impl {
         q->m_ctrlWatchdog.stop();
         ctrl = controller; // Invoke 中已 AddRef
         bindWindow();
-        ctrl->get_CoreWebView2(&web);
+        const HRESULT coreResult = ctrl->get_CoreWebView2(&web);
+        if (FAILED(coreResult) || !web) {
+            ctrl->Close(); ctrl->Release(); ctrl = nullptr;
+            controllerFailed(FAILED(coreResult) ? coreResult : E_FAIL);
+            return;
+        }
 
         // JS -> C++ 消息
         auto *m = new MessageHandler;
-        m->onMessage = [this](const QString &json) {
+        m->onMessage = [this](const QString &json, const QUrl &source) {
+            if (!SecurityPolicy::trustedPage(source, QUrl(startUrl)) || json.size() > 64 * 1024 * 1024)
+                return;
             QJsonParseError err{};
             const QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8(), &err);
             if (err.error != QJsonParseError::NoError || !doc.isObject())
                 return;
             const QJsonObject obj = doc.object();
             const QString type=obj.value(QStringLiteral("t")).toString();
+            if (type == QLatin1String("changed") && obj.value(QStringLiteral("md")).isString()
+                && SecurityPolicy::nonNegativeInt(obj.value(QStringLiteral("rev")))
+                && obj.value(QStringLiteral("rev")).toInt() >= recoveryRev) {
+                recoveryText = obj.value(QStringLiteral("md")).toString();
+                recoveryRev = obj.value(QStringLiteral("rev")).toInt();
+                hasRecovery = true;
+            }
             if (type == QLatin1String("editorRendered"))
                 QTimer::singleShot(0, q, &WebViewHost::finishLoading);
             else if (type == QLatin1String("editorLoadError"))
@@ -713,10 +801,33 @@ struct WebViewHost::Impl {
         hMsg = m;
         web->add_WebMessageReceived(hMsg, &tokMsg);
 
+        hNavigationGuard = new NavigationGuard;
+        hNavigationGuard->allow = [this](const QUrl &url, bool user) {
+            if (SecurityPolicy::trustedNavigation(url, QUrl(startUrl))) {
+                // F5/self-links would rerun the controller's OLD registered
+                // bootstrap. Recreate it with the acknowledged edit snapshot.
+                if (hasRecovery && q->m_pageReady) {
+                    QTimer::singleShot(0, q, &WebViewHost::recreateBrowser);
+                    return false;
+                }
+                return true;
+            }
+            if (user && SecurityPolicy::externalUrl(url))
+                QTimer::singleShot(0, q, [url] { QDesktopServices::openUrl(url); });
+            return false;
+        };
+        web->add_NavigationStarting(hNavigationGuard, &tokNavigationGuard);
+        hNewWindowGuard = new NewWindowGuard;
+        hNewWindowGuard->open = [this](const QUrl &url) {
+            QTimer::singleShot(0, q, [url] { QDesktopServices::openUrl(url); });
+        };
+        web->add_NewWindowRequested(hNewWindowGuard, &tokNewWindowGuard);
+
         // 每次导航完成上报(首次额外触发 pageReady)
         auto *n = new NavCompletedHandler;
         n->onDone = [this](bool ok, HRESULT err) {
-            Q_UNUSED(err);
+            // Deliberately blocked links/reloads are not page-load failures.
+            if (!ok && err == COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED) return;
             emit q->navigated(ok);
             if (!ok)
                 q->showLoadingError(QObject::tr("页面加载失败，请重新加载。"));
@@ -810,12 +921,19 @@ struct WebViewHost::Impl {
             if (initialScript.isEmpty()) q->navigate(startUrl);
             else {
                 auto *ready = new InitialScriptHandler;
-                ready->onDone = [guard = QPointer<WebViewHost>(q)](HRESULT result) {
-                    if (!guard) return;
+                ready->onDone = [guard = QPointer<WebViewHost>(q), generation = controllerGeneration](HRESULT result) {
+                    if (!guard || guard->m_closing || guard->d->controllerGeneration != generation) return;
                     if (FAILED(result)) qWarning() << "Mswrite: initial script registration failed" << result;
                     guard->navigate(guard->d->startUrl);
                 };
-                const auto script = initialScript.toStdWString();
+                QString bootstrap = initialScript;
+                if (hasRecovery) {
+                    const QJsonObject snapshot{{QStringLiteral("content"), recoveryText},
+                                               {QStringLiteral("rev"), recoveryRev}};
+                    bootstrap += QStringLiteral(";if(window.msInitialState){Object.assign(window.msInitialState,%1);}")
+                        .arg(QString::fromUtf8(QJsonDocument(snapshot).toJson(QJsonDocument::Compact)));
+                }
+                const auto script = bootstrap.toStdWString();
                 const HRESULT hr = web->AddScriptToExecuteOnDocumentCreated(script.c_str(), ready);
                 ready->Release();
                 if (FAILED(hr)) q->navigate(startUrl);
@@ -841,6 +959,7 @@ struct WebViewHost::Impl {
 
     void shutdown()
     {
+        ++controllerGeneration; // Discard callbacks retained by an older runtime controller.
         // 关键:环境创建是异步的,若本实例在回调前销毁,s_waiters 里
         // 会留下悬垂指针 —— 回调触发即 use-after-free(启动瞬间关标签/关窗)
         q->m_ctrlWatchdog.stop();
@@ -850,6 +969,8 @@ struct WebViewHost::Impl {
             if (hNav) web->remove_NavigationCompleted(tokNav);
             if (hProcFail) web->remove_ProcessFailed(tokProcFail);
             if (hResource) web->remove_WebResourceRequested(tokResource);
+            if (hNavigationGuard) web->remove_NavigationStarting(tokNavigationGuard);
+            if (hNewWindowGuard) web->remove_NewWindowRequested(tokNewWindowGuard);
         }
         if (ctrl) {
             if (hAcc) ctrl->remove_AcceleratorKeyPressed(tokAcc);
@@ -866,6 +987,8 @@ struct WebViewHost::Impl {
         rel(reinterpret_cast<void **>(&hResource));
         rel(reinterpret_cast<void **>(&hProcFail));
         rel(reinterpret_cast<void **>(&hCtrl));
+        rel(reinterpret_cast<void **>(&hNavigationGuard));
+        rel(reinterpret_cast<void **>(&hNewWindowGuard));
     }
 
     void doPrintToPdf(const QString &outPath, std::function<void(bool, HRESULT)> done)
@@ -1024,6 +1147,9 @@ void WebViewHost::retryLoading()
         auto *surface = static_cast<LoadingSurface *>(m_loading);
         surface->begin(surface->loadingText());
     }
+    // The registered bootstrap belongs to the old controller. Recreate editor
+    // controllers so the next document receives the newest recovery snapshot.
+    if (!d->initialScript.isEmpty()) { recreateBrowser(); return; }
     m_pageReady = false;
     emit loadingRetry();
     if (d->web) navigate(d->startUrl);
@@ -1074,6 +1200,16 @@ void WebViewHost::addHostMapping(const QString &virtualHost, const QString &fold
     d->resourceFolders.insert(host, folder);
 }
 
+void WebViewHost::setRecoverySnapshot(const QString &content, int revision)
+{
+    d->recoveryText = content;
+    d->recoveryRev = qMax(0, revision);
+    d->hasRecovery = true;
+}
+
+QString WebViewHost::recoveryContent() const { return d->recoveryText; }
+int WebViewHost::recoveryRevision() const { return d->recoveryRev; }
+
 void WebViewHost::setAlwaysVisible(bool on)
 {
     d->alwaysVisible = on;
@@ -1094,8 +1230,10 @@ void WebViewHost::evalWithResult(const QString &js,
 {
     // 不等 pageReady:能收到 JS 消息时 web 必然存在,
     // NavigationCompleted 可能晚于 JS ready(资源仍在加载)
-    d->runScriptNow(js, [guard = QPointer<WebViewHost>(this), result = std::move(result)](const QString &value) {
-        if (guard && !guard->m_closing && result) result(value);
+    d->runScriptNow(js, [guard = QPointer<WebViewHost>(this), generation = d->controllerGeneration,
+                        result = std::move(result)](const QString &value) {
+        if (guard && !guard->m_closing && result)
+            result(guard->d->controllerGeneration == generation ? value : QString());
     });
 }
 
@@ -1120,12 +1258,14 @@ void WebViewHost::recreateBrowser()
     d->shutdown();
     m_pageReady = false;
     m_createOnShow = false;
+    emit loadingRetry();
     start(d->userDataFolder, d->virtualHost, d->virtualFolder,
           d->startUrl, d->initialScript);
 }
 
 void WebViewHost::setZoomFactor(double factor)
 {
+    if (!std::isfinite(factor)) return;
     d->zoom = qBound(0.5, factor, 2.0);
     if (d->ctrl)
         d->ctrl->put_ZoomFactor(d->zoom);

@@ -20,6 +20,7 @@ public:
     // 否则 Windows 老文档一保存整篇 diff)
     static QString readFile(const QString &path, bool *ok = nullptr,
                             Encoding *encOut = nullptr, bool *crlfOut = nullptr);
+    static bool readBytes(const QString &path, qint64 limit, QByteArray *data);
     // 按指定编码写出(默认 UTF-8 无 BOM,与 Typora 一致)
     static bool writeFile(const QString &path, const QString &content,
                           Encoding enc = Encoding::Utf8);

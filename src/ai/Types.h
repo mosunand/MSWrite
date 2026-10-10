@@ -111,3 +111,4 @@ inline Protocol protocolFromName(const QString &name)
 
 Q_DECLARE_METATYPE(AiAttach)
 Q_DECLARE_METATYPE(QVector<AiAttach>)
+Q_DECLARE_METATYPE(QVector<ChatMessage>)

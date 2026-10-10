@@ -51,6 +51,8 @@ public:
         void emitThinking(const QString &delta);
         void emitText(const QString &delta);
         bool ensureToolSlot(int index); // 钳制 index,扩容 tools_;非法返回 false
+        bool reservePayload(qsizetype size);
+        void appendToolArgs(int index, const QByteArray &data, bool replace = false);
 
         void emitTextRaw(const QString &delta);
         void splitThinkTags(const QString &delta);
@@ -63,6 +65,7 @@ public:
             QString name;
             QByteArray args;
             QString thoughtSignature;
+            bool emptyInput = false;
         };
         QVector<PendingTool> tools_;
         // 网关拆帧容错:解析失败的 SSE 事件原文暂存,与下一条合并重试
@@ -71,5 +74,7 @@ public:
         int events_ = 0;
         bool sawSse_ = false;
         bool inThinkTag_ = false;
+        qsizetype payloadSize_ = 0;
+        QString assemblyError_;
     };
 };

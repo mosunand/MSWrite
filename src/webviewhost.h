@@ -35,6 +35,10 @@ public:
 
     // 追加文档/图片目录映射,当前页面立即生效,无需重新导航。
     void addHostMapping(const QString &virtualHost, const QString &folder);
+    // Latest editor state stays in the native process when its renderer restarts.
+    void setRecoverySnapshot(const QString &content, int revision);
+    QString recoveryContent() const;
+    int recoveryRevision() const;
 
     // 置 true 后 WebView2 视为始终可见(隐藏导出页用:不可见时渲染会挂起)
     void setAlwaysVisible(bool on);

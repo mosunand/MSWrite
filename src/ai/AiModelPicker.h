@@ -102,7 +102,7 @@ inline QLabel *makeSeparator(QWidget *parent, bool dark)
 inline void disableDwmShadow(QWidget *w)
 {
     using DwmSetWindowAttributeFn = long(__stdcall *)(void *, unsigned long, const void *, unsigned long);
-    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    HMODULE dwm = LoadLibraryExW(L"dwmapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!dwm)
         return;
     const auto set = reinterpret_cast<DwmSetWindowAttributeFn>(

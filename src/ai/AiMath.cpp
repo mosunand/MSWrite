@@ -12,6 +12,7 @@
 #include <QHash>
 #include <QMap>
 #include <QVector>
+#include <QScopeGuard>
 
 #include <algorithm>
 
@@ -271,7 +272,6 @@ static constexpr int kMaxLexDepth = 64;
                     *hitCmd = name;
                 if (endPos)
                     *endPos = i - 1 - name.size() + 0; // position of the backslash
-                *endPos = i - name.size() - 1;
                 return;
             }
             Node n;
@@ -559,12 +559,14 @@ QString renderMatrix(const QString& body)
 {
     // split rows by \\, cells by &
     const QStringList rows = body.split(QStringLiteral("\\\\"));
+    if (rows.size() > 256) return body; // Keep source when a terminal matrix is too large to lay out.
     QStringList out;
     int maxCols = 0;
     QVector<QStringList> cells;
     for (const QString& row : rows) {
         cells << row.split(QLatin1Char('&'));
         maxCols = std::max(maxCols, int(cells.last().size()));
+        if (maxCols > 128) return body;
     }
     QVector<int> widths(maxCols, 0);
     for (const QStringList& row : cells) {
@@ -572,6 +574,9 @@ QString renderMatrix(const QString& body)
             widths[i] = std::max(widths[i], Text::visibleWidth(row.at(i).simplified()));
     }
     const int n = cells.size();
+    qint64 rowWidth = 4;
+    for (int width : widths) rowWidth += width + 1;
+    if (rowWidth * (n + 2) > 1024 * 1024) return body;
     for (int r = 0; r < n; ++r) {
         QString line = QStringLiteral("│ ");
         for (int i = 0; i < cells.at(r).size(); ++i) {
@@ -854,6 +859,11 @@ bool extractEnv(const QString& latex, const QString& env, QString* body, QString
 
 QString render(const QString& latexIn, bool block)
 {
+    // Repeated matrix environments recurse independently of brace depth.
+    static thread_local int renderDepth = 0;
+    if (renderDepth >= 64 || latexIn.size() > 64 * 1024) return latexIn;
+    ++renderDepth;
+    const auto leave = qScopeGuard([&] { --renderDepth; });
     QString latex = latexIn.trimmed();
     if (latex.isEmpty())
         return QString();

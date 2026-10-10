@@ -502,6 +502,8 @@ QImage PdfViewWidget::pageImage(int page) const
 {
     if(page<0 || page>=pageCount()) return {};
     const QSizeF points=m_doc->pagePointSize(page);
+    if (!std::isfinite(points.width()) || !std::isfinite(points.height())
+        || points.width() <= 0 || points.height() <= 0) return {};
     const double scale=qMin(1600.0/points.width(),2000.0/points.height());
     return m_doc->render(page,QSize(qCeil(points.width()*scale),qCeil(points.height()*scale)));
 }
@@ -516,9 +518,11 @@ void PdfViewWidget::fitOutlineWidth()
     // PDF 书签树理论上可无限嵌套。Windows 默认栈约 1MB,递归几千层即溢出崩溃;
     // 正常文档书签深度不过几十层,超过 256 几乎必是畸形 PDF。深度封顶保证稳定。
     constexpr int kMaxOutlineDepth = 256;
+    int measured = 0;
     std::function<void(const QModelIndex &,int)> measure = [&](const QModelIndex &parent,int depth) {
         if (depth >= kMaxOutlineDepth) return;
-        for(int row=0;row<model->rowCount(parent);++row) {
+        for(int row=0;row<model->rowCount(parent) && measured < 10000;++row) {
+            ++measured;
             const auto index=model->index(row,0,parent);
             widest=qMax(widest, metrics.horizontalAdvance(index.data().toString())
                 +(depth+1)*m_outlineTree->indentation()+30);
@@ -553,7 +557,7 @@ void PdfViewWidget::updateRenderQuality()
             item->setProperty("smooth",true);
         }
         const double w=item->width(), h=item->height();
-        if(w<1 || h<1) continue;
+        if(!std::isfinite(w) || !std::isfinite(h) || w<1 || h<1) continue;
         // Supersample fine glyphs, using the native widget's DPR (Quick's
         // offscreen Screen attachment may still refer to the previous screen).
         // Bound very large pages so repeated zooming cannot exhaust memory.

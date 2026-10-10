@@ -5,6 +5,7 @@
 #include "ai/AiChatDock.h"
 #include "ai/LlmCodec.h"
 #include "ai/MswriteSkill.h"
+#include "deferredrequest.h"
 
 #include <QElapsedTimer>
 #include <QJsonArray>
@@ -14,6 +15,8 @@
 #include <QJsonDocument>
 #include <QSemaphore>
 #include <QPointer>
+#include <QScopeGuard>
+#include <QCoreApplication>
 #include <memory>
 
 namespace {
@@ -111,24 +114,31 @@ AiWorker::AiWorker(QObject *parent)
 {
 }
 
+void AiWorker::setDock(AiChatDock *dock) { dock_ = dock; }
+
 void AiWorker::applyConfig(const AiLlmConfig &cfg)
 {
+    // HTTP runs a nested worker event loop. A model switch must not change the
+    // protocol/key halfway through parsing or retrying the current request.
+    if (running_) { pendingConfig_ = cfg; hasPendingConfig_ = true; return; }
     cfg_ = cfg;
     llm_.setConfig(cfg_);
 }
 
 QString AiWorker::runInsert(const QString &text)
 {
-    if (!dock_ || stop_.load())
+    if (!dock_ || stop_.load() || cancel_->load())
         return QStringLiteral("Error: no document window");
     // 跨线程回调 GUI 执行插入并回传结果:Queued + 信号量等待(与 readDocument
     // 同模式),带超时兜底。原先的 BlockingQueuedConnection 在 GUI 忙于模态
     // 对话框/退出时会让工作线程永久挂起,wait() 超时后销毁仍在运行的 QThread
     // 直接 qFatal(退出偶发闪退的根源)。
-    struct InsertState { QSemaphore ready; QString result; };
+    struct InsertState : DeferredRequest { InsertState() : DeferredRequest(5000) {} QSemaphore ready; QString result; };
     auto state = std::make_shared<InsertState>();
-    QMetaObject::invokeMethod(dock_, [guard = QPointer<AiChatDock>(dock_), state, text] {
-        if (!guard) {
+    // Dispatch through the application, whose GUI context outlives the dock.
+    // A retained weak pointer avoids constructing a guard from a stale raw pointer.
+    const bool queued = QMetaObject::invokeMethod(QCoreApplication::instance(), [guard = dock_, state, text, cancel = cancel_] {
+        if (!guard || !state->active() || cancel->load()) {
             state->result = QStringLiteral("Error: document window closed");
             state->ready.release();
             return;
@@ -136,31 +146,48 @@ QString AiWorker::runInsert(const QString &text)
         state->result = guard->insertAtCursor(text);
         state->ready.release();
     }, Qt::QueuedConnection);
+    if (!queued) { state->cancel(); return QStringLiteral("Error: GUI is shutting down; insert skipped"); }
     // 5 秒未完成视为 GUI 不可达:放弃插入,轮次以错误收尾而不是挂死
-    if (!state->ready.tryAcquire(1, 5000))
+    if (!state->ready.tryAcquire(1, 5000)) {
+        state->cancel();
         return QStringLiteral("Error: document window busy; insert skipped");
+    }
     return state->result;
 }
 
 AiDocumentResult AiWorker::readDocument(const QJsonObject &request)
 {
-    if(!dock_) return {QStringLiteral("Error: no document window"),{}};
-    struct ReadState { QSemaphore ready; AiDocumentResult result; };
+    if(!dock_ || stop_.load() || cancel_->load()) return {QStringLiteral("Error: no document window"),{}};
+    struct ReadState : DeferredRequest { ReadState() : DeferredRequest(2000) {} QSemaphore ready; AiDocumentResult result; };
     auto state=std::make_shared<ReadState>();
-    QMetaObject::invokeMethod(dock_,[guard=QPointer<AiChatDock>(dock_),request,state] {
-        if(!guard) {state->result.text=QStringLiteral("Error: document window closed");state->ready.release();return;}
+    const bool queued = QMetaObject::invokeMethod(QCoreApplication::instance(),[guard=dock_,request,state,cancel=cancel_] {
+        if(!guard || !state->active() || cancel->load()) {state->result.text=QStringLiteral("Error: document window closed or request expired");state->ready.release();return;}
         guard->readDocument(request,[state](AiDocumentResult result) {
             state->result=std::move(result);state->ready.release();
         });
     },Qt::QueuedConnection);
-    if(!state->ready.tryAcquire(1,2000))
+    if(!queued) {state->cancel();return {QStringLiteral("Error: GUI is shutting down; read skipped"),{}};}
+    if(!state->ready.tryAcquire(1,2000)) {
+        state->cancel();
         return {QStringLiteral("Error: document is not ready; retry reading. No cached text was substituted."),{}};
+    }
     return state->result;
 }
 
 void AiWorker::run(const QString &userText, const QString &docMarkdown,
                    int writeMode, const QString &thinkEffort, const QVector<AiAttach> &images)
 {
+    const HttpAbort::Scope cancellation(cancel_);
+    running_ = true;
+    const auto finishRun = qScopeGuard([this] {
+        running_ = false;
+        if (hasPendingConfig_) { hasPendingConfig_ = false; applyConfig(pendingConfig_); }
+    });
+    if (stop_.load() || cancel_->load()) {
+        emit turnFinished(QStringLiteral("已中断"));
+        emit busyChanged(false);
+        return;
+    }
     if (userText.trimmed().isEmpty() && images.isEmpty()) {
         emit turnFinished(QStringLiteral("请输入文字或添加图片"));
         emit busyChanged(false);
@@ -210,7 +237,7 @@ void AiWorker::run(const QString &userText, const QString &docMarkdown,
 
     for (int turn = 1; turn <= kMaxTurns; ++turn) {
         // GUI 已请求终止(关窗/退出):不再发起请求与 GUI 回调,立即收尾
-        if (stop_.load()) {
+        if (stop_.load() || cancel_->load()) {
             error = QStringLiteral("已中断");
             break;
         }
@@ -273,6 +300,7 @@ void AiWorker::run(const QString &userText, const QString &docMarkdown,
         // DeepSeek 系模型偶尔把工具调用写进 text 而非 tool_calls:
         // 从正文提取成正式 ToolCall,清除裸 DSML 标签
         LlmCodec::extractStrayToolCalls(resp);
+        if (!resp.error.isEmpty()) { error = translateApiError(resp.error, resp.httpStatus); break; }
         // Some gateways return a complete response without streaming deltas.
         // The final response must still reach the conversation model.
         if(streamedTurnText.isEmpty() && !resp.text.isEmpty()) sink.onText(resp.text);
@@ -289,14 +317,24 @@ void AiWorker::run(const QString &userText, const QString &docMarkdown,
             break;
 
         QVector<AiAttach> pageImages;
+        qsizetype toolOutputBytes = 0, imageBytes = 0;
         for (const ToolCall &call : resp.toolCalls) {
+            if (stop_.load() || cancel_->load()) { error = QStringLiteral("已中断"); break; }
             QString result;
-            if(call.name==QLatin1String("ReadDocument")) {
+            if (call.name==QLatin1String("ReadDocument") && toolOutputBytes >= 32*1024*1024) {
+                result=QStringLiteral("Error: tool output limit reached; request a smaller range in a new turn.");
+            } else if(call.name==QLatin1String("ReadDocument")) {
                 QJsonObject request=call.input;
                 request.insert(QStringLiteral("document_id"),context.value(QStringLiteral("id")));
                 const auto document=readDocument(request);
                 result=document.text;
-                pageImages+=document.images;
+                for(const auto &image:document.images) {
+                    if(pageImages.size()>=8 || imageBytes+image.base64.size()>24*1024*1024) {
+                        result+=QStringLiteral("\nImage output limit reached; request remaining pages in a new turn.");
+                        break;
+                    }
+                    pageImages.append(image); imageBytes+=image.base64.size();
+                }
             } else if (call.name == QLatin1String("Insert") && writeMode!=0) {
                 const QString text = call.input.value(QStringLiteral("text")).toString();
                 if (text.isEmpty()) {
@@ -307,6 +345,12 @@ void AiWorker::run(const QString &userText, const QString &docMarkdown,
             } else {
                 result = QStringLiteral("Error: unknown tool %1").arg(call.name);
             }
+
+            const qsizetype resultBytes = result.toUtf8().size();
+            if (toolOutputBytes+resultBytes>32*1024*1024) {
+                result=QStringLiteral("Error: tool output exceeds 32 MB; request a smaller range in a new turn.");
+                toolOutputBytes=32*1024*1024;
+            } else toolOutputBytes+=resultBytes;
 
             ChatMessage m;
             m.role = QStringLiteral("tool");
@@ -336,6 +380,7 @@ void AiWorker::run(const QString &userText, const QString &docMarkdown,
                << "字 think=" << thinkMs << "ms";
     emit turnStats(thinkMs, tps, outTokens, inTokens);
     emit turnRendered(raw.trimmed());
+    emit historyChanged(history_);
     emit turnFinished(error);
     emit busyChanged(false);
 }

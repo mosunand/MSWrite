@@ -131,9 +131,11 @@ private:
     ChatModel *m_msgs = nullptr;
     QThread *m_thread = nullptr;
     AiWorker *m_worker = nullptr;
+    QVector<ChatMessage> m_history; // Worker-published snapshot; GUI never reads mutable worker history.
 
     QVector<AiAttach> m_images;                       // 待发送图片
     QVector<QPair<QString, QString>> m_textFiles;      // 待发送文本附件 (名, 内容)
+    quint64 m_attachmentGeneration = 0;
 
     int m_writeMode = 0;   // 0不写入 1AI 决定 2强制全写(持久化)
     QString m_thinkEffort = QStringLiteral("high"); // 思考档位名,""=关(持久化 aiThinkEffort)

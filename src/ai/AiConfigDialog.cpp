@@ -5,6 +5,7 @@
 // 每个模型有独立的编辑弹窗(AiModelEditDialog,含思考档位自定义)。
 
 #include "ai/AiConfigDialog.h"
+#include <limits>
 #include "ai/LlmCodec.h" // kDefaultMaxTokens
 
 #include <QCheckBox>
@@ -114,11 +115,13 @@ int smartContextWindow(const QString &id)
     if (l < 0 || r < 0)
         return 0;
     const QString inside = id.mid(l + 1, r - l - 1).trimmed();
-    if (inside.endsWith(QLatin1Char('M'), Qt::CaseInsensitive))
-        return inside.left(inside.size() - 1).toInt() * 1048576;
-    if (inside.endsWith(QLatin1Char('k'), Qt::CaseInsensitive))
-        return inside.left(inside.size() - 1).toInt() * 1024;
-    return 0;
+    const qint64 unit = inside.endsWith(QLatin1Char('M'), Qt::CaseInsensitive) ? 1048576
+                      : inside.endsWith(QLatin1Char('k'), Qt::CaseInsensitive) ? 1024 : 0;
+    if (!unit) return 0;
+    bool ok = false;
+    const qint64 amount = inside.left(inside.size() - 1).toLongLong(&ok);
+    if (!ok || amount <= 0 || amount > std::numeric_limits<int>::max() / unit) return 0;
+    return int(amount * unit);
 }
 
 } // namespace
@@ -631,6 +634,7 @@ void AiConfigDialog::rebuildList(const QString &selectName)
 // 模型列表行:模型 id + 上下文/视觉徽标 + 启用开关 + ✎ 编辑
 void AiConfigDialog::rebuildModelRows()
 {
+    const quint64 generation = ++modelRowsGeneration_;
     modelList_->clear();
     for (int i = 0; i < editingModels_.size(); ++i) {
         const AiModelCfg &m = editingModels_.at(i);
@@ -663,11 +667,13 @@ void AiConfigDialog::rebuildModelRows()
         auto *edit = new QPushButton(QStringLiteral("✎"), row);
         edit->setObjectName(QStringLiteral("mini"));
         edit->setToolTip(tr("编辑该模型(上下文/回复上限/思考档位等)"));
-        connect(edit, &QPushButton::clicked, this, [this, i] {
+        connect(edit, &QPushButton::clicked, this, [this, i, generation] {
+            if (generation != modelRowsGeneration_ || i >= editingModels_.size()) return;
             AiModelCfg cfg = editingModels_.at(i);
             const QString oldId = cfg.id;
             if (!AiModelEditDialog::edit(this, dark_ ? QStringLiteral("dark") : QStringLiteral("light"), cfg, false))
                 return;
+            if (generation != modelRowsGeneration_ || i >= editingModels_.size()) return;
             for (int j = 0; j < editingModels_.size(); ++j) {
                 if (j != i && editingModels_.at(j).id == cfg.id) {
                     setStatus(tr("模型已存在:%1").arg(cfg.id), true);
@@ -685,7 +691,8 @@ void AiConfigDialog::rebuildModelRows()
         sw->setObjectName(QStringLiteral("switch"));
         sw->setChecked(m.enabled);
         sw->setToolTip(tr("启用/停用该模型(停用后不出现在切换列表)"));
-        connect(sw, &QCheckBox::toggled, this, [this, i](bool on) {
+        connect(sw, &QCheckBox::toggled, this, [this, i, generation](bool on) {
+            if (generation != modelRowsGeneration_ || i >= editingModels_.size()) return;
             editingModels_[i].enabled = on;
             rebuildModelRows();
         });

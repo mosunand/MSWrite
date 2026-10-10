@@ -3,6 +3,7 @@
 #include "ai/AiProviders.h"
 
 #include "ai/AiCcSwitch.h"
+#include "fileservice.h"
 
 #include <QDir>
 #include <QFile>
@@ -137,7 +138,11 @@ AiProviderStore::AiProviderStore(const QString &path)
         return;
     }
     QJsonParseError parseError;
-    const QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &parseError);
+    QByteArray data;
+    if (!FileService::readBytes(path_, 8 * 1024 * 1024, &data)) {
+        loadError_ = QStringLiteral("供应商配置读取失败或超过 8 MB，已保留原文件：%1").arg(path_); return;
+    }
+    const QJsonDocument doc = QJsonDocument::fromJson(data, &parseError);
     if (parseError.error != QJsonParseError::NoError || !doc.isObject()
         || !doc.object().value(QStringLiteral("providers")).isArray()) {
         loadError_ = QStringLiteral("供应商配置格式错误，已保留原文件：%1").arg(path_);
@@ -644,7 +649,16 @@ int AiProviderStore::importFromMsAgent(QString *report)
             *report = QStringLiteral("找不到 MS-Agent 配置(%1),可先在 MS-Agent 里添加再导入").arg(src);
         return -1;
     }
-    const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+    QByteArray data;
+    QJsonParseError parseError;
+    const QJsonDocument imported = FileService::readBytes(src, 8 * 1024 * 1024, &data)
+        ? QJsonDocument::fromJson(data, &parseError) : QJsonDocument();
+    if (imported.isNull() || parseError.error != QJsonParseError::NoError || !imported.isObject()
+        || !imported.object().value(QStringLiteral("providers")).isArray()) {
+        if (report) *report = QStringLiteral("MS-Agent 配置读取失败、格式错误或超过 8 MB，未导入任何数据。");
+        return -1;
+    }
+    const QJsonObject root = imported.object();
     const QJsonArray arr = root.value(QStringLiteral("providers")).toArray();
 
     int added = 0;

@@ -48,8 +48,9 @@ void OutlineDock::setItems(const QVector<OutlineItem> &items)
     for (const OutlineItem &it : items) {
         QString prefix;
         // 层级缩进,一级最醒目
-        if (it.level > 1)
-            prefix = QString((it.level - 1) * 2, QLatin1Char(' '));
+        const int level = qBound(1, it.level, 6);
+        if (level > 1)
+            prefix = QString((level - 1) * 2, QLatin1Char(' '));
         auto *row = new QListWidgetItem(prefix + it.text, m_list);
         if (it.level == 1)
             row->setFont([](QFont f) { f.setBold(true); return f; }(row->font()));

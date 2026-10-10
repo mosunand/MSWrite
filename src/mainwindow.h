@@ -11,6 +11,8 @@
 #include <QSet>
 #include <QVector>
 #include <functional>
+#include <atomic>
+#include <memory>
 
 class WebViewHost;
 class OutlineDock;
@@ -208,6 +210,7 @@ private:
     bool m_lineNumbers = false;          // 代码块行号(默认关:MarkText 式无行号卡片)
     int m_docHostSeq = 0;
     QFutureWatcher<QVector<QPair<QString, QString>>> m_searchWatcher;
+    std::shared_ptr<std::atomic_bool> m_searchCancelled;
     bool m_focusMode = false;
     bool m_typewriter = false;
     bool m_shuttingDown = false;

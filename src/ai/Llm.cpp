@@ -40,8 +40,11 @@ ChatResponse Llm::complete(const QString &system,
     if (transport_) {
         const QByteArray body = LlmCodec::requestBody(cfg_.protocol, model, system, history, tools, false, cfg_.maxTokens, cfg_.thinkEffort);
         ChatResponse raw = transport_(cfg_.protocol, url, body, headers, cfg_.timeoutMs);
-        if (!raw.raw.isEmpty())
-            return LlmCodec::parse(cfg_.protocol, raw.httpStatus, raw.raw);
+        if (!raw.raw.isEmpty()) {
+            ChatResponse parsed = LlmCodec::parse(cfg_.protocol, raw.httpStatus, raw.raw);
+            if (!raw.error.isEmpty()) { parsed.error = raw.error; parsed.toolCalls.clear(); }
+            return parsed;
+        }
         return raw;
     }
 
@@ -77,8 +80,11 @@ ChatResponse Llm::complete(const QString &system,
     const QByteArray body = LlmCodec::requestBody(cfg_.protocol, model, system, history, tools, false, cfg_.maxTokens, cfg_.thinkEffort);
     const HttpResult plain = Http::postJson(url, body, headers, cfg_.timeoutMs);
     ChatResponse parsed = LlmCodec::parse(cfg_.protocol, plain.status, plain.body);
-    if (parsed.error.isEmpty() && parsed.text.isEmpty() && parsed.toolCalls.isEmpty() && !plain.error.isEmpty())
+    if (!plain.error.isEmpty()) {
         parsed.error = plain.error;
+        parsed.toolCalls.clear(); // A partial HTTP body must never authorize document writes.
+        return parsed;
+    }
     if (!parsed.thinking.isEmpty() && sink.onThinking)
         sink.onThinking(parsed.thinking);
     if (!parsed.text.isEmpty() && sink.onText && !parsed.streamedText)

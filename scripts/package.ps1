@@ -33,6 +33,7 @@ $env:PATH = "$QtBin;$env:PATH"
 if ($LASTEXITCODE -ne 0) { Write-Error "windeployqt 失败" }
 
 # 3. 页面资源(编辑器内核/主题)
+& (Join-Path $PSScriptRoot 'harden-vditor.ps1')
 $webOut = Join-Path $out "resources\web"
 New-Item -ItemType Directory -Path $webOut -Force | Out-Null
 Copy-Item "$root\resources\web\*" $webOut -Recurse -Force

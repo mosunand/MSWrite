@@ -2,6 +2,7 @@
 
 #include "webviewhost.h"
 #include "bridge.h"
+#include "securitypolicy.h"
 #include "fileservice.h"
 #include "outlinedock.h"
 #include "searchdock.h"
@@ -12,6 +13,7 @@
 #include "ai/AiChatDock.h"
 #include "ai/AiConfigDialog.h"
 #include "ai/AiDoctor.h"
+#include <cmath>
 
 #include <QActionGroup>
 #include <QApplication>
@@ -63,6 +65,7 @@
 #include <QTabBar>
 #include <QToolButton>
 #include <QTextStream>
+#include <QStringTokenizer>
 #include <QTime>
 #include <QTimer>
 #include <QUrl>
@@ -80,7 +83,7 @@ QString pageUrl()
 {
     // ?v= 与 bridge.js 版本同步递增:editor.html 本体也绕过缓存
     QString url = QStringLiteral("https://") + QLatin1String(kVirtualHost)
-                + QStringLiteral("/editor.html?v=161");
+                + QStringLiteral("/editor.html?v=169");
     // 开发态才把排障开关传给页面(按键记录器等),生产环境不启用
     if (qEnvironmentVariableIsSet("MSWRITE_DEV"))
         url += QStringLiteral("&dev=1");
@@ -233,6 +236,7 @@ MainWindow::MainWindow(QWidget *parent, const QString &initialPath)
     // 后台搜索结果回传
     connect(&m_searchWatcher, &QFutureWatcher<QVector<QPair<QString, QString>>>::finished,
             this, [this] {
+                if (!m_searchCancelled || m_searchCancelled->load()) return;
                 m_search->showWorkspaceResults(m_searchWatcher.result());
             });
 
@@ -328,6 +332,7 @@ MainWindow::MainWindow(QWidget *parent, const QString &initialPath)
 
 MainWindow::~MainWindow()
 {
+    if (m_searchCancelled) m_searchCancelled->store(true);
     delete m_aiDock;
 }
 
@@ -382,6 +387,14 @@ QString MainWindow::saveImageAsset(const Tab &tab, const QString &base64, const 
         *error = QStringLiteral("空数据");
         return {};
     }
+    constexpr qsizetype maxImageBytes = 32 * 1024 * 1024;
+    if (base64.size() > ((maxImageBytes + 2) / 3) * 4) {
+        *error = QStringLiteral("图片超过 32 MB"); return {};
+    }
+    const auto decoded = QByteArray::fromBase64Encoding(base64.toLatin1(), QByteArray::AbortOnBase64DecodingErrors);
+    if (!decoded || decoded.decoded.isEmpty() || decoded.decoded.size() > maxImageBytes) {
+        *error = QStringLiteral("图片数据无效或超过 32 MB"); return {};
+    }
     // 图片存文档同级 assets,插入相对路径(可移植,用户指定模式)
     // Keep using the displayed document root until Save As has succeeded.
     const QString baseDir = tab.docDir.isEmpty() ? m_files->defaultSaveDir() : tab.docDir;
@@ -398,7 +411,7 @@ QString MainWindow::saveImageAsset(const Tab &tab, const QString &base64, const 
     for (int i = 0; assetsDir.exists(name); ++i)
         name = QStringLiteral("image-%1-%2.%3").arg(stamp).arg(i).arg(ext);
 
-    const QByteArray bytes = QByteArray::fromBase64(base64.toLatin1());
+    const QByteArray &bytes = decoded.decoded;
     QSaveFile f(assetsDir.filePath(name));
     if (bytes.isEmpty() || !f.open(QIODevice::WriteOnly) || f.write(bytes) != bytes.size() || !f.commit()) {
         *error = QStringLiteral("写入图片失败");
@@ -441,6 +454,7 @@ int MainWindow::addTab(const QString &path, const QString &content,
             QSettings().value(QStringLiteral("lineHeight"), 1.0).toDouble()},
         {"lineNumbers", m_lineNumbers},
         {"preferLatex",QSettings().value(QStringLiteral("preferLatex"),false).toBool()}};
+    t.host->setRecoverySnapshot(content, 0);
     const QString bootstrap = QStringLiteral("if(location.origin==='https://app.local'){window.msInitialState=%1;}")
         .arg(QString::fromUtf8(QJsonDocument(initial).toJson(QJsonDocument::Compact)));
     t.host->start(exeDir + QStringLiteral("/webview-data"),
@@ -470,6 +484,7 @@ int MainWindow::addTab(const QString &path, const QString &content,
     });
     // 恢复该文档上次使用的整页缩放(按路径持久化)
     t.zoom = QSettings().value(QStringLiteral("zoom/") + path, 1.0).toDouble();
+    t.zoom = std::isfinite(t.zoom) ? qBound(0.5, t.zoom, 2.0) : 1.0;
     if (!qFuzzyCompare(t.zoom, 1.0))
         t.host->setZoomFactor(t.zoom);
     // 本文档默认代码语言(按路径持久化,标签页各自独立)
@@ -483,13 +498,13 @@ int MainWindow::addTab(const QString &path, const QString &content,
 
     // Reloading the initial page must restore its live image mappings and any
     // preferences changed while loading, as well as the bootstrap fallback.
-    connect(t.host, &WebViewHost::loadingRetry, this, [this, host=t.host, content] {
+    connect(t.host, &WebViewHost::loadingRetry, this, [this, host=t.host] {
         const auto *tab = tabForHost(host);
         if (!tab) return;
         host->runScript(Bridge::call(QStringLiteral("setDocHost"), { tab->docHost }));
         syncImgMaps();
         host->runScript(QStringLiteral("if(!window.msInitialState){%1}")
-            .arg(Bridge::call(QStringLiteral("setContent"), { content })));
+            .arg(Bridge::call(QStringLiteral("restoreContent"), { host->recoveryContent(), host->recoveryRevision() })));
         host->runScript(Bridge::call(QStringLiteral("setTheme"), { m_theme }));
         host->runScript(Bridge::call(QStringLiteral("setFontSize"), { m_fontSize }));
         host->runScript(Bridge::call(QStringLiteral("setLineNumbers"), { m_lineNumbers }));
@@ -595,6 +610,7 @@ void MainWindow::refreshTitleHint(Tab &tab)
 
 MainWindow::Tab *MainWindow::tabForHost(WebViewHost *host)
 {
+    if (!host) return nullptr; // PDF tabs have no editor host.
     for (Tab &t : m_tabs)
         if (t.host == host)
             return &t;
@@ -603,6 +619,7 @@ MainWindow::Tab *MainWindow::tabForHost(WebViewHost *host)
 
 int MainWindow::indexOfHost(WebViewHost *host) const
 {
+    if (!host) return -1;
     for (int i = 0; i < m_tabs.size(); ++i)
         if (m_tabs[i].host == host)
             return i;
@@ -947,7 +964,7 @@ void MainWindow::markDirty(int index, bool dirty)
 void MainWindow::updateTitle()
 {
     const int i = currentTabIndex();
-    if (i < 0) {
+    if (i < 0 || i >= m_tabs.size()) {
         setWindowTitle(QStringLiteral("Mswrite"));
         return;
     }
@@ -1429,6 +1446,8 @@ void MainWindow::buildMenus()
         Tab *t = currentTab();
         if (!t)
             return;
+        const QPointer<WebViewHost> editor(t->host);
+        if (!editor) return;
         const QString none = tr("(无默认)");
         const QStringList langs = {
             none,
@@ -1452,7 +1471,7 @@ void MainWindow::buildMenus()
         if (!ok)
             return;
         const QString lang = (picked.isEmpty() || picked == none) ? QString() : picked.toLower();
-        applyDocLang(*t, lang);
+        if (auto *live = editor ? tabForHost(editor) : nullptr) applyDocLang(*live, lang);
     });
     settings->addSeparator();
     // 主题:同步勾选到"主题"菜单(同一组 QAction,两处入口共享状态)
@@ -1532,6 +1551,7 @@ void MainWindow::buildMenus()
 // 每标签独立;按文档路径持久化,重开恢复
 void MainWindow::applyZoom(Tab &tab, double factor)
 {
+    if (!std::isfinite(factor)) return;
     if (tab.pdf) { tab.pdf->zoomFitWidth(); return; }
     factor = qBound(0.5, factor, 2.0);
     tab.zoom = factor;
@@ -1853,6 +1873,9 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
         return;
     }
     if (t == QLatin1String("changed")) {
+        if (!SecurityPolicy::nonNegativeInt(obj.value(QStringLiteral("rev")))
+            || !obj.value(QStringLiteral("md")).isString()
+            || obj.value(QStringLiteral("rev")).toInt() < tab->rev) return;
         tab->rev = obj.value(QStringLiteral("rev")).toInt();
         tab->saveError.clear();
         markDirty(index, true);
@@ -1885,13 +1908,22 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
         return;
     }
     if (t == QLatin1String("content")) {
+        if (!tab->awaitingContent || !SecurityPolicy::contentReply(obj, tab->saveRequest))
+            return; // 缺失/错误类型的正文不能被默认转换为空串并覆盖原稿。
         QString md = restoreImagePaths(*tab, obj.value(QStringLiteral("md")).toString());
         const int savedRev = obj.value(QStringLiteral("rev")).toInt();
         if (tab->awaitingContent && obj.value(QStringLiteral("request")).toInt()==tab->saveRequest) {
             tab->awaitingContent = false;
             const bool newFile=tab->path.isEmpty();
             if(newFile && md.trimmed().isEmpty()) {
-                markDirty(index,false);
+                const bool stale = savedRev < qMax(tab->rev, tab->host->recoveryRevision());
+                markDirty(index, stale);
+                if (stale && (m_flushingSaves || tab->closeAfterSave)) requestContent(*tab);
+                else if (stale && m_autoSave) tab->autoSave->start(1500);
+                else if (!stale && tab->closeAfterSave) {
+                    tab->closeAfterSave = false;
+                    closeTab(index);
+                }
                 return;
             }
             {
@@ -1928,7 +1960,7 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
                     statusBar()->showMessage(
                         newFile ? tr("新文档已自动保存到 %1").arg(QDir::toNativeSeparators(path))
                                 : tr("已保存 %1").arg(QTime::currentTime().toString()), newFile ? 8000 : 2500);
-                    if (savedRev < tab->rev) {
+                    if (savedRev < qMax(tab->rev, tab->host->recoveryRevision())) {
                         // 边打字边存:快照已过期。保留脏标记并再存一次,否则会出现
                         // "标签显示已保存、磁盘却是旧内容",此刻关窗就是静默丢字
                         markDirty(index, true);
@@ -1970,6 +2002,9 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
     if (t == QLatin1String("html")) {
         if (!m_exportBusy || sender != m_exportSource
             || obj.value(QStringLiteral("request")).toInt() != m_exportRequest) return;
+        if (!obj.value(QStringLiteral("html")).isString()) {
+            resetExport(); statusBar()->showMessage(tr("导出返回了无效内容，请重试"), 5000); return;
+        }
         tab->titleHint = FileService::titleFromMarkdown(obj.value(QStringLiteral("titleSource")).toString());
         // 延后到 COM 回调之外:导出要开文件对话框(嵌套事件循环)
         const QString html = obj.value(QStringLiteral("html")).toString();
@@ -1991,6 +2026,7 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
     }
     if (t == QLatin1String("pickImage")) {
         QTimer::singleShot(0, this, [this, host = QPointer<WebViewHost>(sender)] {
+            if (!host || !tabForHost(host)) return;
             const int idx = indexOfHost(host);
             if (idx >= 0)
                 m_tabbar->setCurrentIndex(idx);
@@ -2038,7 +2074,7 @@ void MainWindow::onWebMessage(WebViewHost *sender, const QJsonObject &obj)
     if (t == QLatin1String("openUrl")) {
         // Alt+点击链接文字:系统浏览器打开
         const QString url = obj.value(QStringLiteral("url")).toString();
-        if (!url.isEmpty())
+        if (SecurityPolicy::externalUrl(QUrl(url)))
             QDesktopServices::openUrl(QUrl(url));
         return;
     }
@@ -2229,13 +2265,11 @@ void MainWindow::handlePickImage()
     t = editor ? tabForHost(editor) : nullptr;
     if (!t) return;
     // 拷入文档 assets(与粘贴同款流程)
-    QFile in(src);
-    if (!in.open(QIODevice::ReadOnly)) {
-        statusBar()->showMessage(tr("无法读取图片"), 3000);
+    QByteArray bytes;
+    if (!FileService::readBytes(src, 32 * 1024 * 1024, &bytes)) {
+        statusBar()->showMessage(tr("无法读取图片，或图片超过 32 MB"), 3000);
         return;
     }
-    const QByteArray bytes = in.readAll();
-    in.close();
     const QString b64 = QString::fromLatin1(bytes.toBase64());
     QString error;
     const QString rel = saveImageAsset(*t, b64, QFileInfo(src).suffix(), &error);
@@ -2302,10 +2336,9 @@ void MainWindow::pasteFromClipboard()
             const QString suffix = QFileInfo(p).suffix().toLower();
             if (!kImgSuffix.contains(suffix))
                 continue;
-            QFile in(p);
-            if (!in.open(QIODevice::ReadOnly))
-                continue;
-            insertImage(in.readAll(), suffix);
+            QByteArray bytes;
+            if (FileService::readBytes(p, 32 * 1024 * 1024, &bytes)) insertImage(bytes, suffix);
+            else statusBar()->showMessage(tr("无法读取图片，或图片超过 32 MB"), 3000);
             return;
         }
     }
@@ -2419,6 +2452,8 @@ void MainWindow::onOutlineGoto(int index)
 
 void MainWindow::onSearchRequested(const QString &scope, const QString &query)
 {
+    if (m_searchCancelled) m_searchCancelled->store(true);
+    if (query.trimmed().isEmpty()) return;
     if (scope == QLatin1String("doc")) {
         Tab *t = currentTab();
         if (t && t->host) {
@@ -2434,8 +2469,10 @@ void MainWindow::onSearchRequested(const QString &scope, const QString &query)
     }
     m_search->showStatus(tr("正在搜索..."));
     const QString lower = query.toLower();
+    const auto cancelled = std::make_shared<std::atomic_bool>(false);
+    m_searchCancelled = cancelled;
     // 捕获值列表按值拷贝,线程内不碰任何 UI 成员
-    const auto future = QtConcurrent::run([ws, lower]() -> QVector<QPair<QString, QString>> {
+    const auto future = QtConcurrent::run([ws, lower, cancelled]() -> QVector<QPair<QString, QString>> {
         QVector<QPair<QString, QString>> results;
         QDirIterator it(ws,
                         { QStringLiteral("*.md"), QStringLiteral("*.markdown"),
@@ -2443,22 +2480,22 @@ void MainWindow::onSearchRequested(const QString &scope, const QString &query)
                         QDir::Files, QDirIterator::Subdirectories);
         constexpr int kMaxFiles = 2000, kMaxTotal = 200, kMaxPerFile = 10;
         int fileCount = 0;
-        while (it.hasNext() && fileCount < kMaxFiles && results.size() < kMaxTotal) {
+        while (!cancelled->load() && it.hasNext() && fileCount < kMaxFiles && results.size() < kMaxTotal) {
             const QString p = QDir::cleanPath(it.next());
             ++fileCount;
             bool ok = false;
             const QString content = FileService::readFile(p, &ok);
             if (!ok)
                 continue;
-            const QStringList lines = content.split(QLatin1Char('\n'));
             int hitsInFile = 0;
-            for (int i = 0; i < lines.size()
-                            && hitsInFile < kMaxPerFile
-                            && results.size() < kMaxTotal; ++i) {
-                const QString line = lines[i].trimmed();
-                if (!line.isEmpty() && line.toLower().contains(lower)) {
+            int lineNumber = 0;
+            for (const auto rawLine : QStringView(content).tokenize(QLatin1Char('\n'))) {
+                if (hitsInFile >= kMaxPerFile || results.size() >= kMaxTotal || cancelled->load()) break;
+                ++lineNumber;
+                const QStringView line = rawLine.trimmed();
+                if (!line.isEmpty() && line.contains(lower, Qt::CaseInsensitive)) {
                     results.append({ p,
-                                     QStringLiteral("%1:%2").arg(i + 1).arg(line.left(80)) });
+                                     QStringLiteral("%1:%2").arg(lineNumber).arg(line.left(80).toString()) });
                     ++hitsInFile;
                 }
             }
@@ -2591,6 +2628,9 @@ body.ms-export .vditor-reset pre:has(>code){border:0;border-top:0.75pt solid #00
                                  ? darkVars
                                  : (m_theme == QLatin1String("paper") ? paperVars : vars);
     return QStringLiteral("<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"utf-8\">\n")
+        + QStringLiteral("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; "
+                         "style-src 'unsafe-inline'; img-src https: http: file: data: blob:; font-src data: file:; "
+                         "script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'\">\n")
         + QStringLiteral("<title>") + title.toHtmlEscaped() + QStringLiteral("</title>\n")
         + QStringLiteral("<style>\n") + varBlock + QLatin1Char('\n')
         + css.join(QLatin1Char('\n')) + QStringLiteral("\n</style>\n</head>\n")
@@ -2718,6 +2758,7 @@ void MainWindow::finishExport(const QString &bodyHtml, Tab *tab)
         }
         qWarning() << "Mswrite: 临时导出页已写" << (exeDir + "/export-tmp" + name)
                 << doc.size() << "字符";
+        f.close(); // Flush before the browser starts requesting the export page.
         m_exportPdfTarget = target;
         ensureExportHost();
         if (!docTab.docHost.isEmpty()) m_exportHost->addHostMapping(docTab.docHost, docTab.docDir);
@@ -2815,9 +2856,11 @@ void MainWindow::ensureExportHost()
             m_exportPdfTarget.clear();
             qWarning() << "Mswrite: 进入渲染等待,目标" << target;
             // 先等页面真实渲染(字体/图片/布局),再打印,否则输出空白
-            m_exportHost->waitRendered([this, target] {
+            m_exportHost->waitRendered([this, target, request = m_exportRequest] {
+                if (!m_exportBusy || request != m_exportRequest) return;
                 qWarning() << "Mswrite: 渲染等待完成,开始打印";
-                m_exportHost->printToPdf(target, [this, target](bool okPdf, HRESULT hr) {
+                m_exportHost->printToPdf(target, [this, target, request](bool okPdf, HRESULT hr) {
+                    if (!m_exportBusy || request != m_exportRequest) return;
                     if (okPdf) {
                         qWarning() << "Mswrite: PDF 导出成功" << target;
                         statusBar()->showMessage(tr("已导出 %1").arg(target), 4000);
@@ -3091,6 +3134,8 @@ QString MainWindow::insertAiText(const QString &documentId,const QString &text)
         return QStringLiteral("错误:当前文档已切换，请重新发送指令");
     if (t->pdf)
         return QStringLiteral("错误:当前标签是 PDF,只能编辑 Markdown 文档");
+    if (!t->host || !t->host->isPageReady())
+        return QStringLiteral("错误:编辑器仍在加载，请稍后重试");
     t->host->runScript(Bridge::call(QStringLiteral("insertText"), { text }));
     statusBar()->showMessage(tr("AI 已插入 %1 字").arg(text.size()), 3000);
     return QStringLiteral("Inserted %1 characters at the caret.")
@@ -3123,9 +3168,9 @@ void MainWindow::readAiDocument(const QJsonObject &request,std::function<void(Ai
     const QString name=aiDocumentContext().value(QStringLiteral("name")).toString();
     if(t->pdf) {
         auto *pdf=t->pdf;
-        const int start=request.value("page").toInt(pdf->currentPage()+1)-1;
+        const int start=SecurityPolicy::oneBasedIndex(request.value("page"),pdf->pageCount(),pdf->currentPage()+1);
         if(start<0 || start>=pdf->pageCount()) {cb({QStringLiteral("Error: page out of range"),{}});return;}
-        const int end=qMin(pdf->pageCount(),start+qBound(1,request.value("page_count").toInt(2),4));
+        const int end=start+qMin(pdf->pageCount()-start,qBound(1,request.value("page_count").toInt(2),4));
         AiDocumentResult result;
         result.text=tr("Document: %1. Pages %2-%3 of %4.\n").arg(name).arg(start+1).arg(end).arg(pdf->pageCount());
         for(int page=start;page<end;++page) {
@@ -3142,18 +3187,33 @@ void MainWindow::readAiDocument(const QJsonObject &request,std::function<void(Ai
         result.text+=QStringLiteral("Images, when requested, cover at most two pages. Request further pages separately.");
         cb(std::move(result));return;
     }
-    if(!t->host->isPageReady()) {cb({QStringLiteral("Error: editor is still loading; retry shortly."),{}});return;}
+    if(!t->host || !t->host->isPageReady()) {cb({QStringLiteral("Error: editor is still loading; retry shortly."),{}});return;}
     t->host->evalWithResult(
         QStringLiteral("window.mswValue ? window.mswValue() : ''"),
         [guard=QPointer<MainWindow>(this),cb,id,request,name](const QString &v) {
             if(!guard || !guard->currentTab() || guard->currentTab()->aiId!=id) {cb({QStringLiteral("Error: the active document changed during reading."),{}});return;}
-            const QStringList lines=unquoteJsonString(v).split('\n');
-            const int start=request.value("start_line").toInt(1)-1;
-            if(start<0 || start>=lines.size()) {cb({QStringLiteral("Error: line out of range"),{}});return;}
-            const int end=qMin(int(lines.size()),start+qBound(1,request.value("line_count").toInt(1000),2000));
-            QString text=QStringLiteral("Document: %1. Lines %2-%3 of %4.\n").arg(name).arg(start+1).arg(end).arg(lines.size());
-            for(int i=start;i<end;++i) text+=QStringLiteral("%1: %2\n").arg(i+1).arg(lines[i]);
-            if(end<lines.size()) text+=QStringLiteral("More lines remain. Next start_line: %1.\n").arg(end+1);
+            const auto result=QJsonDocument::fromJson((QStringLiteral("[")+v+QLatin1Char(']')).toUtf8());
+            if(!result.isArray() || result.array().size()!=1 || !result.array().first().isString()) {
+                cb({QStringLiteral("Error: editor content could not be read; retry shortly."),{}});return;
+            }
+            const QString content=result.array().first().toString();
+            const int lineCount=int(content.count(QLatin1Char('\n')))+1;
+            const int start=SecurityPolicy::oneBasedIndex(request.value("start_line"),lineCount);
+            if(start<0) {cb({QStringLiteral("Error: line out of range"),{}});return;}
+            const int end=start+qMin(lineCount-start,qBound(1,request.value("line_count").toInt(1000),2000));
+            QString text=QStringLiteral("Document: %1. Lines %2-%3 of %4.\n").arg(name).arg(start+1).arg(end).arg(lineCount);
+            int i=0;
+            for(const auto line:QStringView(content).tokenize(QLatin1Char('\n'))) {
+                if(i>=end) break;
+                if(i>=start) {
+                    if(text.size()+line.size()>8*1024*1024) {
+                        cb({QStringLiteral("Error: requested lines exceed 8 MB; use a smaller range."),{}});return;
+                    }
+                    text+=QStringLiteral("%1: %2\n").arg(i+1).arg(line.toString());
+                }
+                ++i;
+            }
+            if(end<lineCount) text+=QStringLiteral("More lines remain. Next start_line: %1.\n").arg(end+1);
             cb({text,{}});
         });
 }

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <memory>
 #include <vector>
+#include <cmath>
 
 namespace AiMathPainter {
 
@@ -645,7 +646,7 @@ struct Parser {
 
 QPixmap render(const QString &latex, const QColor &fg, double dpr)
 {
-    if (latex.trimmed().isEmpty())
+    if (latex.size() > 64 * 1024 || !std::isfinite(dpr) || dpr <= 0 || dpr > 8 || latex.trimmed().isEmpty())
         return {};
 
     Parser parser(latex);
@@ -664,8 +665,11 @@ QPixmap render(const QString &latex, const QColor &fg, double dpr)
     root->layout(font);
 
     const qreal pad = 4;
-    const int wPix = qCeil((root->w + 2 * pad) * dpr);
-    const int hPix = qCeil((root->h + 2 * pad) * dpr);
+    const qreal width = (root->w + 2 * pad) * dpr, height = (root->h + 2 * pad) * dpr;
+    if (!std::isfinite(width) || !std::isfinite(height) || width <= 0 || height <= 0 || width > 4000 || height > 2000)
+        return {}; // Validate before converting floating-point sizes to integers.
+    const int wPix = qCeil(width);
+    const int hPix = qCeil(height);
     if (wPix <= 0 || hPix <= 0 || wPix > 4000 || hPix > 2000)
         return {};
 

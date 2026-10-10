@@ -13,7 +13,7 @@
 
 namespace {
 
-std::atomic<bool> g_abort{false};
+thread_local HttpAbort::Token threadAbort;
 
 // 每线程一个 QNetworkAccessManager:同一网关的连续请求(流式/重试/回退)
 // 复用连接与 TLS 会话,而不是每个请求都重新握手。QThreadStorage 在线程
@@ -30,14 +30,12 @@ QNetworkAccessManager *sharedNam()
 
 namespace HttpAbort {
 
-void request()
-{
-    g_abort.store(true);
-}
+Scope::Scope(Token token) : previous_(std::move(threadAbort)) { threadAbort = std::move(token); }
+Scope::~Scope() { threadAbort = std::move(previous_); }
 
 bool consume()
 {
-    return g_abort.exchange(false);
+    return threadAbort && threadAbort->load();
 }
 
 } // namespace HttpAbort
@@ -61,6 +59,7 @@ QNetworkRequest makeRequest(const QUrl &url,
 
 // SSE 原始体积封顶:只用于错误解析,超大响应没有留全量的意义
 constexpr int kRawCap = 8 * 1024 * 1024;
+constexpr int kJsonCap = 16 * 1024 * 1024;
 
 } // namespace
 
@@ -71,8 +70,10 @@ HttpResult get(const QUrl &url,
                int timeoutMs,
                int maxBytes)
 {
+    if (HttpAbort::consume()) return {0, {}, QStringLiteral("已中断")};
     QNetworkAccessManager *nam = sharedNam();
     QNetworkReply *reply = nam->get(makeRequest(url, headers));
+    reply->setReadBufferSize(64 * 1024);
 
     HttpResult r;
     QEventLoop loop;
@@ -94,18 +95,13 @@ HttpResult get(const QUrl &url,
 
     QByteArray buf;
     bool truncated = false;
-    if (maxBytes > 0) {
-        QObject::connect(reply, &QNetworkReply::readyRead, reply, [&]() {
-            if (truncated)
-                return;
-            buf += reply->readAll();
-            if (buf.size() > maxBytes) {
-                buf.truncate(maxBytes);
-                truncated = true;
-                reply->abort();
-            }
-        });
-    }
+    const qsizetype cap = maxBytes > 0 ? qMin(maxBytes, kJsonCap) : kJsonCap;
+    const auto drain = [&]() {
+        if (truncated) return;
+        buf += reply->read(cap + 1 - buf.size());
+        if (buf.size() > cap) { truncated = true; buf.clear(); reply->abort(); }
+    };
+    QObject::connect(reply, &QNetworkReply::readyRead, reply, drain);
 
     timer.start(timeoutMs);
     loop.exec();
@@ -127,10 +123,13 @@ HttpResult get(const QUrl &url,
     r.contentType = QString::fromUtf8(
         reply->header(QNetworkRequest::ContentTypeHeader).toByteArray());
     r.status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-    if (maxBytes > 0)
-        r.body = buf;
-    else
-        r.body = reply->readAll();
+    drain();
+    if (truncated) {
+        r.error = QStringLiteral("Error: HTTP response exceeds %1 bytes").arg(cap);
+        reply->deleteLater();
+        return r;
+    }
+    r.body = buf;
     if (reply->error() != QNetworkReply::NoError
         && reply->error() != QNetworkReply::OperationCanceledError) {
         r.error = QStringLiteral("Error: HTTP %1").arg(reply->errorString());
@@ -144,6 +143,7 @@ HttpResult postJson(const QUrl &url,
                     const QList<QPair<QByteArray, QByteArray>> &headers,
                     int timeoutMs)
 {
+    if (HttpAbort::consume()) return {0, {}, QStringLiteral("已中断")};
     auto hdrs = headers;
     bool hasCt = false;
     for (const auto &h : hdrs) {
@@ -155,6 +155,7 @@ HttpResult postJson(const QUrl &url,
 
     QNetworkAccessManager *nam = sharedNam();
     QNetworkReply *reply = nam->post(makeRequest(url, hdrs), body);
+    reply->setReadBufferSize(64 * 1024);
 
     HttpResult r;
     QEventLoop loop;
@@ -162,6 +163,19 @@ HttpResult postJson(const QUrl &url,
     timer.setSingleShot(true);
     QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
     QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+
+    QByteArray responseBody;
+    bool tooLarge = false;
+    const auto drain = [&]() {
+        if (tooLarge) return;
+        responseBody += reply->read(kJsonCap + 1 - responseBody.size());
+        if (responseBody.size() > kJsonCap) {
+            tooLarge = true;
+            responseBody.clear();
+            reply->abort();
+        }
+    };
+    QObject::connect(reply, &QNetworkReply::readyRead, reply, drain);
 
     QTimer abortPoll;
     abortPoll.setInterval(100);
@@ -194,7 +208,13 @@ HttpResult postJson(const QUrl &url,
     r.contentType = QString::fromUtf8(
         reply->header(QNetworkRequest::ContentTypeHeader).toByteArray());
     r.status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-    r.body = reply->readAll();
+    drain();
+    if (tooLarge) {
+        r.error = QStringLiteral("Error: HTTP response exceeds 16 MB");
+        reply->deleteLater();
+        return r;
+    }
+    r.body = responseBody;
     if (reply->error() != QNetworkReply::NoError
         && reply->error() != QNetworkReply::OperationCanceledError) {
         r.error = QStringLiteral("Error: HTTP %1").arg(reply->errorString());
@@ -209,6 +229,7 @@ HttpResult postSse(const QUrl &url,
                    int timeoutMs,
                    const std::function<void(const QByteArray &data)> &onData)
 {
+    if (HttpAbort::consume()) return {0, {}, QStringLiteral("已中断")};
     auto hdrs = headers;
     bool hasCt = false;
     bool hasAccept = false;
@@ -226,6 +247,7 @@ HttpResult postSse(const QUrl &url,
 
     QNetworkAccessManager *nam = sharedNam();
     QNetworkReply *reply = nam->post(makeRequest(url, hdrs), body);
+    reply->setReadBufferSize(64 * 1024);
 
     HttpResult r;
     QEventLoop loop;
@@ -252,16 +274,25 @@ HttpResult postSse(const QUrl &url,
     // 端点若从不发 '\n',或一条事件永不闭合,这两个缓冲没有上限就会无限吃内存
     constexpr int kPendingCap = 2 * 1024 * 1024;
     constexpr int kEventCap = 4 * 1024 * 1024;
+    bool malformedStream = false;
+    qsizetype totalBytes = 0;
     auto flushEvent = [&]() {
         if (eventData.isEmpty()) return;
         if (onData) onData(eventData);
         eventData.clear();
     };
     auto consumeChunk = [&](const QByteArray &chunk) {
+        if (malformedStream) return;
+        totalBytes += chunk.size();
+        if (totalBytes > 64 * 1024 * 1024) {
+            malformedStream = true; reply->abort(); return;
+        }
         pending += chunk;
         if (pending.size() > kPendingCap) {
-            // 畸形流:迟迟等不到换行,丢弃残段,继续收后面的帧
+            // Stop at a malformed frame; accepting its tail as a fresh event
+            // can corrupt generated text or tool arguments.
             pending.clear();
+            eventData.clear(); malformedStream = true; reply->abort();
             return;
         }
         if (all.size() < kRawCap)
@@ -283,9 +314,10 @@ HttpResult postSse(const QUrl &url,
                 // 交给 LlmCodec 侧的容错兜底
                 eventData += data;
                 if (eventData.size() > kEventCap) {
-                    // 事件异常大:丢弃,防无限累积;后面的行让它自然错过闭合
+                    // Refuse the entire event; never interpret a truncated tail.
                     eventData.clear();
                     pending.clear();
+                    malformedStream = true; reply->abort();
                     return;
                 }
             } else if (line.isEmpty()) flushEvent();
@@ -317,10 +349,19 @@ HttpResult postSse(const QUrl &url,
     }
 
     consumeChunk(reply->readAll());
+    if (malformedStream) {
+        r.error = QStringLiteral("Error: oversized or malformed SSE frame");
+        reply->deleteLater();
+        return r;
+    }
     if (pending.startsWith("data:")) {
         QByteArray tail = pending.mid(5);
         if (tail.startsWith(' ')) tail.remove(0, 1);
         eventData += tail;
+        if (eventData.size() > kEventCap) {
+            r.error = QStringLiteral("Error: oversized or malformed SSE frame");
+            reply->deleteLater(); return r;
+        }
     }
     flushEvent();
     r.finalUrl = reply->url();

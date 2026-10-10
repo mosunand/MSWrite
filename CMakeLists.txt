@@ -1,10 +1,15 @@
 cmake_minimum_required(VERSION 3.21)
-project(Mswrite VERSION 3.1.1 LANGUAGES CXX)
+project(Mswrite VERSION 3.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
+
+# Diagram configuration is untrusted document data, not JavaScript to execute.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS scripts/harden-vditor.ps1)
+execute_process(COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/scripts/harden-vditor.ps1"
+                COMMAND_ERROR_IS_FATAL ANY)
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets Concurrent Network Sql Pdf PdfWidgets QuickWidgets QuickControls2)
 
@@ -12,6 +17,7 @@ add_executable(Mswrite WIN32
     src/main.cpp
     src/webviewhost.h      src/webviewhost.cpp
     src/bridge.h           src/bridge.cpp
+    src/securitypolicy.h
     src/fileservice.h      src/fileservice.cpp
     src/outlinedock.h      src/outlinedock.cpp
     src/searchdock.h       src/searchdock.cpp
@@ -80,3 +86,12 @@ add_custom_command(TARGET Mswrite POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:Qt6::PdfWidgets> $<TARGET_FILE_DIR:Mswrite>
 )
+
+option(MSWRITE_BUILD_TESTS "Build native security and file/network regression checks" OFF)
+if(MSWRITE_BUILD_TESTS)
+    enable_testing()
+    add_executable(MswriteCoreTests scripts/test-core.cpp src/fileservice.cpp src/fileservice.h src/ai/Http.cpp src/ai/LlmCodec.cpp src/ai/Llm.cpp src/ai/AiMath.cpp src/ai/AiText.cpp)
+    target_include_directories(MswriteCoreTests PRIVATE src)
+    target_link_libraries(MswriteCoreTests PRIVATE Qt6::Core Qt6::Network)
+    add_test(NAME core-safety COMMAND MswriteCoreTests)
+endif()

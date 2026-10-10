@@ -84,4 +84,5 @@ private:
     bool creating_ = false;
     bool dark_ = false;
     QString editingName_;
+    quint64 modelRowsGeneration_ = 0;
 };

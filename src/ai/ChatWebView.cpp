@@ -1,5 +1,6 @@
 #include "ai/ChatWebView.h"
 #include "ai/ChatView.h"
+#include "securitypolicy.h"
 #include <QApplication>
 #include <QClipboard>
 #include <QDateTime>
@@ -157,7 +158,7 @@ ChatWebView::ChatWebView(ChatModel *model, QWidget *parent)
             emit exportRequested();
         } else if (type == QLatin1String("chatLink")) {
             const QUrl url(o.value("url").toString());
-            if (url.scheme() == QLatin1String("https") || url.scheme() == QLatin1String("http"))
+            if (SecurityPolicy::externalUrl(url))
                 QDesktopServices::openUrl(url);
         }
     }, Qt::QueuedConnection); // Leave the WebView2 COM callback before clipboard/dialog operations.
@@ -168,7 +169,7 @@ ChatWebView::ChatWebView(ChatModel *model, QWidget *parent)
         web = QStringLiteral(MSWRITE_SOURCE_DIR) + QStringLiteral("/resources/web");
 #endif
     start(exe + QStringLiteral("/webview-data"), QStringLiteral("chat.local"),
-          QDir(web).absolutePath(), QStringLiteral("https://chat.local/chat.html?v=9"));
+          QDir(web).absolutePath(), QStringLiteral("https://chat.local/chat.html?v=10"));
 }
 
 void ChatWebView::showEvent(QShowEvent *event)

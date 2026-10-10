@@ -203,10 +203,36 @@ QJsonObject parseObject(const QByteArray &raw)
     return {};
 }
 
-QJsonObject argsToObject(const QString &args)
+bool appendTool(ChatResponse &response, ToolCall call, const QJsonValue &arguments, bool encoded)
 {
-    const QJsonDocument d = QJsonDocument::fromJson(args.toUtf8());
-    return d.isObject() ? d.object() : QJsonObject{};
+    if (!response.error.isEmpty()) return false;
+    QByteArray bytes;
+    if (encoded && arguments.isString()) bytes = arguments.toString().toUtf8();
+    else if (!encoded && arguments.isObject()) bytes = QJsonDocument(arguments.toObject()).toJson(QJsonDocument::Compact);
+    if (call.name.isEmpty() || bytes.isEmpty() || bytes.size() > 8 * 1024 * 1024
+        || response.toolCalls.size() >= 256) {
+        response.error = QStringLiteral("Invalid or oversized tool call; document tools refused");
+        response.toolCalls.clear();
+        return false;
+    }
+    const QJsonDocument parsed = QJsonDocument::fromJson(bytes);
+    if (!parsed.isObject()) {
+        response.error = QStringLiteral("Invalid tool arguments; document tools refused");
+        response.toolCalls.clear(); return false;
+    }
+    call.input = parsed.object();
+    response.toolCalls.append(call);
+    return true;
+}
+
+void refuseTruncatedTools(ChatResponse &response)
+{
+    if (!response.toolCalls.isEmpty()
+        && (response.stopReason == QLatin1String("length")
+            || response.stopReason == QLatin1String("max_tokens")
+            || response.stopReason == QLatin1String("MAX_TOKENS")))
+        response.error = QStringLiteral("Response truncated; document tools refused");
+    if (!response.error.isEmpty()) response.toolCalls.clear();
 }
 
 QJsonArray responsesInput(const QVector<ChatMessage> &history)
@@ -293,11 +319,11 @@ ChatResponse parseResponses(const QJsonObject &obj)
             ToolCall call;
             call.id = item.value("call_id").toString();
             call.name = item.value("name").toString();
-            call.input = argsToObject(item.value("arguments").toString());
-            r.toolCalls.append(call);
+            appendTool(r, call, item.value("arguments"), true);
         }
     }
     if (r.text.isEmpty() && r.toolCalls.isEmpty() && r.error.isEmpty()) r.error = QStringLiteral("Empty Responses output");
+    refuseTruncatedTools(r);
     return r;
 }
 
@@ -325,14 +351,14 @@ ChatResponse parseGemini(const QJsonObject &obj)
             ToolCall call;
             call.id = function.value("id").toString(QUuid::createUuid().toString(QUuid::WithoutBraces));
             call.name = function.value("name").toString();
-            call.input = function.value("args").toObject();
             call.thoughtSignature = part.value("thoughtSignature").toString();
-            r.toolCalls.append(call);
+            appendTool(r, call, function.value("args"), false);
         }
     }
     if (r.stopReason == QLatin1String("SAFETY") || r.stopReason == QLatin1String("RECITATION")
         || r.stopReason == QLatin1String("MALFORMED_FUNCTION_CALL"))
         r.error = QStringLiteral("Gemini stopped: %1").arg(r.stopReason);
+    refuseTruncatedTools(r);
     return r;
 }
 
@@ -470,6 +496,7 @@ QByteArray LlmCodec::requestBody(Protocol p,
 // 是字面量 "uFF5C",从未真正闭合过——2026-10 修正。
 void LlmCodec::extractStrayToolCalls(ChatResponse &resp)
 {
+    if (!resp.error.isEmpty()) { resp.toolCalls.clear(); return; }
     const QChar bar(0xFF5C);
     const QString tag = QStringLiteral("<") + bar + QStringLiteral("{1,2}DSML") + bar
                         + QStringLiteral("{1,2}\\s*(?:function_calls|tool_calls|calls)?");
@@ -499,6 +526,10 @@ void LlmCodec::extractStrayToolCalls(ChatResponse &resp)
         const QString paramValue = m.captured(3);
 
         if (toolName == QLatin1String("Insert") && paramName == QLatin1String("text")) {
+            if (resp.toolCalls.size() >= 256 || paramValue.toUtf8().size() > 8 * 1024 * 1024) {
+                resp.error = QStringLiteral("Oversized DSML tool call; document tools refused");
+                resp.toolCalls.clear(); return;
+            }
             ToolCall tc;
             tc.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
             tc.name = toolName;
@@ -563,10 +594,10 @@ ChatResponse LlmCodec::parse(Protocol p, int httpStatus, const QByteArray &body)
                 ToolCall tc;
                 tc.id = c.value(QStringLiteral("id")).toString();
                 tc.name = c.value(QStringLiteral("name")).toString();
-                tc.input = c.value(QStringLiteral("input")).toObject();
-                r.toolCalls.push_back(tc);
+                appendTool(r, tc, c.value(QStringLiteral("input")), false);
             }
         }
+        refuseTruncatedTools(r);
         return r;
     }
 
@@ -609,9 +640,9 @@ ChatResponse LlmCodec::parse(Protocol p, int httpStatus, const QByteArray &body)
         if (tc.id.isEmpty())
             tc.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
         tc.name = fn.value(QStringLiteral("name")).toString();
-        tc.input = argsToObject(fn.value(QStringLiteral("arguments")).toString());
-        r.toolCalls.push_back(tc);
+        appendTool(r, tc, fn.value(QStringLiteral("arguments")), true);
     }
+    refuseTruncatedTools(r);
     return r;
 }
 
@@ -623,7 +654,7 @@ LlmCodec::StreamAssembler::StreamAssembler(Protocol p, StreamSink sink)
 
 void LlmCodec::StreamAssembler::emitThinking(const QString &delta)
 {
-    if (delta.isEmpty())
+    if (delta.isEmpty() || !reservePayload(delta.size()))
         return;
     out_.thinking += delta;
     if (sink_.onThinking)
@@ -632,7 +663,7 @@ void LlmCodec::StreamAssembler::emitThinking(const QString &delta)
 
 void LlmCodec::StreamAssembler::emitTextRaw(const QString &delta)
 {
-    if (delta.isEmpty())
+    if (delta.isEmpty() || !reservePayload(delta.size()))
         return;
     out_.text += delta;
     out_.streamedText = true;
@@ -688,11 +719,37 @@ bool LlmCodec::StreamAssembler::ensureToolSlot(int index)
     if (index < 0 || index >= kMaxToolSlots) {
         qWarning() << "Mswrite: 丢弃非法工具索引" << index;
         ++droppedEvents_;
+        assemblyError_ = QStringLiteral("Invalid streamed tool index");
         return false;
     }
     while (tools_.size() <= index)
         tools_.push_back({});
     return true;
+}
+
+bool LlmCodec::StreamAssembler::reservePayload(qsizetype size)
+{
+    if (!assemblyError_.isEmpty()) return false;
+    if (size > 32 * 1024 * 1024 - payloadSize_) {
+        assemblyError_ = QStringLiteral("AI response exceeds the 32 MB assembly limit");
+        return false;
+    }
+    payloadSize_ += size;
+    return true;
+}
+
+void LlmCodec::StreamAssembler::appendToolArgs(int index, const QByteArray &data, bool replace)
+{
+    if (!ensureToolSlot(index)) return;
+    auto &args = tools_[index].args;
+    const qsizetype size = (replace ? 0 : args.size()) + data.size();
+    if (size > 8 * 1024 * 1024) {
+        assemblyError_ = QStringLiteral("Streamed tool arguments exceed 8 MB");
+        return;
+    }
+    if (!reservePayload(replace ? data.size() - args.size() : data.size())) return;
+    if (replace) args = data;
+    else args += data;
 }
 
 void LlmCodec::StreamAssembler::applyAnthropic(const QJsonObject &obj)
@@ -714,8 +771,12 @@ void LlmCodec::StreamAssembler::applyAnthropic(const QJsonObject &obj)
             tools_[index].id = block.value(QStringLiteral("id")).toString();
             tools_[index].name = block.value(QStringLiteral("name")).toString();
             const QJsonValue inputVal = block.value(QStringLiteral("input"));
+            if (!inputVal.isObject()) {
+                assemblyError_ = QStringLiteral("Invalid streamed tool input"); return;
+            }
+            tools_[index].emptyInput = inputVal.toObject().isEmpty();
             if (inputVal.isObject() && !inputVal.toObject().isEmpty())
-                tools_[index].args = QJsonDocument(inputVal.toObject()).toJson(QJsonDocument::Compact);
+                appendToolArgs(index, QJsonDocument(inputVal.toObject()).toJson(QJsonDocument::Compact), true);
         } else if (btype == QLatin1String("thinking") || btype == QLatin1String("redacted_thinking")) {
             emitThinking(block.value(QStringLiteral("thinking")).toString());
         } else if (btype == QLatin1String("text")) {
@@ -734,15 +795,7 @@ void LlmCodec::StreamAssembler::applyAnthropic(const QJsonObject &obj)
         else if (dtype == QLatin1String("text_delta") || delta.contains(QStringLiteral("text")))
             emitText(delta.value(QStringLiteral("text")).toString());
         else if (dtype == QLatin1String("input_json_delta")) {
-            // 单条工具参数上限:防止无限流累积吃光内存(8 MB 远超正常工具参数)
-    static constexpr int kMaxToolArgs = 8 * 1024 * 1024;
-    if (!ensureToolSlot(index))
-                return;
-            tools_[index].args += delta.value(QStringLiteral("partial_json")).toString().toUtf8();
-            if (tools_[index].args.size() > kMaxToolArgs) {
-                qWarning() << "Mswrite: 工具参数超过上限,截断";
-                tools_[index].args.truncate(kMaxToolArgs);
-            }
+            appendToolArgs(index, delta.value(QStringLiteral("partial_json")).toString().toUtf8());
         }
         return;
     }
@@ -823,7 +876,7 @@ void LlmCodec::StreamAssembler::applyOpenAi(const QJsonObject &obj)
         const QString name = fn.value(QStringLiteral("name")).toString();
         if (!name.isEmpty())
             tools_[index].name = name;
-        tools_[index].args += fn.value(QStringLiteral("arguments")).toString().toUtf8();
+        appendToolArgs(index, fn.value(QStringLiteral("arguments")).toString().toUtf8());
     }
 }
 
@@ -838,18 +891,15 @@ void LlmCodec::StreamAssembler::applyResponses(const QJsonObject &obj)
         const QJsonObject item = obj.value("item").toObject();
         if (item.value("type") != QLatin1String("function_call")) return;
         const int index = obj.value("output_index").toInt(-1);
-        if (index < 0 || index > 1024) { out_.error = QStringLiteral("Invalid Responses tool index"); return; }
-        while (tools_.size() <= index) tools_.append(PendingTool{});
+        if (!ensureToolSlot(index)) return;
         tools_[index].id = item.value("call_id").toString();
         tools_[index].name = item.value("name").toString();
-        if (item.contains("arguments")) tools_[index].args = item.value("arguments").toString().toUtf8();
+        if (item.contains("arguments")) appendToolArgs(index, item.value("arguments").toString().toUtf8(), true);
     } else if (type == QLatin1String("response.function_call_arguments.delta")
                || type == QLatin1String("response.function_call_arguments.done")) {
         const int index = obj.value("output_index").toInt(-1);
-        if (index < 0 || index > 1024) { out_.error = QStringLiteral("Invalid Responses tool index"); return; }
-        while (tools_.size() <= index) tools_.append(PendingTool{});
-        if (type.endsWith(QLatin1String(".done"))) tools_[index].args = obj.value("arguments").toString().toUtf8();
-        else tools_[index].args += obj.value("delta").toString().toUtf8();
+        appendToolArgs(index, obj.value(type.endsWith(QLatin1String(".done")) ? "arguments" : "delta").toString().toUtf8(),
+                       type.endsWith(QLatin1String(".done")));
     } else if (type == QLatin1String("response.completed") || type == QLatin1String("response.failed")
                || type == QLatin1String("response.incomplete")) {
         const ChatResponse final = parseResponses(obj.value("response").toObject());
@@ -860,7 +910,11 @@ void LlmCodec::StreamAssembler::applyResponses(const QJsonObject &obj)
         if (out_.text.isEmpty()) emitText(final.text);
         if (out_.thinking.isEmpty()) emitThinking(final.thinking);
         if (!final.error.isEmpty()) out_.error = final.error;
-        if (tools_.isEmpty()) out_.toolCalls = final.toolCalls;
+        if (tools_.isEmpty()) {
+            for (const ToolCall &call : final.toolCalls)
+                if (!reservePayload(QJsonDocument(call.input).toJson(QJsonDocument::Compact).size())) return;
+            out_.toolCalls = final.toolCalls;
+        }
     } else if (type == QLatin1String("error") || obj.contains("error")) {
         out_.error = obj.value("message").toString();
         if (out_.error.isEmpty()) out_.error = obj.value("error").toObject().value("message").toString("Responses stream error");
@@ -876,6 +930,11 @@ void LlmCodec::StreamAssembler::applyGemini(const QJsonObject &obj)
     const ChatResponse part = parseGemini(obj);
     emitText(part.text);
     emitThinking(part.thinking);
+    if (out_.toolCalls.size() + part.toolCalls.size() > kMaxToolSlots) {
+        assemblyError_ = QStringLiteral("Too many streamed tool calls"); return;
+    }
+    for (const auto &call : part.toolCalls)
+        if (!reservePayload(QJsonDocument(call.input).toJson(QJsonDocument::Compact).size())) return;
     out_.toolCalls += part.toolCalls;
     if (obj.contains("usageMetadata")) { out_.inputTokens = part.inputTokens; out_.outputTokens = part.outputTokens; }
     if (!part.model.isEmpty()) out_.model = part.model;
@@ -885,6 +944,7 @@ void LlmCodec::StreamAssembler::applyGemini(const QJsonObject &obj)
 
 void LlmCodec::StreamAssembler::feed(const QByteArray &data)
 {
+    if (!assemblyError_.isEmpty()) return;
     if (data.trimmed() == "[DONE]")
         return;
     QJsonParseError err{};
@@ -946,6 +1006,12 @@ ChatResponse LlmCodec::StreamAssembler::finish(int httpStatus, const QByteArray 
     out_.httpStatus = httpStatus;
     out_.raw = raw;
     out_.sseEvents = events_;
+    if (!assemblyError_.isEmpty()) {
+        out_.error = assemblyError_; out_.toolCalls.clear(); return out_;
+    }
+    if ((!pendingBad_.isEmpty() || droppedEvents_ > 0)
+        && (!tools_.isEmpty() || !out_.toolCalls.isEmpty()))
+        out_.error = QStringLiteral("Incomplete stream; document tool calls refused");
     if (!pendingBad_.isEmpty() || droppedEvents_ > 0)
         qWarning() << "Mswrite: AI 流式帧解析容错:丢弃" << droppedEvents_
                    << "条,尾部残段" << pendingBad_.size() << "字节";
@@ -973,7 +1039,7 @@ ChatResponse LlmCodec::StreamAssembler::finish(int httpStatus, const QByteArray 
         if (tc.id.isEmpty())
             tc.id = QUuid::createUuid().toString(QUuid::WithoutBraces);
         tc.name = t.name;
-        const QJsonDocument args = QJsonDocument::fromJson(t.args);
+        const QJsonDocument args = QJsonDocument::fromJson(t.args.isEmpty() && t.emptyInput ? QByteArray("{}") : t.args);
         if (tc.name.isEmpty() || !args.isObject()) {
             out_.error = QStringLiteral("Incomplete or invalid streamed tool call");
             continue;
@@ -982,5 +1048,6 @@ ChatResponse LlmCodec::StreamAssembler::finish(int httpStatus, const QByteArray 
         tc.thoughtSignature = t.thoughtSignature;
         out_.toolCalls.push_back(tc);
     }
+    refuseTruncatedTools(out_);
     return out_;
 }

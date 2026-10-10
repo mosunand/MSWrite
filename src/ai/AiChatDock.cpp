@@ -6,6 +6,8 @@
 #include <windows.h>
 
 #include "ai/AiWorker.h"
+#include "fileservice.h"
+#include <QImageReader>
 #include "ai/ChatView.h"
 #include "ai/ChatWebView.h"
 #include "ai/AiModelPicker.h"
@@ -338,7 +340,8 @@ AiChatDock::AiChatDock(QWidget *parent)
 
     // 写入模式 / 思考程度持久化
     QSettings s;
-    m_writeMode = qBound(0, s.value(QStringLiteral("aiWriteMode"), 0).toInt(), 2);
+    const int storedMode = s.value(QStringLiteral("aiWriteMode"), 0).toInt();
+    m_writeMode = storedMode >= 0 && storedMode <= 2 ? storedMode : 0;
     // 思考档位持久化为档位名(字符串);旧版整数 0关1低2中3高 迁移:中并入高
     m_thinkEffort = s.value(QStringLiteral("aiThinkEffort")).toString();
     if (!s.contains(QStringLiteral("aiThinkEffort"))) {
@@ -363,7 +366,6 @@ AiChatDock::~AiChatDock()
     // 关窗路径可能不走 hideEvent(delete 不触发):析构兜底保存几何
     QSettings().setValue(QStringLiteral("aiGeometry"), saveGeometry());
     // 先请求中断在途请求,再停线程:避免线程卡在 HTTP 里拖住退出
-    HttpAbort::request();
     if (m_worker) {
         // 原 runInsert 用 BlockingQueuedConnection 回调本对象:析构开始后
         // GUI 不再处理事件,工作线程会永久卡住,wait 超时销毁 QThread 即 qFatal。
@@ -378,6 +380,7 @@ AiChatDock::~AiChatDock()
         // 的 deleteLater 路径回收,而不是被析构途中强行销毁。
         qWarning("AI 工作线程未在超时内退出,放弃回收以避免崩溃");
         m_thread->setParent(nullptr);
+        connect(m_thread, &QThread::finished, m_thread, &QObject::deleteLater);
         m_thread = nullptr;
     }
 }
@@ -541,9 +544,10 @@ void AiChatDock::buildUi()
                                                QStringLiteral("jpeg"), QStringLiteral("gif"),
                                                QStringLiteral("webp"), QStringLiteral("bmp") };
             if (kImg.contains(suffix)) {
-                QFile in(f);
-                if (in.open(QIODevice::ReadOnly))
-                    images.append({ QFileInfo(f).fileName(), in.readAll() });
+                QByteArray bytes;
+                if (images.size() < 8 && FileService::readBytes(f, 8 * 1024 * 1024, &bytes))
+                    images.append({ QFileInfo(f).fileName(), bytes });
+                else m_msgs->append(ChatMsg::Notice, tr("跳过图片 %1：读取失败、超过 8 MB 或一次选择超过 8 张。").arg(QFileInfo(f).fileName()), QStringLiteral("error"));
                 continue;
             }
             QFile in(f);
@@ -616,12 +620,14 @@ void AiChatDock::wireWorker()
 {
     // 跨线程队列信号需要元类型注册
     qRegisterMetaType<QVector<AiAttach>>("QVector<AiAttach>");
+    qRegisterMetaType<QVector<ChatMessage>>("QVector<ChatMessage>");
 
     m_thread = new QThread(this);
     m_worker = new AiWorker();
     m_worker->setDock(this);
     m_worker->moveToThread(m_thread);
     connect(m_thread, &QThread::finished, m_worker, &QObject::deleteLater);
+    connect(m_worker, &AiWorker::historyChanged, this, [this](const QVector<ChatMessage> &history) { m_history = history; });
     connect(this, &AiChatDock::runRequested, m_worker,
             &AiWorker::run);
 
@@ -963,9 +969,10 @@ bool AiChatDock::eventFilter(QObject *obj, QEvent *event)
                                                       QStringLiteral("bmp") };
                     if (!kImg.contains(suffix))
                         continue;
-                    QFile in(p);
-                    if (in.open(QIODevice::ReadOnly))
-                        images.append({ QFileInfo(p).fileName(), in.readAll() });
+                    QByteArray bytes;
+                    if (images.size() < 8 && FileService::readBytes(p, 8 * 1024 * 1024, &bytes))
+                        images.append({ QFileInfo(p).fileName(), bytes });
+                    else m_msgs->append(ChatMsg::Notice, tr("图片读取失败或超过附件大小/数量限制。"), QStringLiteral("error"));
                 }
                 if (!images.isEmpty()) {
                     attachImages(images);
@@ -1088,7 +1095,15 @@ void AiChatDock::repaintAll()
 
 void AiChatDock::attachImages(const QList<QPair<QString, QByteArray>> &files)
 {
+    qsizetype totalBytes = 0;
+    for (const auto &image : m_images) totalBytes += image.base64.size();
     for (const auto &f : files) {
+        const qsizetype encodedSize = ((f.second.size() + 2) / 3) * 4;
+        if (f.second.isEmpty() || f.second.size() > 8 * 1024 * 1024 || m_images.size() >= 8
+            || totalBytes + encodedSize > 24 * 1024 * 1024) {
+            m_msgs->append(ChatMsg::Notice, tr("附件过大或过多：单张最多 8 MB，最多 8 张，总数据最多 18 MB。"), QStringLiteral("error"));
+            continue;
+        }
         AiAttach a;
         a.name = f.first;
         a.mime = QStringLiteral("image/png");
@@ -1105,6 +1120,7 @@ void AiChatDock::attachImages(const QList<QPair<QString, QByteArray>> &files)
         else if (d.startsWith("BM"))
             a.mime = QStringLiteral("image/bmp");
         a.base64 = QString::fromLatin1(d.toBase64());
+        totalBytes += a.base64.size();
         m_images.append(a);
     }
     rebuildAttachStrip();
@@ -1113,12 +1129,16 @@ void AiChatDock::attachImages(const QList<QPair<QString, QByteArray>> &files)
 
 void AiChatDock::attachTextFile(const QString &name, const QString &content)
 {
+    if (m_textFiles.size() >= 16) {
+        m_msgs->append(ChatMsg::Notice, tr("文本附件最多 16 个。"), QStringLiteral("error")); return;
+    }
     m_textFiles.append({ name, content });
     rebuildAttachStrip();
 }
 
 void AiChatDock::rebuildAttachStrip()
 {
+    const quint64 generation = ++m_attachmentGeneration;
     // 清空重建
     while (QLayoutItem *it = m_attachLay->takeAt(0)) {
         if (it->widget())
@@ -1131,8 +1151,15 @@ void AiChatDock::rebuildAttachStrip()
         return;
 
     for (int i = 0; i < m_images.size(); ++i) {
+        QByteArray data = QByteArray::fromBase64(m_images[i].base64.toLatin1());
+        QBuffer buffer(&data); buffer.open(QIODevice::ReadOnly);
+        QImageReader reader(&buffer);
+        const QSize size = reader.size();
         QImage img;
-        img.loadFromData(QByteArray::fromBase64(m_images[i].base64.toLatin1()));
+        if (size.isValid() && qint64(size.width()) * size.height() <= 40000000) {
+            reader.setScaledSize(size.scaled(80, 80, Qt::KeepAspectRatio));
+            img = reader.read();
+        }
         auto *thumb = new QLabel(m_attachStrip);
         thumb->setFixedSize(46, 46);
         thumb->setAlignment(Qt::AlignCenter);
@@ -1154,7 +1181,8 @@ void AiChatDock::rebuildAttachStrip()
         rm->setStyleSheet(m_lightTheme
             ? QStringLiteral("background:#dfe2ea;color:#3a4150;border:none;border-radius:10px;font-size:12px;")
             : QStringLiteral("background:#3d434f;color:#e8ebf2;border:none;border-radius:10px;font-size:12px;"));
-        connect(rm, &QPushButton::clicked, this, [this, idx] {
+        connect(rm, &QPushButton::clicked, this, [this, idx, generation] {
+            if (generation != m_attachmentGeneration || idx >= m_images.size()) return;
             m_images.removeAt(idx);
             rebuildAttachStrip();
         });
@@ -1177,7 +1205,8 @@ void AiChatDock::rebuildAttachStrip()
         rm->setStyleSheet(m_lightTheme
             ? QStringLiteral("background:#dfe2ea;color:#3a4150;border:none;border-radius:10px;font-size:12px;")
             : QStringLiteral("background:#3d434f;color:#e8ebf2;border:none;border-radius:10px;font-size:12px;"));
-        connect(rm, &QPushButton::clicked, this, [this, idx] {
+        connect(rm, &QPushButton::clicked, this, [this, idx, generation] {
+            if (generation != m_attachmentGeneration || idx >= m_textFiles.size()) return;
             m_textFiles.removeAt(idx);
             rebuildAttachStrip();
         });
@@ -1334,7 +1363,7 @@ void AiChatDock::saveSession()
         });
     }
     QJsonArray hist;
-    const QVector<ChatMessage> h = m_worker->historySnapshot();
+    const QVector<ChatMessage> h = m_history;
     for (const ChatMessage &mm : h) {
         QJsonObject o{
             { QStringLiteral("role"), mm.role },
@@ -1375,6 +1404,10 @@ void AiChatDock::saveSession()
         { QStringLiteral("rows"), rows },
         { QStringLiteral("history"), hist },
     }).toJson(QJsonDocument::Compact);
+    if (data.size() > 64 * 1024 * 1024) {
+        qWarning() << "Mswrite: AI session exceeds 64 MB; previous saved session kept";
+        return;
+    }
     if (f.write(data) != data.size() || !f.commit())
         qWarning() << "Mswrite: cannot save AI session" << f.errorString();
 }
@@ -1384,7 +1417,9 @@ bool AiChatDock::loadSession()
     QFile f(sessionFilePath());
     if (!f.exists() || !f.open(QIODevice::ReadOnly))
         return false;
-    const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+    QByteArray data;
+    if (!FileService::readBytes(sessionFilePath(), 64 * 1024 * 1024, &data)) return false;
+    const QJsonObject root = QJsonDocument::fromJson(data).object();
     const QJsonArray rows = root.value(QStringLiteral("rows")).toArray();
     if (rows.isEmpty())
         return false;
@@ -1523,13 +1558,20 @@ void AiChatDock::setNoProvider()
 
 void AiChatDock::clearConversation()
 {
-    QMetaObject::invokeMethod(m_worker, [this]() {
-        m_worker->clearHistory();
+    if (m_busy) {
+        m_msgs->append(ChatMsg::Notice, tr("请先停止当前生成，再创建新对话。"), QStringLiteral("muted"));
+        scrollBottom();
+        return;
+    }
+    QPointer<AiWorker> worker = m_worker;
+    QMetaObject::invokeMethod(m_worker, [worker]() {
+        if (worker) worker->clearHistory();
     }, Qt::QueuedConnection);
     m_msgs->clearAll();
     m_assistRow = -1;
     m_thinkRow = -1;
     m_anyText = false;
+    m_history.clear();
     QFile::remove(sessionFilePath()); // 新对话:上次会话作废
     // 模型清空 → modelReset → 自动回到欢迎卡片页
     scrollBottom();
@@ -1537,6 +1579,7 @@ void AiChatDock::clearConversation()
 
 QString AiChatDock::insertAtCursor(const QString &text)
 {
+    if (m_writeMode == 0) return QStringLiteral("错误:写入已关闭，已跳过本次写入");
     QString result;
     if (m_insert)
         result = m_insert(m_activeDocumentId,text);
@@ -1625,7 +1668,7 @@ void AiChatDock::send()
 
 void AiChatDock::stop()
 {
-    HttpAbort::request();
+    if (m_busy && m_worker) m_worker->cancelTurn();
     // 不再预发"正在停止"行:worker 会很快回 turnFinished("已中断"),
     // 两行提示是噪音;发送按钮变红 ■ 本身已是状态反馈
 }
@@ -1638,6 +1681,7 @@ void AiChatDock::dispatch(const QString &userText)
     const int mode=context.value(QStringLiteral("kind")).toString()==QLatin1String("pdf") ? 0 : m_dispatchMode;
     // Set the guard before queuing the worker; rapid clicks cannot start two turns.
     m_busy=true;
+    m_worker->prepareTurn();
     emit runRequested(userText,QString::fromUtf8(QJsonDocument(context).toJson(QJsonDocument::Compact)),
                       mode,m_dispatchEffort,m_dispatchImages);
     m_dispatchImages.clear();

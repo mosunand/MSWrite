@@ -7,7 +7,7 @@
 ; (MSWriteData),用户目录下没有权限问题;装 Program Files 需要额外授权。
 
 #define AppName "Mswrite"
-#define AppVersion "3.1.1"
+#define AppVersion "3.2.0"
 #define AppPublisher "moshuai"
 #define AppExe "Mswrite.exe"
 ; 安装源:由 make-installer.ps1 准备的干净暂存目录(已剔除运行期产物:
