@@ -55,6 +55,7 @@
 #include <QPointer>
 #include <QRegularExpression>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSaveFile>
 #include <QSet>
 #include <QScopeGuard>
@@ -79,11 +80,23 @@ constexpr int kExportHtml = 0, kExportPdf = 1, kExportWord = 2;
 // 退出前等待落盘的上限(超时只提示,不再静默退出)
 constexpr int kSaveWaitMs = 20000;
 
+QString normalizedMathMode(const QString &mode)
+{
+    return mode == QLatin1String("mathjax") ? QStringLiteral("mathjax")
+                                          : QStringLiteral("markdown");
+}
+
+double preferredLineHeight()
+{
+    const double value = QSettings().value(QStringLiteral("lineHeight"), 1.0).toDouble();
+    return std::isfinite(value) ? qBound(1.0, value, 2.2) : 1.0;
+}
+
 QString pageUrl()
 {
     // ?v= 与 bridge.js 版本同步递增:editor.html 本体也绕过缓存
     QString url = QStringLiteral("https://") + QLatin1String(kVirtualHost)
-                + QStringLiteral("/editor.html?v=169");
+                + QStringLiteral("/editor.html?v=173");
     // 开发态才把排障开关传给页面(按键记录器等),生产环境不启用
     if (qEnvironmentVariableIsSet("MSWRITE_DEV"))
         url += QStringLiteral("&dev=1");
@@ -190,6 +203,9 @@ MainWindow::MainWindow(QWidget *parent, const QString &initialPath)
     m_fontSize = qBound(12, QSettings().value(QStringLiteral("fontSize"), 16).toInt(), 28);
     m_lineNumbers = QSettings().value(QStringLiteral("codeLineNumbers"), false).toBool();
     m_autoSave = QSettings().value(QStringLiteral("autoSave"), true).toBool();
+    // 恢复座右铭必须先于状态栏创建；欢迎页只在首次启动时读取设置。
+    m_motto = QSettings().value(QStringLiteral("motto")).toString().trimmed();
+    m_mathMode = normalizedMathMode(QSettings().value(QStringLiteral("mathMode")).toString());
     m_aiStore = AiProviderStore::load(); // AI 助手的供应商(面板懒创建)
 
     // ---------- 标签栏 + 编辑区栈 ----------
@@ -450,11 +466,15 @@ int MainWindow::addTab(const QString &path, const QString &content,
 
     const QString exeDir = QCoreApplication::applicationDirPath();
     const QJsonObject initial{{"content", content}, {"theme", m_theme},
-        {"fontSize", m_fontSize}, {"lineHeight",
-            QSettings().value(QStringLiteral("lineHeight"), 1.0).toDouble()},
+        {"fontSize", m_fontSize}, {"lineHeight", preferredLineHeight()},
         {"lineNumbers", m_lineNumbers},
-        {"preferLatex",QSettings().value(QStringLiteral("preferLatex"),false).toBool()}};
+        {"mathMode", m_mathMode},
+        {"preferLatex",m_mathMode != QLatin1String("mathjax")
+            && QSettings().value(QStringLiteral("preferLatex"),false).toBool()}};
     t.host->setRecoverySnapshot(content, 0);
+    t.host->setRecoveryMathMode(m_mathMode,
+        QSettings().value(QStringLiteral("preferLatex"), false).toBool());
+    t.host->setRecoveryLineHeight(preferredLineHeight());
     const QString bootstrap = QStringLiteral("if(location.origin==='https://app.local'){window.msInitialState=%1;}")
         .arg(QString::fromUtf8(QJsonDocument(initial).toJson(QJsonDocument::Compact)));
     t.host->start(exeDir + QStringLiteral("/webview-data"),
@@ -501,12 +521,20 @@ int MainWindow::addTab(const QString &path, const QString &content,
     connect(t.host, &WebViewHost::loadingRetry, this, [this, host=t.host] {
         const auto *tab = tabForHost(host);
         if (!tab) return;
+        host->setRecoveryMathMode(m_mathMode,
+            QSettings().value(QStringLiteral("preferLatex"), false).toBool());
+        host->setRecoveryLineHeight(preferredLineHeight());
+        host->runScript(Bridge::call(QStringLiteral("setMathMode"), { m_mathMode }));
+        host->runScript(Bridge::call(QStringLiteral("setPreferLatex"), {
+            m_mathMode != QLatin1String("mathjax")
+                && QSettings().value(QStringLiteral("preferLatex"), false).toBool() }));
         host->runScript(Bridge::call(QStringLiteral("setDocHost"), { tab->docHost }));
         syncImgMaps();
         host->runScript(QStringLiteral("if(!window.msInitialState){%1}")
             .arg(Bridge::call(QStringLiteral("restoreContent"), { host->recoveryContent(), host->recoveryRevision() })));
         host->runScript(Bridge::call(QStringLiteral("setTheme"), { m_theme }));
         host->runScript(Bridge::call(QStringLiteral("setFontSize"), { m_fontSize }));
+        host->runScript(Bridge::call(QStringLiteral("setLineHeight"), { preferredLineHeight() }));
         host->runScript(Bridge::call(QStringLiteral("setLineNumbers"), { m_lineNumbers }));
         host->runScript(Bridge::call(QStringLiteral("setDocLang"), { tab->docLang }));
         host->runScript(Bridge::call(QStringLiteral("setFocusMode"), { m_focusMode }));
@@ -526,11 +554,15 @@ int MainWindow::addTab(const QString &path, const QString &content,
 
     // 内容下发(runScript 在 C++ 与 JS 两级都有就绪门,乱序安全)
     // Only used if the runtime could not register the initial script.
-    t.host->runScript(QStringLiteral("if(!window.msInitialState){%1%2%3%4}")
-        .arg(Bridge::call(QStringLiteral("setContent"), { content }),
-             Bridge::call(QStringLiteral("setTheme"), { m_theme }),
-             Bridge::call(QStringLiteral("setFontSize"), { m_fontSize }),
-             Bridge::call(QStringLiteral("setLineNumbers"), { m_lineNumbers })));
+    t.host->runScript(QStringLiteral("if(!window.msInitialState){%1}")
+        .arg(Bridge::call(QStringLiteral("setMathMode"), { m_mathMode })
+             + Bridge::call(QStringLiteral("setPreferLatex"), {
+                 m_mathMode != QLatin1String("mathjax")
+                     && QSettings().value(QStringLiteral("preferLatex"), false).toBool() })
+             + Bridge::call(QStringLiteral("setContent"), { content })
+             + Bridge::call(QStringLiteral("setTheme"), { m_theme })
+             + Bridge::call(QStringLiteral("setFontSize"), { m_fontSize })
+             + Bridge::call(QStringLiteral("setLineNumbers"), { m_lineNumbers })));
     if (!t.docLang.isEmpty())
         t.host->runScript(Bridge::call(QStringLiteral("setDocLang"), { t.docLang }));
     if (m_focusMode)
@@ -1376,19 +1408,33 @@ void MainWindow::buildMenus()
 
     // ---------- 设置菜单(帮助之前) ----------
     QMenu *settings = menuBar()->addMenu(tr("设置(&S)"));
-    auto *preferLatex=settings->addAction(tr("优先 LaTeX 风格"));
-    preferLatex->setObjectName(QStringLiteral("preferLatex"));
-    preferLatex->setCheckable(true);
-    preferLatex->setChecked(QSettings().value(QStringLiteral("preferLatex"),false).toBool());
-    connect(preferLatex,&QAction::toggled,this,[this](bool enabled){
-        QSettings().setValue(QStringLiteral("preferLatex"),enabled);
-        for(const auto &tab:m_tabs) if(tab.host)
-            tab.host->runScript(Bridge::call(QStringLiteral("setPreferLatex"),{enabled}));
+    m_mathModeAction = settings->addAction(tr("MathJax 公式模式"));
+    m_mathModeAction->setObjectName(QStringLiteral("mathMode"));
+    m_mathModeAction->setCheckable(true);
+    m_mathModeAction->setChecked(m_mathMode == QLatin1String("mathjax"));
+    m_mathModeAction->setToolTip(tr("只渲染 \\(...\\) 和 \\[...\\]；$...$ 和 $$...$$ 保留原文。"));
+    connect(m_mathModeAction, &QAction::toggled, this, [this](bool enabled) {
+        applyMathMode(enabled ? QStringLiteral("mathjax") : QStringLiteral("markdown"));
     });
-    settings->addAction(tr("修复当前文档的 LaTeX"),this,[this]{
+    m_preferLatexAction=settings->addAction(tr("优先 LaTeX 风格"));
+    m_preferLatexAction->setObjectName(QStringLiteral("preferLatex"));
+    m_preferLatexAction->setCheckable(true);
+    m_preferLatexAction->setChecked(QSettings().value(QStringLiteral("preferLatex"),false).toBool());
+    m_preferLatexAction->setEnabled(m_mathMode != QLatin1String("mathjax"));
+    connect(m_preferLatexAction,&QAction::toggled,this,[this](bool enabled){
+        QSettings().setValue(QStringLiteral("preferLatex"),enabled);
+        for(const auto &tab:m_tabs) if(tab.host) {
+            tab.host->setRecoveryMathMode(m_mathMode, enabled);
+            tab.host->runScript(Bridge::call(QStringLiteral("setPreferLatex"),{
+                enabled && m_mathMode != QLatin1String("mathjax")}));
+        }
+    });
+    m_repairLatexAction=settings->addAction(tr("修复当前文档的 LaTeX"),this,[this]{
+        if (m_mathMode == QLatin1String("mathjax")) return;
         if(auto *tab=currentTab();tab && tab->host)
             tab->host->runScript(Bridge::call(QStringLiteral("repairLatex")));
     });
+    m_repairLatexAction->setEnabled(m_mathMode != QLatin1String("mathjax"));
     settings->addSeparator();
     QAction *autoSaveAct = settings->addAction(tr("自动保存(&A)(停笔 2 秒)"), this, [this](bool on) {
         QSettings().setValue(QStringLiteral("autoSave"), on);
@@ -2188,9 +2234,11 @@ void MainWindow::showPrefs()
     // 确定后这里应用:行距下发各标签,座右铭刷新状态栏
     if (!UiDialogs::showPrefs(this, m_theme))
         return;
-    const double lh = QSettings().value(QStringLiteral("lineHeight"), 1.0).toDouble();
+    applyMathMode(QSettings().value(QStringLiteral("mathMode")).toString());
+    const double lh = preferredLineHeight();
     for (const Tab &t : m_tabs) {
         if (!t.host) continue;
+        t.host->setRecoveryLineHeight(lh);
         t.host->runScript(Bridge::call(QStringLiteral("setLineHeight"), { lh }));
         QTimer::singleShot(80, t.host, [host = t.host]() {
             host->runScript(QStringLiteral("window.msbridge.resyncDecor()"));
@@ -2199,6 +2247,28 @@ void MainWindow::showPrefs()
     m_motto = QSettings().value(QStringLiteral("motto")).toString().trimmed();
     if (auto *t = currentTab())
         m_modeLabel->setText(t->pdf ? tr("PDF 阅读") : modeLabelText(t->mode == QLatin1String("sv")));
+}
+
+void MainWindow::applyMathMode(const QString &mode)
+{
+    m_mathMode = normalizedMathMode(mode);
+    QSettings().setValue(QStringLiteral("mathMode"), m_mathMode);
+    const bool mathjax = m_mathMode == QLatin1String("mathjax");
+    if (m_mathModeAction) {
+        const QSignalBlocker blocker(m_mathModeAction);
+        m_mathModeAction->setChecked(mathjax);
+    }
+    if (m_preferLatexAction) m_preferLatexAction->setEnabled(!mathjax);
+    if (m_repairLatexAction) m_repairLatexAction->setEnabled(!mathjax);
+    const bool preferLatex = !mathjax
+        && QSettings().value(QStringLiteral("preferLatex"), false).toBool();
+    for (const Tab &tab : m_tabs) {
+        if (!tab.host) continue;
+        tab.host->setRecoveryMathMode(m_mathMode, preferLatex);
+        tab.host->runScript(Bridge::call(QStringLiteral("setMathMode"), { m_mathMode }));
+        tab.host->runScript(Bridge::call(QStringLiteral("setPreferLatex"), { preferLatex }));
+    }
+    if (m_aiDock) m_aiDock->setMathMode(m_mathMode);
 }
 
 // 状态栏左侧的模式位:有座右铭时用座右铭替代「所见即所得」(源码模式/PDF 除外)
@@ -2990,6 +3060,7 @@ void MainWindow::ensureAiDock()
     if (m_aiDock)
         return;
     m_aiDock = new AiChatDock(); // 故意不传父窗口
+    m_aiDock->setMathMode(m_mathMode);
     // 无已保存几何(首次/新机器)时:与主窗口【同高】、【2/3 宽】,摆在主窗
     // 口右侧;有则恢复用户上次的位置(旧版本默认 883x1096 比不少屏幕还高,
     // 曾把超大几何存进设置 —— 恢复后超出当前屏幕时按屏幕钳回)
@@ -3149,7 +3220,7 @@ QJsonObject MainWindow::aiDocumentContext()
     if(!t) return {};
     return {{"id",t->aiId},{"name",t->path.isEmpty() ? tr("未命名文档") : QFileInfo(t->path).fileName()},
             {"kind",t->pdf ? "pdf" : "markdown"},{"page_count",t->pdf ? t->pdf->pageCount() : 0},
-            {"current_page",t->pdf ? t->pdf->currentPage()+1 : 0}};
+            {"current_page",t->pdf ? t->pdf->currentPage()+1 : 0}, {"mathMode", m_mathMode}};
 }
 
 void MainWindow::openAiSkills()

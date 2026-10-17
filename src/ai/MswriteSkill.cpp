@@ -10,6 +10,8 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QSettings>
 
 namespace {
@@ -17,6 +19,30 @@ namespace {
 // 不截断文档:用户要求全文交给模型(模型侧 1M 上下文;超限由网关报错可见)
 // 仅对病态超大文档做保险上限,正常文档永远全文
 constexpr int kDocSanityCap = 900000;
+
+QString mathModeSection(const QString &mode)
+{
+    if (mode == QLatin1String("mathjax")) {
+        return QStringLiteral(
+            "\n# Active math mode: MathJax\n"
+            "Use only \\(...\\) for inline formulas and \\[...\\] for display formulas. "
+            "For example: \\(E=mc^2\\) or \\[\\frac{a}{b}\\]. "
+            "The Markdown dollar delimiters $...$ and $$...$$ are disabled and remain literal text; "
+            "never use them for mathematics you intend to render, including Insert payloads. "
+            "Use \\boldsymbol{...} for bold math. "
+            "Keep LaTeX environments inside the active delimiters. "
+            "Do not emit MathJax JavaScript, HTML script tags, \\require, \\href or \\style. "
+            "Code spans and fenced code blocks show source, so do not wrap rendered formulas in them.\n");
+    }
+    return QStringLiteral(
+        "\n# Active math mode: traditional Markdown / LaTeX\n"
+        "Use only $...$ for inline formulas and $$...$$ on their own lines for display formulas. "
+        "For example: $E=mc^2$ or $$\\frac{a}{b}$$. "
+        "MathJax delimiters \\(...\\) and \\[...\\] are disabled; "
+        "do not use them for mathematics you intend to render, including Insert payloads. "
+        "The renderer is KaTeX: bold math uses \\pmb{...}, chemistry uses \\ce{...}. "
+        "Code spans and fenced code blocks show source, so do not wrap rendered formulas in them.\n");
+}
 
 } // namespace
 
@@ -63,7 +89,12 @@ QString customInstructions(const QString &directory)
 
 QString withContext(const QString &context,int writeMode,const QString &skills)
 {
-    return basePrompt()+writeModeSection(writeMode)
+    // The native document context owns the mode. Missing or malformed context
+    // falls back to the editor's default rather than inferring it from content.
+    const QJsonDocument metadata = QJsonDocument::fromJson(context.toUtf8());
+    const QString mathMode = metadata.isObject()
+        ? metadata.object().value(QStringLiteral("mathMode")).toString() : QString();
+    return basePrompt()+writeModeSection(writeMode)+mathModeSection(mathMode)
         +QStringLiteral("\n# Current document metadata\n%1\n"
             "Use ReadDocument only when the user's request needs the document. "
             "Opening the assistant alone does not authorize an unsolicited analysis. "
@@ -98,7 +129,7 @@ QString basePrompt()
         "  to, say you can only help write the current document.\n"
         "\n"
         "# Mswrite Markdown - what renders well here\n"
-        "Mswrite renders via Vditor/Lute, KaTeX and highlight.js.\n"
+        "Mswrite renders via Vditor/Lute, the selected KaTeX or MathJax math renderer, and highlight.js.\n"
         "\n"
         "Structure: `#`..`######` headings; `**bold**`; `*italic*`;\n"
         "`~~strike~~`; inline `` `code` ``; `>` quote; `---` rule; `-`/`*`/`+`\n"
@@ -110,11 +141,10 @@ QString basePrompt()
         "unknown language still shows a plain card. Diagram sources render as\n"
         "graphics: mermaid, flowchart, graphviz, echarts, mindmap, plantuml.\n"
         "\n"
-        "Math (KaTeX): inline `$E=mc^2$`; display math as `$$...$$` on its own\n"
-        "lines. Greek and operators, \\frac{a}{b}, \\sqrt{x}, \\sum_{i=1}^{n},\n"
+        "Math: follow the Active math mode section for the only enabled delimiters.\n"
+        "Greek and operators, \\frac{a}{b}, \\sqrt{x}, \\sum_{i=1}^{n},\n"
         "\\int, \\begin{pmatrix}...\\end{pmatrix}; color with\n"
-        "\\textcolor{#c0392b}{...}; bold with \\pmb{...}; chemistry with\n"
-        "\\ce{...}. Write real math as math, not ASCII approximations.\n"
+        "\\textcolor{#c0392b}{...}. Write real math as math, not ASCII approximations.\n"
         "\n"
         "Inline HTML that Mswrite actually renders (anything else shows as\n"
         "literal text, so avoid it):\n"
@@ -178,6 +208,7 @@ QString withDocument(const QString &docMarkdown, int writeMode)
         body = QStringLiteral("(empty document)");
     return basePrompt()
          + writeModeSection(writeMode)
+         + mathModeSection(QStringLiteral("markdown"))
          + QStringLiteral("\n# Current document (full, not truncated)\n<document>\n")
          + body
          + QStringLiteral("\n</document>\n");

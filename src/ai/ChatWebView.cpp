@@ -26,6 +26,8 @@ ChatWebView::ChatWebView(ChatModel *model, QWidget *parent)
     // 不一致即源于此)。主窗口切主题时由 followHostTheme 实时同步。
     m_light = QSettings().value(QStringLiteral("theme"), QStringLiteral("light"))
                   .toString() != QLatin1String("dark");
+    m_mathMode = QSettings().value(QStringLiteral("mathMode")).toString() == QLatin1String("mathjax")
+        ? QStringLiteral("mathjax") : QStringLiteral("markdown");
     showLoading(m_light ? "light" : "dark", tr("正在加载对话…"));
     connect(this, &WebViewHost::loadingRetry, this, [this] {
         // 重载启动:全状态复位。watchdog 不在此刻武装 —— 重载本身需要
@@ -169,7 +171,7 @@ ChatWebView::ChatWebView(ChatModel *model, QWidget *parent)
         web = QStringLiteral(MSWRITE_SOURCE_DIR) + QStringLiteral("/resources/web");
 #endif
     start(exe + QStringLiteral("/webview-data"), QStringLiteral("chat.local"),
-          QDir(web).absolutePath(), QStringLiteral("https://chat.local/chat.html?v=10"));
+          QDir(web).absolutePath(), QStringLiteral("https://chat.local/chat.html?v=13"));
 }
 
 void ChatWebView::showEvent(QShowEvent *event)
@@ -230,6 +232,23 @@ void ChatWebView::setLightTheme(bool light)
 }
 void ChatWebView::setBusy(bool busy) { m_busy = busy; schedule(); }
 
+void ChatWebView::setMathMode(const QString &mode)
+{
+    const QString next = mode == QLatin1String("mathjax") ? QStringLiteral("mathjax")
+                                                        : QStringLiteral("markdown");
+    if (m_mathMode == next) return;
+    m_mathMode = next;
+    // 页面尚未就绪/隐藏/正在同步时仍保留最新模式，下一次完整载荷会重绘历史。
+    m_reset = true;
+    m_dirty.clear();
+    if (m_ready && isPageReady()) {
+        runScript(QStringLiteral(
+            "if(window.chatView&&typeof window.chatView.setMathMode==='function')"
+            "window.chatView.setMathMode('%1');").arg(m_mathMode));
+    }
+    schedule();
+}
+
 void ChatWebView::scrollToBottom(bool force)
 {
     if (m_ready)
@@ -280,11 +299,17 @@ void ChatWebView::sync()
     }
     const int sequence = ++m_sequence;
     const QJsonObject payload{{"reset", m_reset}, {"count", m_model->rowCount()}, {"sequence", sequence},
-                             {"rows", rows}, {"light", m_light}, {"busy", m_busy}};
+                             {"rows", rows}, {"light", m_light}, {"busy", m_busy},
+                             {"mathMode", m_mathMode}};
     m_dirty.clear();
     m_reset = false;
     m_renderPending=true;
     m_inFlight=true;
+    // Arm on dispatch itself: schedule() runs before m_renderPending becomes
+    // true, and a successful ExecuteScript reply does not confirm rendering.
+    // A quiet conversation must still recover if its first frame never acks.
+    if (isVisible() && !m_watchdog.isActive())
+        m_watchdog.start();
     // 回调自保:WebView2 在页面导航/重载边缘会静默丢弃 ExecuteScript 的
     // 完成回调(handler 永远不被 Invoke)。原实现 m_inFlight 会因此永久卡
     // true,后续 sync 全被跳过。这里用超时兜底:无回调视为丢失,复位
@@ -313,8 +338,11 @@ void ChatWebView::sync()
                 guard->m_renderPending=false;
                 guard->m_reset=true;   // 下次全量重发,主题/消息变更不丢
                 if (++guard->m_failures <= 2) {
-                    QTimer::singleShot(300, guard, [guard] {
-                        if (!guard || guard->m_rendered) return;
+                    QTimer::singleShot(300, guard, [guard, sequence] {
+                        // m_rendered can describe the previous healthy frame;
+                        // it must not discard this failed update or mode switch.
+                        if (!guard || guard->isClosing() || !guard->m_ready
+                            || guard->m_sequence != sequence) return;
                         guard->schedule();
                     });
                     return;

@@ -563,6 +563,7 @@ struct WebViewHost::Impl {
     QString recoveryText;
     int recoveryRev = 0;
     bool hasRecovery = false;
+    QJsonObject recoveryPreferences;
     QString userDataFolder;
     QString curUrl;                      // 最近一次导航的 URL
     bool alwaysVisible = false;         // 导出页等隐藏场景:渲染不挂起
@@ -927,9 +928,12 @@ struct WebViewHost::Impl {
                     guard->navigate(guard->d->startUrl);
                 };
                 QString bootstrap = initialScript;
-                if (hasRecovery) {
-                    const QJsonObject snapshot{{QStringLiteral("content"), recoveryText},
-                                               {QStringLiteral("rev"), recoveryRev}};
+                if (hasRecovery || !recoveryPreferences.isEmpty()) {
+                    QJsonObject snapshot = recoveryPreferences;
+                    if (hasRecovery) {
+                        snapshot.insert(QStringLiteral("content"), recoveryText);
+                        snapshot.insert(QStringLiteral("rev"), recoveryRev);
+                    }
                     bootstrap += QStringLiteral(";if(window.msInitialState){Object.assign(window.msInitialState,%1);}")
                         .arg(QString::fromUtf8(QJsonDocument(snapshot).toJson(QJsonDocument::Compact)));
                 }
@@ -959,6 +963,7 @@ struct WebViewHost::Impl {
 
     void shutdown()
     {
+        q->cancelPdfRequest(E_ABORT);
         ++controllerGeneration; // Discard callbacks retained by an older runtime controller.
         // 关键:环境创建是异步的,若本实例在回调前销毁,s_waiters 里
         // 会留下悬垂指针 —— 回调触发即 use-after-free(启动瞬间关标签/关窗)
@@ -1064,6 +1069,17 @@ WebViewHost::WebViewHost(QWidget *parent)
     // 控制器创建兜底:回调静默丢失时自动重试(见 m_ctrlWatchdog 注释)
     m_ctrlWatchdog.setSingleShot(true);
     m_ctrlWatchdog.setInterval(12000);
+    m_printWatchdog.setSingleShot(true);
+    m_printWatchdog.setInterval(60000);
+    connect(&m_printWatchdog, &QTimer::timeout, this, [this] {
+        if (m_closing || !m_printPending) return;
+        qWarning() << "Mswrite: PDF 打印完成回执超时，重置打印控制器";
+        finishPdfRequest(m_printRequest, false, HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+        // Close the old controller before the queued failure callback allows
+        // another export. Its late COM reply cannot complete the next request.
+        if (d->startUrl.isEmpty()) d->shutdown();
+        else recreateBrowser();
+    });
     connect(&m_ctrlWatchdog, &QTimer::timeout, this, [this] {
         if (m_closing || !d || d->ctrl)
             return;
@@ -1207,6 +1223,20 @@ void WebViewHost::setRecoverySnapshot(const QString &content, int revision)
     d->hasRecovery = true;
 }
 
+void WebViewHost::setRecoveryMathMode(const QString &mode, bool preferLatex)
+{
+    const bool mathjax = mode == QLatin1String("mathjax");
+    d->recoveryPreferences.insert(QStringLiteral("mathMode"),
+        mathjax ? QStringLiteral("mathjax") : QStringLiteral("markdown"));
+    d->recoveryPreferences.insert(QStringLiteral("preferLatex"), preferLatex && !mathjax);
+}
+
+void WebViewHost::setRecoveryLineHeight(double lineHeight)
+{
+    d->recoveryPreferences.insert(QStringLiteral("lineHeight"),
+        std::isfinite(lineHeight) ? qBound(1.0, lineHeight, 2.2) : 1.0);
+}
+
 QString WebViewHost::recoveryContent() const { return d->recoveryText; }
 int WebViewHost::recoveryRevision() const { return d->recoveryRev; }
 
@@ -1301,10 +1331,53 @@ QString WebViewHost::currentUrl() const
     return d->curUrl;
 }
 
+quint64 WebViewHost::beginPdfRequest(std::function<void(bool, HRESULT)> done)
+{
+    if (m_closing || m_printPending) {
+        if (done && !m_closing) QTimer::singleShot(0, this, [this, done = std::move(done)] {
+            if (!m_closing) done(false, HRESULT_FROM_WIN32(ERROR_BUSY));
+        });
+        return 0;
+    }
+    m_printDone = std::move(done);
+    m_printPending = true;
+    m_printGeneration = d->controllerGeneration;
+    m_printWatchdog.start();
+    return ++m_printRequest;
+}
+
+void WebViewHost::finishPdfRequest(quint64 request, bool ok, HRESULT error)
+{
+    if (m_closing || request != m_printRequest || !m_printPending
+        || m_printGeneration != d->controllerGeneration) return;
+    m_printPending = false;
+    m_printWatchdog.stop();
+    auto done = std::move(m_printDone);
+    m_printDone = nullptr;
+    // Leave the COM callback before showing UI or starting another export.
+    if (done) QTimer::singleShot(0, this, [this, done = std::move(done), ok, error] {
+        if (!m_closing) done(ok, error);
+    });
+}
+
+void WebViewHost::cancelPdfRequest(HRESULT error)
+{
+    m_printWatchdog.stop();
+    m_printPending = false;
+    ++m_printRequest;
+    auto done = std::move(m_printDone);
+    m_printDone = nullptr;
+    if (done && !m_closing) QTimer::singleShot(0, this, [this, done = std::move(done), error] {
+        if (!m_closing) done(false, error);
+    });
+}
+
 void WebViewHost::printToPdf(const QString &outputPath, std::function<void(bool, HRESULT)> done)
 {
-    d->doPrintToPdf(outputPath, [guard = QPointer<WebViewHost>(this), done = std::move(done)](bool ok, HRESULT hr) {
-        if (guard && !guard->m_closing && done) done(ok, hr);
+    const quint64 request = beginPdfRequest(std::move(done));
+    if (!request) return;
+    d->doPrintToPdf(outputPath, [guard = QPointer<WebViewHost>(this), request](bool ok, HRESULT error) {
+        if (guard) guard->finishPdfRequest(request, ok, error);
     });
 }
 

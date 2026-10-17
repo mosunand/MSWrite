@@ -1,6 +1,7 @@
 #include "uidialogs.h"
 #include "ai/MswriteSkill.h"
 #include <QApplication>
+#include <QCheckBox>
 #include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -304,6 +305,7 @@ QLabel#prefsSubtitle { color:%3; font-size:13px; }
 QLabel#sectionTitle { color:%2; font-size:15px; font-weight:600; }
 QLabel#fieldLabel { color:%2; font-size:13px; }
 QLabel#hint { color:%3; font-size:12px; }
+QCheckBox { color:%2; background:transparent; font-size:13px; spacing:8px; }
 QFrame#prefsCard { background:%4; border:1px solid %5; border-radius:12px; }
 QLineEdit, QDoubleSpinBox {
     background:%4; color:%2; border:1px solid %5; border-radius:8px;
@@ -325,8 +327,8 @@ QFrame#separator { background:%5; max-height:1px; border:none; }
        dark ? QStringLiteral("#303846") : QStringLiteral("#eef3fb"),
        dark ? QStringLiteral("#6fa7ef") : QStringLiteral("#264da9")));
     d.setFont(QFont(QStringLiteral("Microsoft YaHei UI"), 10));
-    d.resize(640, 480);
-    d.setMinimumSize(560, 440);
+    d.resize(640, 540);
+    d.setMinimumSize(560, 500);
 
     auto *root = new QVBoxLayout(&d);
     root->setContentsMargins(30, 26, 30, 22);
@@ -335,7 +337,7 @@ QFrame#separator { background:%5; max-height:1px; border:none; }
     auto *title = new QLabel(QObject::tr("偏好设置"), &d);
     title->setObjectName(QStringLiteral("prefsTitle"));
     root->addWidget(title);
-    auto *subtitle = new QLabel(QObject::tr("调整编辑器的显示方式。设置会立即应用到当前文档。"), &d);
+    auto *subtitle = new QLabel(QObject::tr("调整显示方式。确认后应用到已打开的文档和对话。"), &d);
     subtitle->setObjectName(QStringLiteral("prefsSubtitle"));
     root->addWidget(subtitle);
     root->addSpacing(10);
@@ -396,6 +398,18 @@ QFrame#separator { background:%5; max-height:1px; border:none; }
     mottoRow->addWidget(motto, 0);
     motto->setMinimumWidth(260);
     cardLay->addLayout(mottoRow);
+
+    auto *mathjax = new QCheckBox(QObject::tr("MathJax 公式模式"), card);
+    mathjax->setObjectName(QStringLiteral("mathModeCheck"));
+    mathjax->setChecked(QSettings().value(QStringLiteral("mathMode")).toString()
+                       == QLatin1String("mathjax"));
+    cardLay->addWidget(mathjax);
+    auto *mathHint = new QLabel(QObject::tr(
+        "勾选：只渲染 \\(...\\) 和 \\[...\\]，$...$ 和 $$...$$ 保留原文。\n"
+        "未勾选：使用传统 LaTeX / Markdown 公式模式。"), card);
+    mathHint->setObjectName(QStringLiteral("hint"));
+    mathHint->setWordWrap(true);
+    cardLay->addWidget(mathHint);
     root->addWidget(card);
     root->addStretch(1);
 
@@ -414,5 +428,7 @@ QFrame#separator { background:%5; max-height:1px; border:none; }
         return false;
     QSettings().setValue(QStringLiteral("lineHeight"), lh->value());
     QSettings().setValue(QStringLiteral("motto"), motto->text().trimmed());
+    QSettings().setValue(QStringLiteral("mathMode"),
+                         mathjax->isChecked() ? QStringLiteral("mathjax") : QStringLiteral("markdown"));
     return true;
 }

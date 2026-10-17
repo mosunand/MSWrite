@@ -22,6 +22,7 @@ article { min-width:0; margin:12px 0 30px; }
 .content > :first-child { margin-top:0; }
 .content > :last-child { margin-bottom:0; }
 .content p { margin:0 0 1em; }
+.content strong .katex { font-weight:700; }
 .content h1 { font-size:1.5em; }
 .content h2 { font-size:1.3em; }
 .content h3 { font-size:1.15em; }
@@ -63,3 +64,4 @@ img { max-width:100%; height:auto; }
 #toast { position:fixed; bottom:62px; left:50%; transform:translateX(-50%); padding:7px 14px; border-radius:8px; background:var(--user); color:var(--fg); border:1px solid var(--line); font-size:12px; }
 ::selection { background:#4b8fea55; }
 @media(max-width:520px) { main { padding:4px 16px 64px; } nav { padding:6px 12px; } .user .content { max-width:94%; } }
+.ms-math-literal { white-space: pre-wrap; }

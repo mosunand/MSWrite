@@ -1053,6 +1053,11 @@ void AiChatDock::followHostTheme(bool light)
     applyLightTheme(light);
 }
 
+void AiChatDock::setMathMode(const QString &mode)
+{
+    if (m_chat) m_chat->setMathMode(mode);
+}
+
 void AiChatDock::applyLightTheme(bool light)
 {
     m_lightTheme = light;
@@ -1675,7 +1680,8 @@ void AiChatDock::stop()
 
 void AiChatDock::dispatch(const QString &userText)
 {
-    m_turnPreferLatex=QSettings().value(QStringLiteral("preferLatex"),false).toBool();
+    m_turnPreferLatex=QSettings().value(QStringLiteral("mathMode")).toString() != QLatin1String("mathjax")
+        && QSettings().value(QStringLiteral("preferLatex"),false).toBool();
     const QJsonObject context=m_contextProvider ? m_contextProvider() : QJsonObject();
     m_activeDocumentId=context.value(QStringLiteral("id")).toString();
     const int mode=context.value(QStringLiteral("kind")).toString()==QLatin1String("pdf") ? 0 : m_dispatchMode;

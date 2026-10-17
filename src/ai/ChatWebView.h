@@ -12,6 +12,7 @@ class ChatWebView : public WebViewHost {
 public:
     explicit ChatWebView(ChatModel *model, QWidget *parent = nullptr);
     void setLightTheme(bool light);
+    void setMathMode(const QString &mode);
     void setBusy(bool busy);
     void scrollToBottom(bool force = false);
 
@@ -34,6 +35,7 @@ private:
     bool m_ready = false;
     bool m_light = false;
     bool m_busy = false;
+    QString m_mathMode = QStringLiteral("markdown");
     bool m_rendered = false;
     bool m_renderPending = false;
     bool m_inFlight = false;

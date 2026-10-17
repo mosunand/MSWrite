@@ -109,7 +109,7 @@ async function main() {
         }
         finally { await page.close(); }
     }
-    async function testChat(name, text, verify) {
+    async function testChat(name, text, verify, mathMode = 'markdown') {
         const page = await browser.newPage();
         page.on('pageerror', error => errors.push(error.message));
         try {
@@ -119,13 +119,417 @@ async function main() {
             });
             await page.goto(`http://127.0.0.1:${server.address().port}/chat.html`);
             await page.waitForFunction(() => !!window.chatView);
-            await page.evaluate(text => chatView.update({ reset: true, count: 1, sequence: 7,
-                rows: [{ id: 0, kind: 1, text, finalized: true }], light: true, busy: false }), text);
+            await page.evaluate(({text, mathMode}) => chatView.update({ reset: true, count: 1, sequence: 7,
+                rows: [{ id: 0, kind: 1, text, finalized: true, preferLatex: mathMode === 'mathjax' }], mathMode,
+                light: true, busy: false }), {text, mathMode});
             await page.waitForFunction(() => hostMessages.some(msg => msg.t === 'chatRendered' && msg.sequence === 7));
             await verify(page); passed++; console.log('PASS ' + name);
         } finally { await page.close(); }
     }
     try {
+        await test('math mode preserves edits undo redo and active formula rendering', async page => {
+            await page.evaluate(() => {
+                codeTests.root.focus(); codeTests.placeCaretInBlock(codeTests.root.querySelector('p'), true);
+            });
+            await page.keyboard.type(' edited');
+            await page.evaluate(() => codeTests.recordMathUndo());
+            const edited = (await state(page)).md;
+            await page.evaluate(() => msbridge.setMathMode('mathjax'));
+            await page.waitForFunction(() => codeTests.root.querySelector('mjx-container'));
+            await page.evaluate(() => msbridge.editUndo());
+            await page.waitForFunction(() => !mswValue().includes(' edited'));
+            assert.ok((await state(page)).md.includes('$a$'));
+            assert.equal(await page.locator('.katex').count(), 0);
+            await page.evaluate(() => msbridge.editRedo());
+            await page.waitForFunction(() => mswValue().includes(' edited'));
+            assert.equal((await state(page)).md, edited);
+            await page.evaluate(() => msbridge.setMathMode('markdown'));
+            await page.waitForFunction(() => codeTests.root.querySelector('.katex'));
+            await page.evaluate(() => msbridge.editUndo());
+            await page.waitForFunction(() => !mswValue().includes(' edited'));
+            assert.equal(await page.locator('mjx-container').count(), 0);
+        }, 'original $a$ \\(b\\)');
+        await test('math mode retains redo while displaying another formula syntax', async page => {
+            await page.evaluate(() => {
+                codeTests.root.focus(); codeTests.placeCaretInBlock(codeTests.root.querySelector('p'), true);
+            });
+            await page.keyboard.type(' edited'); await page.evaluate(() => codeTests.recordMathUndo());
+            await page.evaluate(() => msbridge.editUndo());
+            await page.waitForFunction(() => !mswValue().includes(' edited'));
+            await page.evaluate(() => msbridge.setMathMode('mathjax'));
+            await page.waitForTimeout(1600);
+            await page.evaluate(() => msbridge.editRedo());
+            await page.waitForFunction(() => mswValue().includes(' edited'));
+            assert.equal((await state(page)).md, 'original edited\n');
+        }, 'original');
+        await test('math mode keeps the insertion caret in the same prose position', async page => {
+            await page.evaluate(() => {
+                const text = codeTests.root.querySelector('p').firstChild;
+                const range = document.createRange(); range.setStart(text, 3); range.collapse(true);
+                getSelection().removeAllRanges(); getSelection().addRange(range); codeTests.root.focus();
+                msbridge.setMathMode('mathjax');
+            });
+            await page.keyboard.type('X');
+            assert.equal((await state(page)).md, 'oriXginal\n');
+        }, 'original');
+        await test('failed formula parser leaves content mode and undo intact', async page => {
+            const before = (await state(page)).md;
+            const history = await page.evaluate(() => codeTests.editor.vditor.undo.ir.undoStack.length);
+            await page.evaluate(() => {
+                codeTests.editor.vditor.lute.Md2VditorIRDOM = () => { throw Error('test parser failure'); };
+                msbridge.setMathMode('mathjax');
+            });
+            assert.equal((await state(page)).md, before);
+            assert.equal(await page.evaluate(() => msMathMode.getMode()), 'markdown');
+            assert.equal(await page.evaluate(() => codeTests.editor.vditor.undo.ir.undoStack.length), history);
+            assert.ok(await page.evaluate(() => hostMessages.some(m => m.t === 'notice' && m.msg.includes('已保留当前内容'))));
+        }, 'original $a$');
+        await test('failed renderer rolls back the formula view and caret', async page => {
+            const before = (await state(page)).md;
+            const view = await page.evaluate(() => {
+                codeTests.root.focus();
+                const text = codeTests.root.querySelector('p').firstChild;
+                const range = document.createRange(); range.setStart(text, 3); range.collapse(true);
+                getSelection().removeAllRanges(); getSelection().addRange(range);
+                const before = codeTests.root.innerHTML;
+                const render = Vditor.mathRender;
+                Vditor.mathRender = () => { throw Error('test renderer setup failure'); };
+                try { msbridge.setMathMode('mathjax'); }
+                finally { Vditor.mathRender = render; }
+                return { before, after: codeTests.root.innerHTML, mode: msMathMode.getMode(),
+                    engine: codeTests.editor.vditor.options.preview.math.engine };
+            });
+            assert.equal(view.after, view.before);
+            assert.equal(view.mode, 'markdown'); assert.equal(view.engine, 'KaTeX');
+            assert.equal((await state(page)).md, before);
+            await page.keyboard.type('X');
+            assert.ok((await state(page)).md.startsWith('oriXginal'));
+        }, 'original $a$ \\(b\\)');
+        await test('switching formula modes cannot suppress a pending real edit', async page => {
+            await page.evaluate(() => {
+                hostMessages.length = 0;
+                codeTests.root.focus(); codeTests.placeCaretInBlock(codeTests.root.querySelector('p'), true);
+            });
+            await page.keyboard.type(' edited');
+            await page.evaluate(() => msbridge.setMathMode('mathjax'));
+            await page.waitForFunction(() => hostMessages.some(m => m.t === 'changed' && m.md.includes('original edited')));
+            assert.equal((await state(page)).md, 'original edited\n');
+        }, 'original');
+        const exclusiveMath = '行内 **\\(P^{m \\times n}\\)**；旧式 $x^2$。\n\n\\[\n\\frac{1}{2}+\\sqrt{x}\n\\]\n\n$$\ny^2\n$$';
+        await test('MathJax exclusively renders backslash delimiters and preserves dollars', async page => {
+            await page.waitForFunction(() => codeTests.root.querySelectorAll('mjx-container').length === 2);
+            assert.equal(await page.locator('.katex').count(), 0);
+            assert.equal(await page.locator('mjx-container[display="true"]').count(), 1);
+            const source = (await state(page)).md;
+            assert.ok(source.includes('**\\(P^{m \\times n}\\)**'));
+            assert.ok(source.includes('\\[\n\\frac{1}{2}+\\sqrt{x}\n\\]'));
+            assert.ok(source.includes('$x^2$')); assert.ok(source.includes('$$\ny^2\n$$'));
+            assert.ok(await page.locator('.vditor-ir').innerText().then(text => text.includes('$x^2$') && text.includes('$$')));
+            await page.evaluate(text => msbridge.setContent(text), source);
+            await page.waitForFunction(() => codeTests.root.querySelectorAll('mjx-container').length === 2);
+            assert.equal((await state(page)).md, source);
+        }, { content: exclusiveMath, mathMode: 'mathjax', preferLatex: true });
+        await test('formula mode switching keeps Markdown and revision intact', async page => {
+            await page.waitForFunction(() => codeTests.root.querySelectorAll('mjx-container').length === 2);
+            const before = (await state(page)).md;
+            await page.evaluate(() => msbridge.requestContent(911));
+            await page.waitForFunction(() => hostMessages.some(m => m.t === 'content' && m.request === 911));
+            const revision = await page.evaluate(() => hostMessages.find(m => m.t === 'content' && m.request === 911).rev);
+            await page.evaluate(() => { hostMessages.length = 0; msbridge.setMathMode('markdown'); });
+            await page.waitForFunction(() => codeTests.ready && msMathMode.getMode() === 'markdown');
+            await page.waitForFunction(() => codeTests.root.querySelectorAll('.katex').length === 2);
+            assert.equal((await state(page)).md, before);
+            await page.evaluate(() => msbridge.setMathMode('mathjax'));
+            await page.waitForFunction(() => codeTests.ready && codeTests.root.querySelectorAll('mjx-container').length === 2);
+            assert.equal((await state(page)).md, before);
+            assert.equal(await page.evaluate(() => hostMessages.filter(m => m.t === 'changed').length), 0);
+            await page.evaluate(() => msbridge.requestContent(912));
+            await page.waitForFunction(() => hostMessages.some(m => m.t === 'content' && m.request === 912));
+            assert.equal(await page.evaluate(() => hostMessages.find(m => m.t === 'content' && m.request === 912).rev), revision);
+        }, { content: exclusiveMath, mathMode: 'mathjax' });
+        const protectedMath = '`\\(a\\)` 与 `$$b$$`\n\n```text\n\\(c\\)\n\\[d\\]\n$e$\n```\n\n    \\(f\\)\n\n\\\\(escaped\\\\) 与 \\(unclosed';
+        await test('MathJax leaves code escaped and incomplete delimiters untouched', async page => {
+            await page.waitForTimeout(300);
+            assert.equal(await page.locator('mjx-container').count(), 0);
+            const source = (await state(page)).md;
+            assert.ok(source.includes('\\(c\\)')); assert.ok(source.includes('\\[d\\]'));
+            assert.ok(source.includes('\\\\(escaped\\\\)')); assert.ok(source.includes('\\(unclosed'));
+            await page.evaluate(text => msbridge.setContent(text), source);
+            assert.equal((await state(page)).md, source);
+        }, { content: protectedMath, mathMode: 'mathjax' });
+        await test('MathJax source mode round trip preserves delimiters', async page => {
+            await page.waitForFunction(() => codeTests.root.querySelector('mjx-container'));
+            const before = (await state(page)).md;
+            await page.evaluate(() => msbridge.toggleMode());
+            await page.waitForFunction(() => codeTests.ready && !!document.querySelector('.vditor-sv'));
+            assert.equal((await state(page)).md.trimEnd(), before.trimEnd());
+            await page.evaluate(() => msbridge.toggleMode());
+            await page.waitForFunction(() => codeTests.ready && codeTests.root.querySelectorAll('mjx-container').length === 2);
+            assert.equal((await state(page)).md.trimEnd(), before.trimEnd());
+        }, { content: exclusiveMath, mathMode: 'mathjax' });
+        await test('typing a MathJax formula completes its preview and preserves editable source', async page => {
+            await page.evaluate(() => {
+                codeTests.root.focus(); codeTests.placeCaretInBlock(codeTests.root.querySelector('p'), true);
+            });
+            await page.keyboard.type('值 \\(x^2\\) 尾文');
+            await page.waitForFunction(() => codeTests.root.querySelector('mjx-container'));
+            assert.ok((await state(page)).md.includes('值 \\(x^2\\) 尾文'), JSON.stringify(await state(page)));
+            await page.keyboard.press('Backspace');
+            assert.ok((await state(page)).md.includes('\\(x^2\\) 尾'));
+        }, { content: '', mathMode: 'mathjax' });
+        await test('MathJax native paste preserves formulas and dollar source', async page => {
+            await page.evaluate(text => {
+                codeTests.root.focus(); codeTests.placeCaretInBlock(codeTests.root.querySelector('p'), true);
+                msbridge.pasteText(text);
+            }, exclusiveMath);
+            await page.waitForFunction(() => codeTests.root.querySelectorAll('mjx-container').length === 2);
+            const source = (await state(page)).md;
+            assert.ok(source.includes('\\[\n\\frac{1}{2}+\\sqrt{x}\n\\]'));
+            assert.ok(source.includes('$x^2$')); assert.ok(source.includes('$$\ny^2\n$$'));
+        }, { content: '', mathMode: 'mathjax', preferLatex: true });
+        await test('MathJax empty formulas are safe to open and save', async page => {
+            await page.waitForTimeout(300);
+            assert.ok((await state(page)).md.includes('\\(\\)'));
+            assert.ok((await state(page)).md.includes('\\[\\]'));
+        }, { content: '\\(\\)\n\n\\[\\]', mathMode: 'mathjax' });
+        const inactiveDollar = '$\\{x\\}$ 与 $a **b**$\n\n$$\n\\{x\\} \\_ \\*\n$$';
+        await test('inactive dollar formulas retain TeX escapes and Markdown-like text', async page => {
+            const source = (await state(page)).md;
+            assert.ok(source.includes('$\\{x\\}$'), source);
+            assert.ok(source.includes('$a **b**$'), source);
+            assert.ok(source.includes('$$\n\\{x\\} \\_ \\*\n$$'), source);
+            assert.equal(await page.locator('strong,mjx-container,.katex').count(), 0);
+            await page.evaluate(text => msbridge.setContent(text), source);
+            assert.equal((await state(page)).md, source);
+        }, { content: inactiveDollar, mathMode: 'mathjax' });
+        await test('MathJax clipboard text follows the same parsing as document loading', async page => {
+            await page.evaluate(text => {
+                codeTests.root.focus(); codeTests.placeCaretInBlock(codeTests.root.querySelector('p'), true);
+                const data = new DataTransfer(); data.setData('text/plain', text);
+                codeTests.root.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+            }, exclusiveMath);
+            await page.waitForFunction(() => codeTests.root.querySelectorAll('mjx-container').length === 2);
+            assert.ok((await state(page)).md.includes('\\[\n\\frac{1}{2}+\\sqrt{x}\n\\]'));
+        }, { content: '', mathMode: 'mathjax' });
+        await test('MathJax rich clipboard retains source and bold formatting', async page => {
+            await page.evaluate(() => {
+                codeTests.root.focus(); codeTests.placeCaretInBlock(codeTests.root.querySelector('p'), true);
+                const data = new DataTransfer(); data.setData('text/plain', 'P');
+                data.setData('text/html', '<p><strong><span class="language-math" data-ms-math-mode="mathjax" data-ms-math-display="false" data-ms-math-source="P">P</span></strong></p>');
+                codeTests.root.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+            });
+            await page.waitForFunction(() => codeTests.root.querySelector('strong mjx-container'));
+            assert.ok((await state(page)).md.includes('**\\(P\\)**'));
+        }, { content: '', mathMode: 'mathjax' });
+        await test('MathJax display inside quotations excludes Markdown quote markers', async page => {
+            await page.waitForFunction(() => codeTests.root.querySelector('blockquote mjx-container[display="true"]'));
+            assert.equal(await page.locator('blockquote svg [data-c="3E"]').count(), 0);
+            const source = (await state(page)).md;
+            assert.ok(source.includes('> \\[')); assert.ok(source.includes('> x^2'));
+            assert.ok(source.includes('> \\]'));
+        }, { content: '> \\[\n> x^2\n> \\]', mathMode: 'mathjax' });
+        await test('MathJax export contains self contained SVG and inactive dollars', async page => {
+            await page.evaluate(() => msbridge.requestHtml(321));
+            await page.waitForFunction(() => hostMessages.some(m => m.t === 'html' && m.request === 321));
+            const html = await page.evaluate(() => hostMessages.find(m => m.t === 'html' && m.request === 321).html);
+            assert.ok(html.includes('<svg')); assert.ok(html.includes('MJX-SVG-styles'));
+            const exportedText = await page.evaluate(html => {
+                const node = document.createElement('div'); node.innerHTML = html;
+                node.querySelectorAll('style,mjx-container').forEach(el => el.remove());
+                return node.textContent;
+            }, html);
+            assert.ok(exportedText.includes('$x^2$')); assert.ok(exportedText.includes('$$'));
+            assert.ok(!html.includes('class="katex')); assert.ok(!html.includes('<script'));
+            assert.ok(!/(?:xlink:href|href)="(?:https?:|javascript:)/i.test(html));
+        }, { content: exclusiveMath, mathMode: 'mathjax' });
+        await test('MathJax invalid and dangerous formulas fall back to source', async page => {
+            await page.waitForFunction(() => codeTests.root.querySelectorAll('.vditor-reset--error').length === 3);
+            assert.equal(await page.locator('mjx-container').count(), 0);
+            assert.ok((await state(page)).md.includes('\\href{https://example.invalid/}{x}'));
+            assert.equal(await page.locator('[href^="https://example.invalid"]').count(), 0);
+            assert.equal(await page.evaluate(() => window.mathAttack || 0), 0);
+        }, { content: '\\(\\href{https://example.invalid/}{x}\\)\n\n\\(\\require{html}x\\)\n\n\\(\\def\\x{\\x}\\x\\)', mathMode: 'mathjax' });
+        await test('MathJax macro definitions cannot leak across formulas', async page => {
+            await page.waitForFunction(() => codeTests.root.querySelector('mjx-container') && codeTests.root.querySelector('.vditor-reset--error'));
+            assert.equal(await page.locator('mjx-container').count(), 1);
+        }, { content: '\\(\\newcommand{\\privateMacro}{x}\\privateMacro\\)\n\n\\(\\privateMacro\\)', mathMode: 'mathjax' });
+        await test('latest mode wins during consecutive mode changes', async page => {
+            await page.evaluate(() => { msbridge.setMathMode('mathjax'); msbridge.setMathMode('markdown'); msbridge.setMathMode('mathjax'); });
+            await page.waitForFunction(() => codeTests.ready && codeTests.root.querySelectorAll('mjx-container').length === 2);
+            assert.equal(await page.locator('.katex').count(), 0);
+            assert.ok((await state(page)).md.includes('\\(P^{m \\times n}\\)'));
+        }, { content: exclusiveMath });
+        await testChat('MathJax chat ignores legacy conversion preferences', exclusiveMath, async page => {
+            assert.equal(await page.locator('mjx-container').count(), 2);
+            assert.equal(await page.locator('.katex').count(), 0);
+            assert.ok((await page.locator('.content').innerText()).includes('$x^2$'));
+            await page.evaluate(() => chatView.setMathMode('markdown'));
+            await page.waitForFunction(() => document.querySelectorAll('.katex').length >= 2);
+            await page.evaluate(() => chatView.setMathMode('mathjax'));
+            await page.waitForFunction(() => document.querySelectorAll('mjx-container').length === 2);
+            assert.equal(await page.locator('.katex').count(), 0);
+        }, 'mathjax');
+        const exactBoldMath = '- **$P$**：一个数域，例如实数域 $\\mathbb{R}$ 或复数域 $\\mathbb{C}$。\n'
+            + '- **$m$**：矩阵的行数。\n'
+            + '- **$n$**：矩阵的列数。\n'
+            + '- **$P^{m \\times n}$**：所有元素都属于数域 $P$ 的 $m \\times n$ 矩阵的集合。';
+        async function verifyExactBoldMath(page) {
+            await page.waitForFunction(() => codeTests.root.querySelectorAll('li strong .katex').length === 4,
+                undefined, { timeout: 4000 });
+            assert.deepEqual(await page.locator('li strong code[data-type="math-inline"]').allTextContents(),
+                ['P', 'm', 'n', 'P^{m \\times n}']);
+            const markdown = (await state(page)).md;
+            assert.ok(markdown.includes('**$P$**')); assert.ok(markdown.includes('**$m$**'));
+            assert.ok(markdown.includes('**$n$**')); assert.ok(markdown.includes('**$P^{m \\times n}$**'));
+            assert.equal(await page.locator('li strong .mathnormal').first().evaluate(node =>
+                getComputedStyle(node).fontWeight), '700');
+            await page.evaluate(source => msbridge.setContent(source), markdown);
+            await page.waitForFunction(() => codeTests.root.querySelectorAll('li strong .katex').length === 4,
+                undefined, { timeout: 4000 });
+        }
+        await test('user exact bold formulas survive native text paste and reopening', async page => {
+            await page.evaluate(text => {
+                codeTests.root.focus(); codeTests.placeCaretInBlock(codeTests.root.querySelector('p'), true);
+                msbridge.pasteText(text);
+            }, exactBoldMath);
+            await verifyExactBoldMath(page);
+        }, '');
+        await test('user exact bold formulas survive Markdown insertion and reopening', async page => {
+            await page.evaluate(text => {
+                codeTests.root.focus(); codeTests.placeCaretInBlock(codeTests.root.querySelector('p'), true);
+                msbridge.insertText('\n\n' + text);
+            }, exactBoldMath);
+            await verifyExactBoldMath(page);
+        }, '');
+        await test('user exact bold formulas render when opening a document', verifyExactBoldMath, exactBoldMath);
+        await test('user exact bold formulas survive rich clipboard conversion and reopening', async page => {
+            await page.evaluate(text => {
+                codeTests.root.focus(); codeTests.placeCaretInBlock(codeTests.root.querySelector('p'), true);
+                const data = new DataTransfer(); data.setData('text/plain', text);
+                const holder = document.createElement('div');
+                const items = text.split('\n').map(line => { const item = document.createElement('li');
+                    item.textContent = line.slice(2); return item; });
+                const list = document.createElement('ul'); list.append(...items); holder.append(list);
+                data.setData('text/html', holder.innerHTML);
+                codeTests.root.dispatchEvent(new ClipboardEvent('paste', {
+                    clipboardData: data, bubbles: true, cancelable: true
+                }));
+            }, exactBoldMath);
+            await verifyExactBoldMath(page);
+        }, '');
+        await testChat('user exact bold formulas render in AI chat', exactBoldMath, async page => {
+            assert.equal(await page.locator('.content li strong .katex').count(), 4);
+            assert.equal((await page.locator('.content').innerText()).includes('**'), false);
+        });
+        await test('rich paste preserves bold inline formulas without zero-width guards', async page => {
+            await page.evaluate(() => {
+                codeTests.root.focus(); codeTests.placeCaretInBlock(codeTests.root.querySelector('p'), true);
+                const data = new DataTransfer();
+                data.setData('text/plain', 'P：数域。\nm：矩阵的行数。');
+                data.setData('text/html', '<ul><li><strong>$P$</strong>：数域。</li><li>**$m$**：矩阵的行数。</li></ul>');
+                codeTests.root.dispatchEvent(new ClipboardEvent('paste', {
+                    clipboardData: data, bubbles: true, cancelable: true
+                }));
+            });
+            await page.waitForFunction(() => codeTests.root.querySelectorAll('li strong .katex').length === 2);
+            const md = (await state(page)).md;
+            assert.ok(md.includes('**$P$**')); assert.ok(md.includes('**$m$**'));
+            await page.evaluate(source => msbridge.setContent(source), md);
+            await page.waitForFunction(() => codeTests.root.querySelectorAll('li strong .katex').length === 2);
+        }, '原文');
+        await test('bold math has bold glyphs while ordinary math stays regular', async page => {
+            await page.waitForFunction(() => codeTests.root.querySelectorAll('.katex').length === 2);
+            const weights = await page.evaluate(() => ({
+                bold: getComputedStyle(codeTests.root.querySelector('strong .katex .mathnormal')).fontWeight,
+                regular: getComputedStyle(codeTests.root.querySelector('p > .vditor-ir__node > .vditor-ir__preview .mathnormal')).fontWeight
+            }));
+            assert.equal(weights.bold, '700'); assert.equal(weights.regular, '400');
+        }, '**$P$** and $m$');
+        const boldMathMarkdown = '一、**每个符号是什么意思？**\n\n'
+            + '- ** $P$ **：一个数域，例如实数域 $\\mathbb{R}$ 或复数域 $\\mathbb{C}$。\n'
+            + '- ** $m$ **：矩阵的行数。\n'
+            + '- ** $n$ **：矩阵的列数。\n'
+            + '- ** $P^{m\\times n}$ **：所有元素都属于数域 $P$ 的矩阵。';
+        await test('spaced bold delimiters render around inline math and survive reopening', async page => {
+            await page.waitForFunction(() => codeTests.root.querySelectorAll('li strong .katex').length === 4);
+            const source = (await state(page)).md;
+            assert.ok(source.includes('P^{m\\times n}'));
+            assert.equal(await page.locator('.vditor-ir li').evaluateAll(items => items.some(item => {
+                const prose = item.cloneNode(true);
+                prose.querySelectorAll('.vditor-ir__marker').forEach(node => node.remove());
+                return prose.textContent.includes('**');
+            })), false);
+            await page.evaluate(markdown => msbridge.setContent(markdown), source);
+            await page.waitForFunction(() => codeTests.root.querySelectorAll('li strong .katex').length === 4);
+        }, boldMathMarkdown);
+        await testChat('chat renders spaced bold formulas', boldMathMarkdown, async page => {
+            assert.equal(await page.locator('.content li strong .katex').count(), 4);
+            assert.equal((await page.locator('.content').innerText()).includes('**'), false);
+            assert.equal(await page.locator('.content li strong .mathnormal').first().evaluate(node =>
+                getComputedStyle(node).fontWeight), '700');
+        });
+        await test('literal asterisks and math operators retain their meaning', async page => {
+            const results = await page.evaluate(() => {
+                const lute = Lute.New();
+                return ['\\*\\*$P$\\*\\*', '`** $P$ **`', '$**P**$', '$x**y$',
+                    '***$P$***', '** $P$ ** and ** $m$ **', '** **',
+                    '** left\n\nright **', '** left `$m$` right **', '** left $a*b$ right **'].map(md => {
+                    const template = document.createElement('template'); template.innerHTML = lute.Md2HTML(md);
+                    return { md, strong: template.content.querySelectorAll('strong').length,
+                        math: Array.from(template.content.querySelectorAll('.language-math')).map(node => node.textContent),
+                        text: template.content.textContent };
+                });
+            });
+            assert.equal(results[0].strong, 0); assert.ok(results[0].text.includes('**'));
+            assert.equal(results[1].strong, 0); assert.ok(results[1].text.includes('** $P$ **'));
+            assert.equal(results[2].strong, 0); assert.deepEqual(results[2].math, ['**P**']);
+            assert.equal(results[3].strong, 0); assert.deepEqual(results[3].math, ['x**y']);
+            assert.equal(results[4].strong, 1);
+            assert.equal(results[5].strong, 2);
+            assert.equal(results[6].strong, 0); assert.equal(results[7].strong, 0);
+            assert.equal(results[8].strong, 1); assert.deepEqual(results[8].math, []);
+            assert.equal(results[9].strong, 1); assert.deepEqual(results[9].math, ['a*b']);
+        });
+        const spacingMarkdown = Array.from({ length: 6 }, (_, i) =>
+            '上一段\n\n---\n\n' + '#'.repeat(i + 1) + ' 新概念').join('\n\n')
+            + '\n\n---\n\n新概念\n\n普通上段\n\n### 独立标题';
+        for (const theme of ['light', 'dark', 'paper']) {
+            for (const mode of ['ir', 'wysiwyg']) {
+                await test(`headings after separators use paragraph spacing (${theme}, ${mode})`, async page => {
+                    if (mode !== 'ir') {
+                        await page.evaluate(markdown => codeTests.createEditor('wysiwyg', markdown), spacingMarkdown);
+                        await page.waitForFunction(() => codeTests.ready && !!document.querySelector('.vditor-wysiwyg'));
+                    }
+                    await page.evaluate(theme => msbridge.setTheme(theme), theme);
+                    await page.waitForFunction(theme => {
+                        const expected = theme === 'paper' ? 'wechat' : theme;
+                        return Array.from(document.querySelectorAll('link[rel="stylesheet"]')).some(link =>
+                            link.href.includes('/content-theme/' + expected + '.css') && !!link.sheet);
+                    }, theme);
+                    for (const [fontSize, lineHeight] of [[16, 1], [12, 2.2], [28, 1.6]]) {
+                        const layout = await page.evaluate(({ fontSize, lineHeight }) => {
+                            msbridge.setFontSize(fontSize); msbridge.setLineHeight(lineHeight);
+                            const root = codeTests.root;
+                            const gap = node => node.getBoundingClientRect().top
+                                - node.previousElementSibling.getBoundingClientRect().bottom;
+                            return {
+                                paragraph: gap(root.querySelector('hr + p')),
+                                headings: Array.from(root.querySelectorAll('hr + h1,hr + h2,hr + h3,hr + h4,hr + h5,hr + h6')).map(gap),
+                                independentMargin: parseFloat(getComputedStyle(root.querySelector('p + h3')).marginTop),
+                                md: mswValue()
+                            };
+                        }, { fontSize, lineHeight });
+                        assert.equal(layout.headings.length, 6);
+                        for (const gap of layout.headings) {
+                            assert.ok(Math.abs(gap - layout.paragraph) < 1,
+                                `Heading gap ${gap} differs from paragraph ${layout.paragraph} at ${fontSize}px/${lineHeight}`);
+                        }
+                        assert.equal(layout.independentMargin, 24, 'Independent heading spacing stays unchanged');
+                        assert.ok(layout.md.includes('###### 新概念'), 'Heading Markdown survives layout changes');
+                    }
+                }, { content: spacingMarkdown, theme });
+            }
+        }
         await testChat('chat formatting and math work without dynamic script evaluation',
             '**正文**\n\n$x^2$\n\n```javascript\nconst value = 1;\n```', async page => {
                 assert.equal(await page.locator('.content strong').innerText(), '正文');

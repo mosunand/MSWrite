@@ -55,6 +55,7 @@ public:
     void clearConversation();                // 清历史 + 清屏
     bool isLightTheme() const { return m_lightTheme; }
     void followHostTheme(bool light);        // 主窗口主题变化时 AI 面板跟随
+    void setMathMode(const QString &mode);   // 跟随全局公式标记模式，不修改消息原文
 
 public slots:
     // 工作线程经 BlockingQueuedConnection 调用(在 GUI 线程执行)

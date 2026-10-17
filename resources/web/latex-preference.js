@@ -27,6 +27,17 @@
             masked = masked.replace(/(?<![\\$])(\${1,2})(?!\$)[\s\S]*?(?<![\\$])\1(?!\$)/g,
                 match => ' '.repeat(match.length));
             if (decodeMath) {
+                // HTML2Md inserts zero-width guards around HTML <strong>.
+                // They prevent emphasis around an inline formula from parsing.
+                // Remove only this paired guard on the rich clipboard path.
+                const guardedStrong = /\u200b\*\*(?!\*)([^\r\n]+?)\*\*(?!\*)\u200b/g;
+                let guarded;
+                while ((guarded = guardedStrong.exec(masked))) {
+                    const start = guarded.index, end = start + guarded[0].length;
+                    if (!text.slice(start + 3, end - 3).trim()) continue;
+                    changes.push({ start:offset+start, end:offset+start+1, text:'' });
+                    changes.push({ start:offset+end-1, end:offset+end, text:'' });
+                }
                 const strong = /(?<![\\*])\\\*\\\*([^\r\n]+?)\\\*\\\*(?!\*)/g;
                 let emphasis;
                 while ((emphasis = strong.exec(masked))) {

@@ -49,6 +49,9 @@
     .vditor-reset pre > code { line-height: 1.7 !important; }
     .vditor-reset .katex,
     .vditor-reset .katex-display { line-height: normal; }
+    /* KaTeX 的 font 简写会重置粗体；让 Markdown 的 strong 作用于公式。 */
+    .vditor-reset strong .katex { font-weight: 700; }
+    .ms-math-literal { white-space: pre-wrap; }
 
     /* 引用块:用户明确不要「竖线 + 右侧变浅色」的样式 —— 改为无竖线的
        圆角底色卡片,文字用正常色,靠底色区分(粘贴进来的旧引用同样生效)。
@@ -131,6 +134,17 @@
     .vditor-ir h5 .vditor-ir__marker--heading,
     .vditor-ir h6 .vditor-ir__marker--heading {
         display: none !important;
+    }
+
+    /* 分隔线下的标题与普通段落使用同一间距。保留独立标题的上边距，
+       这里只消除紧随 hr 的额外 24px；!important 压住动态内容主题。 */
+    .vditor-reset hr + h1,
+    .vditor-reset hr + h2,
+    .vditor-reset hr + h3,
+    .vditor-reset hr + h4,
+    .vditor-reset hr + h5,
+    .vditor-reset hr + h6 {
+        margin-top: 0 !important;
     }
 
     /* 代码块:对齐 Typora —— 一张卡片,左侧行号,语法高亮。
@@ -616,9 +630,11 @@
     <script defer src="vditor/dist/js/highlight.js/highlight.min.js"></script>
     <script defer id="vditorKatexScript" src="vditor/dist/js/katex/katex.min.js"></script>
     <script defer id="vditorKatexChemScript" src="vditor/dist/js/katex/mhchem.min.js"></script>
-<script defer src="strong-spacing.js?v=168"></script>
-<script defer src="latex-preference.js?v=168"></script>
+<script defer src="strong-spacing.js?v=171"></script>
+<script defer src="math-mode.js?v=173"></script>
+<script defer src="math-renderer.js?v=173"></script>
+<script defer src="latex-preference.js?v=171"></script>
 <script defer src="render-ready.js?v=144"></script>
-<script defer src="bridge.js?v=169"></script>
+<script defer src="bridge.js?v=173"></script>
 </body>
 </html>

@@ -133,6 +133,7 @@ private:
 
     void applyTheme(const QString &theme, bool persist = true);
     void broadcastTheme();
+    void applyMathMode(const QString &mode); // 公式标记模式:全局持久化并同步编辑器/聊天
     void updateSaveIndicator(bool dirty);    // 状态栏:未保存红/已保存白(加粗)
     void updateZoomLabel(double factor);     // 状态栏:缩放百分比胶囊
     void applyZoom(Tab &tab, double factor); // 整页缩放:同步 host/状态栏/持久化
@@ -206,6 +207,10 @@ private:
 
     QString m_theme = QStringLiteral("light");
     QString m_motto;                     // 座右铭(空 = 状态栏显示「所见即所得」)
+    QString m_mathMode = QStringLiteral("markdown");
+    QAction *m_mathModeAction = nullptr;
+    QAction *m_preferLatexAction = nullptr;
+    QAction *m_repairLatexAction = nullptr;
     int m_fontSize = 16;
     bool m_lineNumbers = false;          // 代码块行号(默认关:MarkText 式无行号卡片)
     int m_docHostSeq = 0;

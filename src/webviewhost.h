@@ -37,6 +37,9 @@ public:
     void addHostMapping(const QString &virtualHost, const QString &folder);
     // Latest editor state stays in the native process when its renderer restarts.
     void setRecoverySnapshot(const QString &content, int revision);
+    // 重建前的公式偏好必须先覆盖旧 bootstrap，避免恢复正文被旧转换逻辑修改。
+    void setRecoveryMathMode(const QString &mode, bool preferLatex);
+    void setRecoveryLineHeight(double lineHeight);
     QString recoveryContent() const;
     int recoveryRevision() const;
 
@@ -99,6 +102,9 @@ protected:
 private:
     friend struct Impl;
     void raiseLoading();
+    quint64 beginPdfRequest(std::function<void(bool, HRESULT)> done);
+    void finishPdfRequest(quint64 request, bool ok, HRESULT error);
+    void cancelPdfRequest(HRESULT error);
     struct Impl;
     Impl *d = nullptr;
 
@@ -112,6 +118,13 @@ private:
     // 转圈。创建后 12s 内没拿到控制器就自动重试;窗口不可见时先挂起,等
     // showEvent 再建(WebView2 要求创建时父窗口可见)。
     QTimer m_ctrlWatchdog;
+    // COM may never acknowledge a print after a renderer failure. Keep one
+    // request, consume its callback once, and cancel it before controller Close.
+    QTimer m_printWatchdog;
+    bool m_printPending = false;
+    std::function<void(bool, HRESULT)> m_printDone;
+    quint64 m_printRequest = 0;
+    quint64 m_printGeneration = 0;
     bool m_createOnShow = false;
     qint64 m_lastRecreateAt = 0;   // 上次整链重建时刻:600ms 内的重复触发合并
 };

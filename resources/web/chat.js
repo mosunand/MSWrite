@@ -12,6 +12,7 @@
     if (lute.SetSanitize) lute.SetSanitize(true);
     if (lute.SetInlineMathAllowDigitAfterOpenMarker) lute.SetInlineMathAllowDigitAfterOpenMarker(true);
     let follow = true, busy = false, toastTimer, paintTicket = 0;
+    let mathMode = 'markdown';
     const button = (label, action) => {
         const b = document.createElement('button'); b.textContent = label; b.dataset.action = action;
         return b;
@@ -26,23 +27,6 @@
         return [...records.values()].filter(r => r.data.kind < 2)
             .map(r => `## ${r.data.kind === 0 ? '我' : 'AI'}\n${r.data.text}`).join('\n\n');
     }
-    // Lute handles dollar delimiters. Normalize the other common AI delimiters,
-    // retaining fenced code and inline code verbatim.
-    function normalizeMath(md) {
-        let fence = null;
-        return md.split('\n').map(line => {
-            const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
-            if (marker) {
-                if (!fence) fence = marker[1];
-                else if (marker[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = null;
-                return line;
-            }
-            if (fence || /^( {4}|\t)/.test(line)) return line;
-            return line.split(/(`+[^`]*(?:`[^`]+)*?`+)/g).map((part, i) => i % 2 ? part :
-                part.replace(/\\\[/g, '$$$$').replace(/\\\]/g, '$$$$')
-                    .replace(/\\\(/g, '$$').replace(/\\\)/g, '$$')).join('');
-        }).join('\n');
-    }
     function sanitize(html) {
         const t = document.createElement('template'); t.innerHTML = html;
         const allowed = new Set('P DIV SPAN BR HR EM STRONG B I S DEL U A BLOCKQUOTE H1 H2 H3 H4 H5 H6 OL UL LI PRE CODE TABLE THEAD TBODY TFOOT TR TH TD SUP SUB IMG INPUT'.split(' '));
@@ -51,11 +35,13 @@
             for (const attr of [...el.attributes]) {
                 const name = attr.name;
                 if (name === 'class') {
-                    el.className = el.className.split(/\s+/).filter(c => /^(language-[\w+-]+|math-inline|math-block)$/.test(c)).join(' ');
+                    el.className = el.className.split(/\s+/).filter(c => /^(language-[\w+-]+|math-inline|math-block|ms-math-literal)$/.test(c)).join(' ');
                 } else if (name === 'href' && el.tagName === 'A') {
                     if (!/^https?:\/\//i.test(attr.value)) el.removeAttribute(name);
                 } else if (name === 'src' && el.tagName === 'IMG') {
                     if (!/^data:image\/(png|jpeg|gif|webp);base64,/i.test(attr.value)) el.removeAttribute(name);
+                } else if (name === 'data-ms-math-display' && attr.value === 'true') {
+                    // Only this boolean rendering hint is accepted from Lute.
                 } else if (!['alt','title','colspan','rowspan','start','checked'].includes(name)) {
                     el.removeAttribute(name);
                 }
@@ -65,8 +51,8 @@
         return t.content;
     }
     function markdown(text, target) {
-        target.replaceChildren(sanitize(lute.Md2HTML(normalizeMath(text))));
-        target.querySelectorAll('.language-math').forEach(el => {
+        target.replaceChildren(sanitize(lute.Md2HTML(text)));
+        if (mathMode !== 'mathjax') target.querySelectorAll('.language-math').forEach(el => {
             const source = el.textContent;
             const display = el.parentElement?.tagName === 'PRE' || el.tagName === 'DIV';
             const wrapper = document.createElement(display ? 'div' : 'span');
@@ -97,6 +83,7 @@
             const wrap = document.createElement('div'); wrap.className = 'table-wrap';
             table.replaceWith(wrap); wrap.append(table);
         });
+        return mathMode === 'mathjax' ? window.msMathRenderer.render(target) : Promise.resolve();
     }
     function render(record) {
         const {data:d, el} = record;
@@ -126,11 +113,13 @@
             const actions = document.createElement('div'); actions.className='actions';
             el.append(content, actions);
         }
-        if (record.renderedText !== d.text || record.renderedPreferLatex !== !!d.preferLatex) {
+        const preferLatex = mathMode !== 'mathjax' && !!d.preferLatex;
+        if (record.renderedText !== d.text || record.renderedPreferLatex !== preferLatex || record.renderedMathMode !== mathMode) {
             if (d.kind === 0) content.textContent = d.text;
-            else markdown(d.preferLatex ? window.msLatexPreference.normalize(d.text) : d.text, content);
+            else record.paintPromise = markdown(preferLatex ? window.msLatexPreference.normalize(d.text) : d.text, content);
             record.renderedText = d.text;
-            record.renderedPreferLatex = !!d.preferLatex;
+            record.renderedPreferLatex = preferLatex;
+            record.renderedMathMode = mathMode;
             record.renderedImages = '';  // textContent 会清空内容,图片行必须重建
         }
         // 用户消息的图片附件(截图):显示原图,不再只是"📎 截图"文字
@@ -169,6 +158,13 @@
     }
     window.chatView = {
         scrollToBottom,
+        setMathMode(mode) {
+            const next = mode === 'mathjax' ? 'mathjax' : 'markdown';
+            if (mathMode === next) return;
+            mathMode = next; window.msMathMode.setMode(next); window.msMathRenderer.invalidate();
+            for (const record of records.values()) render(record);
+            scrollToBottom();
+        },
         setTheme(light) {
             try {
                 if (!document.documentElement) return false;
@@ -184,6 +180,7 @@
         update(payload) {
             window.chatViewSequence = payload.sequence;
             if (payload.reset) { records.clear(); root.replaceChildren(); follow = true; }
+            this.setMathMode(payload.mathMode);
             busy = payload.busy;
             const theme = payload.light ? 'light' : 'dark';
             if (document.documentElement.dataset.theme !== theme) {
@@ -204,7 +201,8 @@
             root.querySelectorAll('[data-action="regenerate"]').forEach(b => { b.disabled=busy; });
             scrollToBottom();
             const ticket = ++paintTicket;
-            window.msWaitForRender(root).then(() => {
+            Promise.all([...records.values()].map(r => r.paintPromise)).then(() =>
+                window.msWaitForRender(root, () => window.msMathRenderer.pending(root))).then(() => {
                 if (ticket === paintTicket) post({t:'chatRendered', count:records.size, sequence:payload.sequence});
             }, () => {
                 if (ticket === paintTicket) post({t:'chatError', message:'Conversation rendering failed', sequence:payload.sequence});

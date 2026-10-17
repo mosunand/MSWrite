@@ -4,7 +4,7 @@
  */
 (function () {
     'use strict';
-    var MSW_BRIDGE_VERSION = 169;
+    var MSW_BRIDGE_VERSION = 173;
     window.msbridgeVer = MSW_BRIDGE_VERSION;
     window.mswValue = function () { return vd ? vd.getValue() : ''; }; // 启动校验(C++ 读日志) // 缓存排查:每次改动必须递增
 
@@ -27,7 +27,9 @@
     var lineHeight = typeof initial.lineHeight === 'number' && initial.lineHeight >= 1.0
         ? Math.min(initial.lineHeight, 2.2) : 1.0;   // 正文行距(代码块/公式固定,不随动)
     var showLineNumbers = !!initial.lineNumbers;
-    var preferLatex = !!initial.preferLatex;
+    var mathMode = initial.mathMode === 'mathjax' ? 'mathjax' : 'markdown';
+    window.msMathMode.setMode(mathMode);
+    var preferLatex = mathMode !== 'mathjax' && !!initial.preferLatex;
     var latexBefore = null, latexTimer = null, applyingLatex = false;
     var docLang = '';              // 本文档默认代码语言:新建块自动带上(仍可手动改)
     var focusMode = false;
@@ -181,7 +183,7 @@
         return preferLatex && window.msLatexPreference ? window.msLatexPreference.normalize(text) : text;
     }
     document.addEventListener('beforeinput', function (event) {
-        if (!vd || currentMode !== 'ir' || event.isComposing || !event.cancelable ||
+        if (mathMode === 'mathjax' || !vd || currentMode !== 'ir' || event.isComposing || !event.cancelable ||
             event.inputType !== 'insertText' || event.data !== '$') return;
         if (!editorRoot().contains(event.target) || /^(INPUT|TEXTAREA|SELECT)$/.test(event.target.tagName)) return;
         var block = caretBlock(), selection = getSelection();
@@ -850,7 +852,7 @@
             return;
         }
         var pv = node.querySelector('.vditor-ir__preview');
-        var inner = (pv && pv.querySelector('.katex')) ? pv.innerHTML : '';
+        var inner = (pv && pv.querySelector('.katex,mjx-container')) ? pv.innerHTML : '';
         if (!inner) { el.hidden = true; return; }
         if (el.__html !== inner) {
             el.__html = inner;
@@ -2439,7 +2441,7 @@
         if (format.bold) { prefix += '\\pmb{\n'; suffix = '\n}' + suffix; }
         var text = prefix + format.body + suffix;
         try {
-            window.katex.renderToString(text, {
+            if (mathMode !== 'mathjax') window.katex.renderToString(text, {
                 displayMode: true, macros: vd.vditor.options.preview.math.macros || {}
             });
         } catch (error) {
@@ -2505,8 +2507,12 @@
             return math && math.classList.contains('language-math') && !math.hasAttribute('data-math');
         });
         pending.forEach(function (preview) { preview.setAttribute('data-render', '2'); });
-        try { undo.addToUndoStack(vd.vditor); return true; }
-        finally { pending.forEach(function (preview) { preview.setAttribute('data-render', '1'); }); }
+        var force = undo.msMathForceSnapshot;
+        try { undo.msMathForceSnapshot = true; undo.addToUndoStack(vd.vditor); return true; }
+        finally {
+            undo.msMathForceSnapshot = force;
+            pending.forEach(function (preview) { preview.setAttribute('data-render', '1'); });
+        }
     }
 
     // Keep LaTeX as text inside CODE. Browser insertText/insertHTML split
@@ -4400,7 +4406,7 @@
             }
             var normalized = html && window.msLatexPreference
                 ? window.msLatexPreference.normalizeClipboard(raw, preferLatex) : preferredText(raw);
-            if (normalized !== raw) {
+            if (normalized !== raw || (mathMode === 'mathjax' && raw)) {
                 e.preventDefault(); e.stopPropagation();
                 suppressUntil = 0;
                 recordMathUndo(); vd.insertMD(normalized); rerender(); recordMathUndo();
@@ -4433,6 +4439,107 @@
     // ------------------------------------------------------------------
     // 编辑器创建 / 重建(切换模式需要)
     // ------------------------------------------------------------------
+    function captureMathView() {
+        var root = editorRoot(), selection = getSelection();
+        var saved = { source: vd.getValue(), x: window.scrollX, y: window.scrollY,
+            focused: document.activeElement === root, tokens: [] };
+        if (currentMode !== 'ir' || !selection.rangeCount) return saved;
+        var range = selection.getRangeAt(0).cloneRange();
+        if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return saved;
+        var prefix = 'msMathCaret' + Date.now().toString(36) + Math.random().toString(36).slice(2);
+        var start = document.createTextNode(prefix + 'Start'), end = document.createTextNode(prefix + 'End');
+        saved.tokens = [start.data, end.data];
+        try {
+            var tail = range.cloneRange(); tail.collapse(false); tail.insertNode(end);
+            range.collapse(true); range.insertNode(start);
+            var marked = vd.getValue();
+            if (marked.split(start.data).join('').split(end.data).join('') === saved.source)
+                saved.marked = marked;
+            else saved.tokens = [];
+        } finally { start.remove(); end.remove(); }
+        return saved;
+    }
+
+    function applyMathView(saved) {
+        var root = editorRoot(), tokens = saved.tokens, points = [];
+        var html = vd.vditor.lute.Md2VditorIRDOM(saved.marked || saved.source);
+        var template = document.createElement('template'); template.innerHTML = html;
+        var walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_COMMENT), nodes = [];
+        while (walker.nextNode()) nodes.push(walker.currentNode);
+        tokens.forEach(function (token, index) {
+            nodes.forEach(function (node) {
+                var offset = node.data.indexOf(token);
+                if (offset < 0) return;
+                if (node.nodeType === Node.TEXT_NODE && !points[index] && node.parentElement
+                    && !node.parentElement.closest('.vditor-ir__preview')) points[index] = [node, offset];
+                node.data = node.data.split(token).join('');
+            });
+            template.content.querySelectorAll('*').forEach(function (node) {
+                Array.from(node.attributes).forEach(function (attribute) {
+                    if (attribute.value.includes(token)) node.setAttribute(attribute.name, attribute.value.split(token).join(''));
+                });
+            });
+        });
+        // Keep the actual nodes until decoration succeeds. A renderer can fail
+        // after parsing succeeds; rollback must restore the old view as well
+        // as the source, including its original selection and event handlers.
+        var previousNodes = Array.from(root.childNodes), previousRange = null, selection = getSelection();
+        if (selection.rangeCount && root.contains(selection.anchorNode)) {
+            var oldRange = selection.getRangeAt(0);
+            previousRange = [oldRange.startContainer, oldRange.startOffset, oldRange.endContainer, oldRange.endOffset];
+        }
+        try {
+            resetLangPicker(); codeLangBlock = null; contextMathBlock = null;
+            lastMiNode = null; activeBlock = null; window._msCbEdit = null;
+            if (codeLangBtn) codeLangBtn.style.display = 'none';
+            if (mathPopEl) mathPopEl.hidden = true;
+            root.replaceChildren(template.content);
+            if (points[0] && points[1]) {
+                var range = document.createRange(); range.setStart(points[0][0], points[0][1]);
+                range.setEnd(points[1][0], points[1][1]);
+                selection.removeAllRanges(); selection.addRange(range);
+            }
+            if (saved.focused) root.focus({ preventScroll: true });
+            clearStaleCaretBookmarks(); syncFrontMatterFlag();
+            if (docHost) rewriteAllImgs(root);
+            renderColorTags(); decorateAllCodeBlocks();
+            Vditor.mathRender(root, { cdn: vd.vditor.options.cdn, math: vd.vditor.options.preview.math });
+            window.scrollTo(saved.x, saved.y);
+        } catch (error) {
+            root.replaceChildren.apply(root, previousNodes);
+            if (previousRange) {
+                var oldRange = document.createRange();
+                oldRange.setStart(previousRange[0], previousRange[1]); oldRange.setEnd(previousRange[2], previousRange[3]);
+                selection.removeAllRanges(); selection.addRange(oldRange);
+            }
+            if (saved.focused) root.focus({ preventScroll: true });
+            window.scrollTo(saved.x, saved.y);
+            throw error;
+        }
+    }
+
+    function preserveMathUndo() {
+        var undo = vd.vditor.undo;
+        if (undo.msMathViewWrapped) return;
+        var renderDiff = undo.renderDiff, editor = vd;
+        var addToUndoStack = undo.addToUndoStack;
+        undo.addToUndoStack = function () {
+            // An input callback queued before a display switch can run later.
+            // Its view-only difference must not consume redo or add an undo.
+            if (this.msMathViewChanged && !this.msMathForceSnapshot && vd === editor && currentMode === 'ir'
+                && editor.vditor.lute.VditorIRDOM2Md(this.ir.lastText) === editor.getValue()) return;
+            return addToUndoStack.apply(this, arguments);
+        };
+        undo.renderDiff = function () {
+            renderDiff.apply(this, arguments);
+            // History stores the DOM from each edit. Rebuild only its display
+            // after undo/redo so history from the other math mode stays usable.
+            if (this.msMathViewChanged && vd === editor && currentMode === 'ir')
+                applyMathView(captureMathView());
+        };
+        undo.msMathViewWrapped = true;
+    }
+
     function createEditor(mode, value) {
         if (['ir', 'sv', 'wysiwyg'].indexOf(mode) < 0) throw new Error('Invalid editor mode');
         var generation = ++editorGeneration;
@@ -4480,7 +4587,7 @@
                     footnotes: true,
                     imageCaption: true
                 },
-                math: { engine: 'KaTeX', inlineDigit: true },
+                math: { engine: mathMode === 'mathjax' ? 'MSMathJax' : 'KaTeX', inlineDigit: true },
                 hljs: {
                     // 语言选择由 ms-lang-suggest 负责，禁止内核再生成第二份列表。
                     langs: [],
@@ -4501,6 +4608,8 @@
                 if (generation !== editorGeneration) return;
                 clearStaleCaretBookmarks();
                 vd.clearStack();
+                preserveMathUndo();
+                if (mathMode === 'mathjax') window.msMathRenderer.render(editorRoot());
                 document.documentElement.style.setProperty('--ms-font-size', fontSize + 'px');
                 document.documentElement.style.setProperty('--ms-line-height', String(lineHeight));
                 // 初始文档自带 front matter 时标记为合法(输入路径不得回退)
@@ -4540,7 +4649,7 @@
                     post({ t: 'ready' });
                     window.msWaitForRender(document.getElementById('vd'), function () {
                         return Array.from(document.querySelectorAll('.vditor-ir__preview .language-math'))
-                            .some(function (el) { return el.textContent.trim() && !el.querySelector('.katex,.katex-error')
+                            .some(function (el) { return el.textContent.trim() && !el.querySelector('.katex,.katex-error,mjx-container')
                                 && !el.classList.contains('vditor-reset--error'); })
                             || Array.from(document.querySelectorAll('.vditor-ir__preview .language-mermaid'))
                             .some(function (el) { return el.textContent.trim() && !el.querySelector('svg')
@@ -4562,14 +4671,16 @@
         var snapshot = document.createElement('div');
         snapshot.innerHTML = stripColorSpans(vd ? vd.getHTML() : '');
         var mathOptions = vd ? vd.vditor.options.preview.math : {};
-        snapshot.querySelectorAll('.language-math').forEach(function (element) {
+        var exportMathMode = mathMode;
+        var mathReady = exportMathMode === 'mathjax' ? window.msMathRenderer.render(snapshot, true) : Promise.resolve();
+        if (exportMathMode !== 'mathjax') snapshot.querySelectorAll('.language-math').forEach(function (element) {
             var source = element.textContent.replace(/\u00a0/g, ' ');
             element.setAttribute('data-math', source);
             try {
                 element.innerHTML = window.katex.renderToString(source, {
                     displayMode: element.tagName === 'DIV',
                     output: 'html',
-                    macros: mathOptions.macros || {}
+                    macros: mathOptions.macros || {}, trust: false, maxSize: 20, maxExpand: 1000
                 });
             } catch (error) {
                 element.textContent = error.message;
@@ -4628,13 +4739,53 @@
                 });
             }).catch(function () { /* Keep the resolved URL for the host fallback. */ });
         });
-        return Promise.all(images).then(function () { return snapshot.innerHTML; });
+        return Promise.all([mathReady, ...images]).then(function () {
+            return (exportMathMode === 'mathjax' ? '<style>.ms-math-literal{white-space:pre-wrap}</style>'
+                + window.msMathRenderer.exportStyle() : '') + snapshot.innerHTML;
+        });
     }
 
     // C++ -> JS 暴露的桥接口(全部经过初始化门)
     // ------------------------------------------------------------------
     var impl = {
+        setMathMode: function (mode) {
+            var next = mode === 'mathjax' ? 'mathjax' : 'markdown';
+            if (next === mathMode) return;
+            var saved;
+            try {
+                saved = captureMathView();
+                if (currentMode === 'ir') {
+                    var history = vd.vditor.undo && vd.vditor.undo.ir;
+                    if (!history) throw Error('Undo unavailable');
+                    var recorded = vd.vditor.lute.VditorIRDOM2Md(history.lastText);
+                    if (recorded !== saved.source && !recordMathUndo()) throw Error('Undo unavailable');
+                }
+            }
+            catch (error) {
+                post({ t: 'jserror', msg: String(error), src: 'setMathMode' });
+                notice('无法读取当前内容，已取消切换'); return;
+            }
+            var previous = mathMode, previousEngine = vd.vditor.options.preview.math.engine;
+            try {
+                window.msMathMode.setMode(next);
+                vd.vditor.options.preview.math.engine = next === 'mathjax' ? 'MSMathJax' : 'KaTeX';
+                window.msMathRenderer.invalidate();
+                if (currentMode === 'ir') applyMathView(saved);
+            } catch (error) {
+                window.msMathMode.setMode(previous);
+                vd.vditor.options.preview.math.engine = previousEngine;
+                window.msMathRenderer.invalidate();
+                post({ t: 'jserror', msg: String(error), src: 'setMathMode' });
+                notice('公式显示切换失败，已保留当前内容'); return;
+            }
+            mathMode = next;
+            vd.vditor.undo.msMathViewChanged = true;
+            if (next === 'mathjax') preferLatex = false;
+            latexBefore = null; clearTimeout(latexTimer);
+            lastValue = saved.source;
+        },
         repairLatex: function () {
+            if (mathMode === 'mathjax') return;
             var source=vd.getValue(), converted=window.msLatexPreference.normalize(source);
             if(source===converted) { notice('未发现需要转换的公式');return; }
             if (!recordCodeUndo()) { notice('无法记录撤销状态，已取消转换'); return; }
@@ -4643,7 +4794,7 @@
             notice('公式已修复，可撤销本次转换');
         },
         setPreferLatex: function (enabled) {
-            preferLatex = !!enabled;
+            preferLatex = mathMode !== 'mathjax' && !!enabled;
             latexBefore = null; clearTimeout(latexTimer);
         },
         setContent: function (md) {
@@ -4986,7 +5137,7 @@
             var codeTarget = preferLatex && currentMode === 'ir' ? currentCodeBlock() : null;
             var beforeCode = codeTarget ? blockMarkdown(codeTarget) : null;
             var normalized = currentCodeBlock() ? t : preferredText(t);
-            if (normalized !== t) {
+            if (normalized !== t || (mathMode === 'mathjax' && !currentCodeBlock())) {
                 recordMathUndo(); vd.insertMD(normalized); rerender(); recordMathUndo(); onInput(vd.getValue()); return;
             }
             var ok = false;
